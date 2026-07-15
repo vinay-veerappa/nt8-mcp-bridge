@@ -13,7 +13,7 @@ import { createInterface } from 'node:readline';
 import { request as httpRequest } from 'node:http';
 
 // ─── Config ─────────────────────────────────────────────────────────────
-const NT8_HOST = process.env.NT8_HOST || '127.0.0.1';
+const NT8_HOST = process.env.NT8_HOST || 'localhost';
 const NT8_PORT = parseInt(process.env.NT8_PORT || '7890', 10);
 const NT8_BASE = `http://${NT8_HOST}:${NT8_PORT}`;
 

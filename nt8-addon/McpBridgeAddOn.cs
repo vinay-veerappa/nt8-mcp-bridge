@@ -1456,7 +1456,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         private object PlaceOrder(string body)
         {
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
-            var account = Account.All.FirstOrDefault();
+            string reqAccount = req.GetValueOrDefault("account")?.ToString();
+            Account account = null;
+            if (!string.IsNullOrEmpty(reqAccount))
+            {
+                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
+            }
+            if (account == null)
+            {
+                account = Account.All.FirstOrDefault(a => a.Name == "Sim101") 
+                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
+                          ?? Account.All.FirstOrDefault();
+            }
             if (account == null) return new { error = "no account available" };
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
