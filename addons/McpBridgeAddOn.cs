@@ -1549,6 +1549,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (account == null) return new { error = "no account available" };
 
+            // Reject order if account is locked out by RiskGuard
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+            {
+                return new { error = $"Order blocked: Account {account.Name} is locked out by Risk Guard." };
+            }
+
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString();
             var orderTypeStr = req.GetValueOrDefault("orderType")?.ToString() ?? "Market";
