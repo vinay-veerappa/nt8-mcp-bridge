@@ -195,7 +195,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/export":             return ReadExportFile(query["name"]);
                 case "/api/order":              return Post(method, () => PlaceOrder(body));
                 case "/api/order/cancel":       return Post(method, () => CancelOrder(body));
+                case "/api/order/change":       return Post(method, () => ChangeOrder(body));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
+                case "/api/position/close":     return Post(method, () => ClosePosition(body));
 
                 // ─── Phase 2 (strategy authoring / compile / backtest) ────
                 case "/api/strategies":         return ListStrategies();
@@ -1571,11 +1573,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             var tifStr = req.GetValueOrDefault("timeInForce")?.ToString() ?? "Day";
             var tif = (TimeInForce)Enum.Parse(typeof(TimeInForce), tifStr, true);
-            double limitPrice = Convert.ToDouble(req.GetValueOrDefault("price", 0));
+            
+            // Map both price and limitPrice
+            double limitPrice = 0;
+            if (req.ContainsKey("limitPrice"))
+                limitPrice = Convert.ToDouble(req["limitPrice"]);
+            else if (req.ContainsKey("price"))
+                limitPrice = Convert.ToDouble(req["price"]);
+
             double stopPrice = Convert.ToDouble(req.GetValueOrDefault("stopPrice", 0));
+            string oco = req.GetValueOrDefault("ocoId")?.ToString() ?? req.GetValueOrDefault("oco")?.ToString() ?? string.Empty;
+            string name = req.GetValueOrDefault("name")?.ToString() ?? "McpBridge";
 
             // NT8.1: CreateOrder(instrument, action, type, timeInForce, qty, limit, stop, oco, name, customOrder)
-            var order = account.CreateOrder(instrument, orderAction, orderType, tif, quantity, limitPrice, stopPrice, string.Empty, "McpBridge", null);
+            var order = account.CreateOrder(instrument, orderAction, orderType, tif, quantity, limitPrice, stopPrice, oco, name, null);
             account.Submit(new[] { order });
             return new { status = "submitted", id = order.Id.ToString(), orderId = order.OrderId, orderName = order.Name };
         }
@@ -1587,13 +1598,71 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             var orderId = req.GetValueOrDefault("orderId")?.ToString();
+            var ocoId = req.GetValueOrDefault("ocoId")?.ToString();
+
+            if (!string.IsNullOrEmpty(ocoId))
+            {
+                int count = 0;
+                foreach (Account account in Account.All)
+                {
+                    var toCancel = account.Orders
+                        .Where(o => o.Oco == ocoId && o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                        .ToList();
+                    if (toCancel.Count > 0)
+                    {
+                        account.Cancel(toCancel);
+                        count += toCancel.Count;
+                    }
+                }
+                return new { status = "cancelled_oco", ocoId, count };
+            }
+
+            if (!string.IsNullOrEmpty(orderId))
+            {
+                foreach (Account account in Account.All)
+                    foreach (Order order in account.Orders)
+                        if (OrderMatches(order, orderId))
+                        {
+                            account.Cancel(new[] { order });
+                            return new { status = "cancelled", orderId };
+                        }
+                return new { error = $"order not found: {orderId}" };
+            }
+
+            return new { error = "Either orderId or ocoId is required" };
+        }
+
+        private object ChangeOrder(string body)
+        {
+            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var orderId = req.GetValueOrDefault("orderId")?.ToString();
+            if (string.IsNullOrEmpty(orderId)) return new { error = "orderId required" };
+
+            int quantity = req.ContainsKey("quantity") ? Convert.ToInt32(req["quantity"]) : 0;
+            
+            double limitPrice = -1.0;
+            if (req.ContainsKey("limitPrice"))
+                limitPrice = Convert.ToDouble(req["limitPrice"]);
+            else if (req.ContainsKey("price"))
+                limitPrice = Convert.ToDouble(req["price"]);
+
+            double stopPrice = req.ContainsKey("stopPrice") ? Convert.ToDouble(req["stopPrice"]) : -1.0;
+
             foreach (Account account in Account.All)
+            {
                 foreach (Order order in account.Orders)
+                {
                     if (OrderMatches(order, orderId))
                     {
-                        account.Cancel(new[] { order });
-                        return new { status = "cancelled", orderId };
+                        order.Quantity = quantity > 0 ? quantity : order.Quantity;
+                        if (limitPrice >= 0) order.LimitPrice = limitPrice;
+                        if (stopPrice >= 0) order.StopPrice = stopPrice;
+
+                        account.Change(new[] { order });
+                        return new { status = "modified", orderId, quantity = order.Quantity, limitPrice = order.LimitPrice, stopPrice = order.StopPrice };
                     }
+                }
+            }
             return new { error = $"order not found: {orderId}" };
         }
 
@@ -1609,14 +1678,76 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { status = "cancelled", count };
         }
 
+        private object ClosePosition(string body)
+        {
+            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+
+            var reqAccount = req.GetValueOrDefault("account")?.ToString();
+
+            int cancelledOrdersCount = 0;
+            bool positionClosed = false;
+
+            foreach (Account account in Account.All)
+            {
+                if (!string.IsNullOrEmpty(reqAccount) && !account.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // 1. Cancel working orders for this instrument
+                var toCancel = account.Orders
+                    .Where(o => o.Instrument != null && o.Instrument.FullName.Equals(symbol, StringComparison.OrdinalIgnoreCase)
+                                && o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                    .ToList();
+                if (toCancel.Count > 0)
+                {
+                    account.Cancel(toCancel);
+                    cancelledOrdersCount += toCancel.Count;
+                }
+
+                // 2. Flatten active positions
+                foreach (Position pos in account.Positions)
+                {
+                    if (pos.Instrument != null && pos.Instrument.FullName.Equals(symbol, StringComparison.OrdinalIgnoreCase)
+                        && pos.MarketPosition != MarketPosition.Flat)
+                    {
+                        var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.Buy;
+                        var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
+                        account.Submit(new[] { closeOrder });
+                        positionClosed = true;
+                    }
+                }
+            }
+
+            return new { status = "flattened", symbol, positionClosed, cancelledOrdersCount };
+        }
+
+        private static readonly HashSet<string> _subscribedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object _subLock = new object();
+
+        private void EnsureSubscribed(Instrument instrument)
+        {
+            lock (_subLock)
+            {
+                if (!_subscribedSymbols.Contains(instrument.FullName))
+                {
+                    instrument.MarketData.Update += (sender, args) => {};
+                    _subscribedSymbols.Add(instrument.FullName);
+                    System.Threading.Thread.Sleep(200); // Give it a moment to initialize data stream
+                }
+            }
+        }
+
         private object GetQuote(string symbol)
         {
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
+
+            EnsureSubscribed(instrument);
+
             try
             {
-                // NT8.1: Level1 snapshot via instrument.MarketData (populated once subscribed).
                 var md = instrument.MarketData;
                 if (md == null) return new { symbol = instrument.FullName, error = "no market data (not subscribed)" };
                 return new
