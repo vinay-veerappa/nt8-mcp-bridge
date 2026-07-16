@@ -52,29 +52,59 @@ const TOOLS = [
         symbol:    { type: 'string', description: 'Ticker (NQ, ES, MES)' },
         action:    { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
         quantity:  { type: 'number', description: 'Number of contracts' },
-        orderType: { type: 'string', enum: ['Market', 'Limit', 'StopMarket', 'StopLimit'], description: 'Order type' },
-        price:     { type: 'number', description: 'Price (for Limit/Stop)' },
+        orderType: { type: 'string', enum: ['Market', 'Limit', 'StopMarket', 'StopLimit', 'MIT'], description: 'Order type' },
+        price:     { type: 'number', description: 'Price / Limit Price (for Limit/StopLimit/MIT)' },
+        limitPrice: { type: 'number', description: 'Limit Price (alternative to price)' },
         stopPrice: { type: 'number', description: 'Stop price (for StopMarket/StopLimit)' },
-        timeInForce: { type: 'string', enum: ['Day', 'GTC'], description: 'Time in force' },
+        timeInForce: { type: 'string', enum: ['Day', 'GTC', 'IOC', 'FOK'], description: 'Time in force' },
+        ocoId:     { type: 'string', description: 'Optional OCO group ID string' },
+        name:      { type: 'string', description: 'Optional custom order label / signal name' },
+        account:   { type: 'string', description: 'Optional target account name' },
       },
       required: ['symbol', 'action', 'quantity'],
     },
   },
   {
-    name: 'nt_cancel_order',
-    description: 'Cancel an order by ID',
+    name: 'nt_change_order',
+    description: 'Modify a working order (quantity, limit price, stop price)',
     inputSchema: {
       type: 'object',
       properties: {
-        orderId: { type: 'string', description: 'Order ID' },
+        orderId:    { type: 'string', description: 'Order ID to modify' },
+        quantity:   { type: 'number', description: 'New quantity' },
+        limitPrice: { type: 'number', description: 'New limit price' },
+        stopPrice:  { type: 'number', description: 'New stop price' },
       },
       required: ['orderId'],
+    },
+  },
+  {
+    name: 'nt_cancel_order',
+    description: 'Cancel an order by ID or OCO ID group',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        orderId: { type: 'string', description: 'Order ID to cancel' },
+        ocoId:   { type: 'string', description: 'OCO group ID to cancel all orders in the group' },
+      },
     },
   },
   {
     name: 'nt_cancel_all_orders',
     description: 'Cancel all working orders',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'nt_close_position',
+    description: 'Flatten a position and cancel all its working orders by symbol and account',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:  { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
+        account: { type: 'string', description: 'Optional account name' },
+      },
+      required: ['symbol'],
+    },
   },
   {
     name: 'nt_quote',
@@ -327,13 +357,23 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    case 'nt_change_order': {
+      const res = await ntFetch('/api/order/change', 'POST', args);
+      return res.data;
+    }
+
     case 'nt_cancel_order': {
-      const res = await ntFetch('/api/order/cancel', 'POST', { orderId: args.orderId });
+      const res = await ntFetch('/api/order/cancel', 'POST', { orderId: args.orderId, ocoId: args.ocoId });
       return res.data;
     }
 
     case 'nt_cancel_all_orders': {
       const res = await ntFetch('/api/orders/cancel-all', 'POST');
+      return res.data;
+    }
+
+    case 'nt_close_position': {
+      const res = await ntFetch('/api/position/close', 'POST', args);
       return res.data;
     }
 
