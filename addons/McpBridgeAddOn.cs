@@ -1,15 +1,15 @@
-// McpBridgeAddOn.cs — NinjaTrader 8 AddOn, HTTP API on port 7890
-// Compile in NT8: File → Utilities → NinjaScript Editor → right-click → Compile (F5)
+﻿// McpBridgeAddOn.cs - NinjaTrader 8 AddOn, HTTP API on port 7890
+// Compile in NT8: File - Utilities - NinjaScript Editor - right-click - Compile (F5)
 // Or: copy to Documents\NinjaTrader 8\bin\Custom\AddOns\ and compile via NinjaScript Editor.
 //
-// v0.2.0 — Phase 2: strategy authoring, in-process compile, Strategy Analyzer backtest.
+// v0.2.0 - Phase 2: strategy authoring, in-process compile, Strategy Analyzer backtest.
 //   New endpoints:
 //     GET  /api/strategies              list NinjaScript strategy source files
 //     GET  /api/strategy/source?name=   read one strategy's source
 //     POST /api/strategy/create         write a strategy .cs into bin\Custom\Strategies
 //     POST /api/compile                 recompile NinjaScript in-process (hot-swap, no restart)
 //     POST /api/backtest                run a backtest via the Strategy Analyzer
-//     POST /api/dev/reflect             DEV ONLY — reflection RPC for probing NT8 internals
+//     POST /api/dev/reflect             DEV ONLY - reflection RPC for probing NT8 internals
 //                                       (enabled only when env NT8_MCP_DEV=1)
 
 #region Using declarations
@@ -42,7 +42,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool _running;
 
         // Dev-only reflection RPC: object handle registry so callers can chain calls
-        // (e.g. construct a window → invoke methods on it → read results).
+        // (e.g. construct a window - invoke methods on it - read results).
         // Gated dynamically (checked per request) on either env NT8_MCP_DEV=1 or the
         // presence of a marker file, so it can be toggled WITHOUT restarting NT8.
         private static string DevMarkerFile => Path.Combine(Globals.UserDataDir, "mcp_dev.on");
@@ -77,7 +77,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             _listener = new HttpListener();
 
             // Bind address is configurable via the NT8_MCP_PREFIX environment variable.
-            // Default: localhost only (safe — same-machine access).
+            // Default: localhost only (safe - same-machine access).
             // For remote access over a PRIVATE network (e.g. Tailscale), set it to
             // "http://+:7890/" so the AddOn also listens on the VPN interface.
             // NEVER expose this on a public interface without auth + firewall.
@@ -96,7 +96,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (!_running) return;
             _running = false;
-            // Do NOT close SA windows here — closing pops a blocking confirmation dialog, and on a
+            // Do NOT close SA windows here - closing pops a blocking confirmation dialog, and on a
             // hot-swap the next addon instance adopts the existing window anyway (FindExistingSaWindow).
             _listener?.Stop();
             _listener?.Close();
@@ -182,7 +182,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/dev/reload-state":
                     return Post(method, () => ReloadRiskGuardState());
 
-                // ─── Phase 1 (account / trading / data) ───────────────────
+                // - RiskGuard FSM observation (read-only, -7 of RiskGuardAddOn.md) -
+                case "/api/riskguard/fsm-state":
+                    return GetFsmState(query["account"], query["instrument"]);
+                case "/api/riskguard/fsm-reset":
+                    return Post(method, () => ResetFsmState(query["account"], query["instrument"]));
+
+                // - Phase 1 (account / trading / data) -
                 case "/api/account":            return GetAccountInfo();
                 case "/api/positions":          return GetPositions();
                 case "/api/orders":             return GetOrders();
@@ -194,12 +200,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/bars/export":        return Post(method, () => ExportBars(body));
                 case "/api/export":             return ReadExportFile(query["name"]);
                 case "/api/order":              return Post(method, () => PlaceOrder(body));
+                case "/api/order/oco":          return Post(method, () => PlaceOcoOrder(body));
                 case "/api/order/cancel":       return Post(method, () => CancelOrder(body));
                 case "/api/order/change":       return Post(method, () => ChangeOrder(body));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
                 case "/api/position/close":     return Post(method, () => ClosePosition(body));
 
-                // ─── Phase 2 (strategy authoring / compile / backtest) ────
+                // - Phase 2 (strategy authoring / compile / backtest) -
                 case "/api/strategies":         return ListStrategies();
                 case "/api/strategy/source":    return GetStrategySource(query["name"]);
                 case "/api/strategy/create":    return Post(method, () => CreateStrategy(body));
@@ -213,7 +220,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
-                // ─── Dev-only reflection RPC ──────────────────────────────
+                // - Dev-only reflection RPC -
                 case "/api/dev/reflect":
                     if (!DevMode) return new { error = "dev mode disabled (set NT8_MCP_DEV=1 and restart NT8)" };
                     return Post(method, () => DevReflect(body));
@@ -226,14 +233,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static object Post(string method, Func<object> fn)
             => method == "POST" ? fn() : new { error = "method not allowed" };
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Strategy authoring (safe — pure file I/O)
-        // ═══════════════════════════════════════════════════════════════
+        // -
+        //  Strategy authoring (safe - pure file I/O)
+        // -
 
         private static string StrategiesDir =>
             Path.Combine(Globals.UserDataDir, "bin", "Custom", "Strategies");
 
-        // Guard against path traversal — accept a bare class/file name only.
+        // Guard against path traversal - accept a bare class/file name only.
         private static string SafeStrategyPath(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new Exception("name required");
@@ -281,14 +288,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                          note = "call /api/compile to build + hot-load this strategy" };
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Compile — invoke NT8's internal Roslyn compiler in-process.
+        // -
+        //  Compile - invoke NT8's internal Roslyn compiler in-process.
         //  NinjaTrader.Code.Compiler is public but obfuscated; call via
         //  reflection so we don't take a compile-time dep on Microsoft.CodeAnalysis.
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
-        // A successful compile hot-swaps the NinjaScript AppDomain — the very domain
-        // THIS addon runs in — so the addon (and its HttpListener) is torn down and
+        // A successful compile hot-swaps the NinjaScript AppDomain - the very domain
+        // THIS addon runs in - so the addon (and its HttpListener) is torn down and
         // recreated moments after Compiler.Compile() returns. The in-flight HTTP
         // response usually dies with it. So we persist the result to disk immediately
         // and expose GET /api/compile/result as a reliable fallback.
@@ -337,7 +344,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 errorCount = diagnostics.Count(d => d.severity == "Error"),
                 errors = diagnostics.Where(d => d.severity == "Error").ToList(),
                 // CS1701/CS1702 are benign assembly-version-unification notices NT8 emits en masse
-                // (thousands of them) — filter them out, and hard-cap the rest so the result file
+                // (thousands of them) - filter them out, and hard-cap the rest so the result file
                 // can never balloon.
                 warnings = diagnostics.Where(d => d.severity == "Warning" && d.id != "CS1701" && d.id != "CS1702").Take(25).ToList(),
                 assemblyToLoad,
@@ -376,20 +383,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var id = t.GetProperty("Id")?.GetValue(d)?.ToString();
                 string loc = null;
                 try { loc = t.GetProperty("Location")?.GetValue(d)?.ToString(); } catch { }
-                // Diagnostic.ToString() = "file(line,col): error CSxxxx: message" — ideal for reporting.
+                // Diagnostic.ToString() = "file(line,col): error CSxxxx: message" - ideal for reporting.
                 result.Add(new Diag { severity = sev, id = id, message = SafeToString(d), location = loc });
             }
             return result;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Backtest — driven via a bridge-managed Strategy Analyzer window.
+        // -
+        //  Backtest - driven via a bridge-managed Strategy Analyzer window.
         //  Sequence (all on the WPF dispatcher):
-        //    create+show(minimized) SA window (cached/reused) → configure the
-        //    selected tab (Strategy, Instrument, BarsPeriod, params) →
-        //    CheckSettingsValid → ViewModel.OnRun → poll SelectedResult.Results
-        //    → extract SystemPerformance (metrics + trade list).
-        // ═══════════════════════════════════════════════════════════════
+        //    create+show(minimized) SA window (cached/reused) - configure the
+        //    selected tab (Strategy, Instrument, BarsPeriod, params) -
+        //    CheckSettingsValid - ViewModel.OnRun - poll SelectedResult.Results
+        //    - extract SystemPerformance (metrics + trade list).
+        // -
 
         private object _saWindow; // reused across backtests
 
@@ -424,7 +431,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try
                 {
                     // Reuse a single SA window across runs/hot-swaps. Closing NT8 windows pops a
-                    // blocking "are you sure?" dialog, so we NEVER close — we adopt any existing
+                    // blocking "are you sure?" dialog, so we NEVER close - we adopt any existing
                     // SA window (orphaned by a prior hot-swap) or create one if none exists.
                     _saWindow = FindExistingSaWindow();
                     if (_saWindow == null)
@@ -471,7 +478,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }));
 
             if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
-            if (!valid) return new { error = "settings invalid — check strategy name, instrument, or that data exists for the range" };
+            if (!valid) return new { error = "settings invalid - check strategy name, instrument, or that data exists for the range" };
 
             // Poll for a new completed result.
             var deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
@@ -490,7 +497,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (entry == null) return new { status = "timeout", message = $"no result within {timeoutSec}s (backtest may still be running)" };
 
             object report = null;
-            // Leave the (minimized) window open for reuse — closing pops a blocking dialog.
+            // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
             disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades); }));
             return report;
         }
@@ -564,6 +571,48 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        // - FSM observation endpoints (-7 of RiskGuardAddOn.md) -
+        // Read-only window onto the per-position guard state machines plus a
+        // targeted reset. No guard evaluation lives here; the MCP stays an
+        // observation/intervention surface, never the driver.
+        private object GetFsmState(string accountName, string instrument)
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+
+                var snapshots = RiskGuardAddOn.Instance.GetFsmSnapshots();
+                if (!string.IsNullOrEmpty(accountName))
+                    snapshots = snapshots.Where(s => s.AccountName == accountName).ToList();
+                if (!string.IsNullOrEmpty(instrument))
+                    snapshots = snapshots.Where(s => s.Instrument == instrument).ToList();
+                return new { success = true, count = snapshots.Count, fsms = snapshots };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object ResetFsmState(string accountName, string instrument)
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+                if (string.IsNullOrEmpty(accountName) || string.IsNullOrEmpty(instrument))
+                    return new { error = "Both 'account' and 'instrument' query params are required." };
+
+                bool removed = RiskGuardAddOn.Instance.ResetFsm(accountName, instrument);
+                return new { success = true, removed = removed };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
         private object SaInspect()
         {
             var disp = System.Windows.Application.Current?.Dispatcher;
@@ -624,7 +673,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Set the SA toolbar's From/To date pickers. The editors display the run-config dates via a
         // (OneWay) binding, so we resolve each editor's binding SOURCE object+property and set THAT
-        // directly — that source is what the run actually reads.
+        // directly - that source is what the run actually reads.
         private object _dateNote;
         private void SetSaDateRange(object win, DateTime from, DateTime to)
         {
@@ -635,7 +684,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // The backtest run-input From/To are the date editors whose Value binds to a property-grid
             // PropertyItemValue (NOT the TradePerformanceReportViewModel report filter). Pick those,
-            // ordered by current date → [From, To].
+            // ordered by current date - [From, To].
             var runEditors = editors
                 .Select(e => new { e, dv = GetP(e, "DateValue") as DateTime?, src = EditorBindingSource(e) })
                 .Where(x => x.dv.HasValue && x.dv.Value.Year >= 2000
@@ -729,7 +778,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var trades = new List<object>();
             int total = 0, winners = 0, losers = 0;
             // Aggregate P&L per distinct entry (scale-out exits share one entry) so we can report
-            // entry-level win rate — comparable to research/kernel numbers, unlike per-partial-trade WR.
+            // entry-level win rate - comparable to research/kernel numbers, unlike per-partial-trade WR.
             var entryPnl = new Dictionary<string, double>();
             var exitReasons = new Dictionary<string, int>();   // per-partial-exit tally by exit order name
             DateTime firstEntry = DateTime.MaxValue, lastExit = DateTime.MinValue;
@@ -828,7 +877,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch { return null; }
         }
 
-        // ── small reflection helpers (instance) ──
+        // - small reflection helpers (instance) -
         private static object GetP(object o, string name)
         {
             if (o == null) return null;
@@ -854,8 +903,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             return m?.Invoke(o, args);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  DEV reflection RPC — probe/drive NT8 internals over HTTP so we
+        // -
+        //  DEV reflection RPC - probe/drive NT8 internals over HTTP so we
         //  can discover the Strategy Analyzer / compile behaviour without
         //  recompiling this addon on every iteration. Localhost + dev-gated.
         //
@@ -871,7 +920,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         //  Args accept literals or {"$ref":"h3"} / {"$type":"...","value":...} coercions.
         //  Any op result that is a non-primitive object is stored and returned as a handle
         //  ("h1", "h2", ...) reusable as a target/$ref in later ops.
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
         private object DevReflect(string body)
         {
@@ -1110,9 +1159,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static string SafeToString(object v) { try { return v.ToString(); } catch { return "<toString threw>"; } }
 
-        // ═══════════════════════════════════════════════════════════════
+        // -
         //  Phase 1 handlers (unchanged)
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
         // Account.Get in NT8.1 requires the account's currency (Denomination).
         private static double AcctGet(Account a, AccountItem item)
@@ -1198,13 +1247,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             foreach (var s in col) if (s != null) outp.Add(DescribeStrategy(s, src));
         }
 
-        // ═══════════════════════════════════════════════════════════════
+        // -
         //  Deploy / stop a strategy on a chart (SIM-first). Validated sequence:
         //    create instance (defaults auto-populate) -> set Account (+params) ->
         //    ChartControl.ApplyStrategy(null, strat, chartBars, false, null) [adds, disabled] ->
         //    ChartControl.StrategyEnable(template, chartBars, true, null) [enables -> Realtime].
         //  Stop = static ChartControl.StrategyDisable(template, clone) + Strategies.Remove(template).
-        // ═══════════════════════════════════════════════════════════════
+        // -
         private object DeployStrategy(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
@@ -1591,6 +1640,66 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { status = "submitted", id = order.Id.ToString(), orderId = order.OrderId, orderName = order.Name };
         }
 
+        // Place a proper OCO bracket: market entry + stop + target with a shared OCO GUID.
+        // NT8 requires OCO orders to share the same GUID string for the OCO group.
+        private object PlaceOcoOrder(string body)
+        {
+            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            string reqAccount = req.GetValueOrDefault("account")?.ToString();
+            Account account = null;
+            if (!string.IsNullOrEmpty(reqAccount))
+                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
+            if (account == null)
+                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
+                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
+                          ?? Account.All.FirstOrDefault();
+            if (account == null) return new { error = "no account available" };
+
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
+
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
+            var quantity = Convert.ToInt32(req.GetValueOrDefault("quantity", 1));
+            var stopPrice = Convert.ToDouble(req.GetValueOrDefault("stopPrice", 0));
+            var targetPrice = Convert.ToDouble(req.GetValueOrDefault("targetPrice", 0));
+
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+            if (stopPrice <= 0) return new { error = "stopPrice required" };
+            if (targetPrice <= 0) return new { error = "targetPrice required" };
+
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null) return new { error = "instrument not found: " + symbol };
+
+            // Generate a proper OCO GUID (NT8 uses GUID strings for OCO groups)
+            string ocoId = Guid.NewGuid().ToString();
+            bool isBuy = actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase);
+            var entryAction = isBuy ? OrderAction.Buy : OrderAction.Sell;
+            var exitAction = isBuy ? OrderAction.Sell : OrderAction.Buy;
+            string entryName = req.GetValueOrDefault("name")?.ToString() ?? "OcoEntry";
+
+            // 1. Entry: Market order
+            var entryOrder = account.CreateOrder(instrument, entryAction, OrderType.Market, TimeInForce.Day, quantity, 0, 0, string.Empty, entryName, null);
+
+            // 2. Stop: StopMarket order (OCO linked)
+            var stopOrder = account.CreateOrder(instrument, exitAction, OrderType.StopMarket, TimeInForce.Day, quantity, 0, stopPrice, ocoId, "Stop1", null);
+
+            // 3. Target: Limit order (OCO linked)
+            var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
+
+            // Submit all three as a batch
+            account.Submit(new[] { entryOrder, stopOrder, targetOrder });
+
+            return new
+            {
+                status = "submitted",
+                ocoId = ocoId,
+                entry = new { id = entryOrder.Id.ToString(), name = entryOrder.Name },
+                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice },
+                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice }
+            };
+        }
+
         private static bool OrderMatches(Order o, string key)
             => o.OrderId == key || o.Name == key || o.Id.ToString() == key;
 
@@ -1824,7 +1933,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Continuous-contract merge policy. DoNotMerge = the resolved single contract (default).
             // MergeNonBackAdjusted = real front-month prices spliced at rolls, NO price adjustment
             // (matches a research-grade continuous series). MergeBackAdjusted shifts historical prices
-            // by cumulative roll gaps — do NOT use it for log-ratio / spread work.
+            // by cumulative roll gaps - do NOT use it for log-ratio / spread work.
             var mergeStr = req.Str("merge") ?? "DoNotMerge";
             MergePolicy merge;
             if (!Enum.TryParse(mergeStr, true, out merge)) merge = MergePolicy.DoNotMerge;
@@ -1839,7 +1948,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var path = Path.Combine(Globals.UserDataDir, name);
 
             // Direct DATE-RANGE request (from/to are local time). This downloads exactly the window
-            // from the provider — no oversized count, no client-side filtering.
+            // from the provider - no oversized count, no client-side filtering.
             using (var request = new BarsRequest(instrument, from, to) { BarsPeriod = bp, MergePolicy = merge })
             {
                 request.Request((r, code, msg) => { status = code.ToString(); done.Set(); });
@@ -1901,7 +2010,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             return results;
         }
 
-        // ─── Helpers ──────────────────────────────────────────────────
+        // - Helpers -
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
         {
             var json = JsonConvert.SerializeObject(data);
