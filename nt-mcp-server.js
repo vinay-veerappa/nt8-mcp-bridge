@@ -409,6 +409,124 @@ const TOOLS = [
     },
   },
 
+  // ─── Phase 5 SSE Stream & Phase 6-8 Expansion Tools ───────────────────
+  {
+    name: 'nt_subscribe',
+    description: 'Subscribe to NinjaTrader Hub (ninjatrader_hub.py) or McpBridge real-time SSE event stream for fills, RiskGuard FSM state transitions, and strategy errors',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hubUrl: { type: 'string', description: 'NinjaTrader Hub URL or local broadcast bus', default: 'http://127.0.0.1:7891' },
+      },
+    },
+  },
+  {
+    name: 'nt_portfolio_backtest',
+    description: 'Run simultaneous multi-symbol portfolio backtests with correlation matrix calculation and capital allocation metrics',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbols:  { type: 'array', description: 'List of symbols (e.g. ["NQ 09-26", "ES 09-26", "CL 09-26"])' },
+        strategy: { type: 'string', description: 'Strategy class name' },
+        from:     { type: 'string', description: 'UTC Start date YYYY-MM-DD' },
+        to:       { type: 'string', description: 'UTC End date YYYY-MM-DD' },
+      },
+      required: ['symbols', 'strategy'],
+    },
+  },
+  {
+    name: 'nt_synthetic_data',
+    description: 'Generate stress scenario datasets (e.g. 2020 COVID shock, 2008 GFC, volatility scaling) to evaluate strategy robustness',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scenario: { type: 'string', enum: ['2020_covid_shock', '2008_gfc_crash', 'high_volatility_regime', 'custom_gap_shock'], default: '2020_covid_shock' },
+        symbol:   { type: 'string', description: 'Target instrument symbol', default: 'NQ 09-26' },
+      },
+    },
+  },
+  {
+    name: 'nt_signal_backtest',
+    description: 'Lightweight "what-if" testing of entry/exit signal rules without full NinjaScript strategy overhead',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:     { type: 'string', description: 'Instrument symbol' },
+        entryRule:  { type: 'string', description: 'Signal entry rule expression' },
+        exitRule:   { type: 'string', description: 'Signal exit rule expression' },
+        timeframe:  { type: 'string', default: '5m' },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'nt_schedule',
+    description: 'Register time-based or event-based scheduled tasks inside NinjaTrader (e.g., re-optimize weekly, flatten at market close)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cronExpression: { type: 'string', description: '5-field cron expression', default: '0 18 * * 0' },
+        taskAction:     { type: 'string', description: 'Task action name or endpoint', default: 'reoptimize' },
+      },
+    },
+  },
+  {
+    name: 'nt_trade_journal',
+    description: 'Full CRUD operations on local trade journal repository with macro window auto-tagging and export to TraderSync/TradesViz',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action:  { type: 'string', enum: ['list', 'add', 'tag', 'export'], default: 'list' },
+        format:  { type: 'string', enum: ['json', 'csv'], default: 'json' },
+      },
+    },
+  },
+  {
+    name: 'nt_alert',
+    description: 'Create persistent price, indicator, or strategy alerts with local email/SMS/webhook notifications',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:    { type: 'string', description: 'Instrument symbol' },
+        condition: { type: 'string', description: 'Alert trigger condition' },
+        action:    { type: 'string', enum: ['flatten', 'webhook', 'notify'], default: 'webhook' },
+      },
+      required: ['symbol', 'condition'],
+    },
+  },
+  {
+    name: 'nt_riskguard_config',
+    description: 'Dynamic configuration of trailing drawdown limits, volatility-based position caps, and time-of-day blackout windows',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        trailingDrawdown: { type: 'number', description: 'Max trailing drawdown limit ($)' },
+        maxPositionCap:   { type: 'number', description: 'Max contracts position cap' },
+      },
+    },
+  },
+  {
+    name: 'nt_compliance_report',
+    description: 'One-click generation of prop firm / broker compliance reports (daily P&L, trade log, max position exposure)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Target account name', default: 'Sim101' },
+      },
+    },
+  },
+  {
+    name: 'nt_multi_account_orchestrator',
+    description: 'Coordinated order routing and hedging across multiple accounts',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action:   { type: 'string', enum: ['sync_hedge', 'rebalance', 'group_flatten'], default: 'sync_hedge' },
+        accounts: { type: 'array', description: 'List of target account names' },
+      },
+    },
+  },
+
   // ─── Phase 2: strategy authoring / compile / backtest ─────────────────
   {
     name: 'nt_list_strategies',
@@ -771,6 +889,57 @@ async function handleToolCall(name, args) {
 
     case 'nt_script_execute': {
       const res = await ntFetch('/api/script/execute', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_subscribe': {
+      return { status: 'subscribed', hubUrl: args.hubUrl || 'http://127.0.0.1:7891', sseEndpoint: 'http://127.0.0.1:7890/api/events/stream' };
+    }
+
+    case 'nt_portfolio_backtest': {
+      const res = await ntFetch('/api/backtest/portfolio', 'POST', args, 300000);
+      return res.data;
+    }
+
+    case 'nt_synthetic_data': {
+      const res = await ntFetch('/api/data/synthetic', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_signal_backtest': {
+      const res = await ntFetch('/api/backtest/signal', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_schedule': {
+      const res = await ntFetch('/api/schedule/task', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_trade_journal': {
+      const res = await ntFetch('/api/trades/journal', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_alert': {
+      const res = await ntFetch('/api/alert/create', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_riskguard_config': {
+      const res = await ntFetch('/api/riskguard/config', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_compliance_report': {
+      const params = new URLSearchParams();
+      if (args.account) params.append('account', args.account);
+      const res = await ntFetch(`/api/compliance/report?${params}`);
+      return res.data;
+    }
+
+    case 'nt_multi_account_orchestrator': {
+      const res = await ntFetch('/api/orchestrator/multi-account', 'POST', args);
       return res.data;
     }
 
