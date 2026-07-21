@@ -20,8 +20,9 @@ const NT8_BASE = `http://${NT8_HOST}:${NT8_PORT}`;
 const NT8_MCP_TOKEN = process.env.NT8_MCP_TOKEN || '';
 
 const SERVER_NAME = 'nt-mcp-server';
-const SERVER_VERSION = '1.4.0';
+const SERVER_VERSION = '1.5.0';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
+
 
 // ─── Tool Definitions ───────────────────────────────────────────────────
 const TOOLS = [
@@ -246,11 +247,27 @@ const TOOLS = [
         symbol:     { type: 'string', description: 'Instrument symbol' },
         width:      { type: 'number', description: 'Width px', default: 1280 },
         height:     { type: 'number', description: 'Height px', default: 720 },
-        markers:    { type: 'array', description: 'Overlay markers [{ time, price, label, color }]' },
+        markers:    { type: 'array', description: 'Overlay markers [{ time, price, label, color, shape }]' },
         indicators: { type: 'array', description: 'Indicator names to highlight' },
+        timeRange:  { type: 'string', description: 'Time range to display (e.g. 09:30-16:00 ET or ISO range)' },
       },
     },
   },
+  {
+    name: 'nt_trade_chart',
+    description: 'Capture chart screenshot automatically for an execution fill with trade marker overlay returning imageId & base64',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        executionId: { type: 'string', description: 'Execution ID to overlay trade markers for' },
+        symbol:      { type: 'string', description: 'Instrument symbol (e.g. NQ 09-26)' },
+        account:     { type: 'string', description: 'Account name filter' },
+        width:       { type: 'number', description: 'Width px', default: 1280 },
+        height:      { type: 'number', description: 'Height px', default: 720 },
+      },
+    },
+  },
+
   {
     name: 'nt_open_chart',
     description: 'Programmatically open a new chart window/tab for a symbol and period',
@@ -697,9 +714,24 @@ function sendResult(id, result) {
 async function handleToolCall(name, args) {
   switch (name) {
     case 'nt_health': {
-      const res = await ntFetch('/api/health');
-      return { status: res.status === 200 ? 'connected' : 'error', version: SERVER_VERSION, nt8: res.data };
+      try {
+        const res = await ntFetch('/api/health');
+        return {
+          status: res.status === 200 ? 'connected' : 'error',
+          server_version: SERVER_VERSION,
+          nt8_bridge: res.data,
+          timestamp_utc: new Date().toISOString()
+        };
+      } catch (err) {
+        return {
+          status: 'disconnected',
+          server_version: SERVER_VERSION,
+          error: err.message,
+          timestamp_utc: new Date().toISOString()
+        };
+      }
     }
+
 
     case 'nt_accounts': {
       const res = await ntFetch('/api/account');
@@ -807,6 +839,12 @@ async function handleToolCall(name, args) {
       const res = await ntFetch('/api/chart/snapshot', 'POST', args);
       return res.data;
     }
+
+    case 'nt_trade_chart': {
+      const res = await ntFetch('/api/chart/trade', 'POST', args);
+      return res.data;
+    }
+
 
     case 'nt_open_chart': {
       const res = await ntFetch('/api/chart/open', 'POST', args);

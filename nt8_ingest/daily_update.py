@@ -21,7 +21,7 @@ Usage:
     python daily_update.py            # run the update (what the scheduler calls)
     python daily_update.py --dry      # show which contracts/window, pull nothing
 """
-import sys, os, datetime as dt, urllib.request
+import sys, os, time, datetime as dt, urllib.request
 from zoneinfo import ZoneInfo
 from psycopg2.extras import execute_values
 import ingest
@@ -40,6 +40,22 @@ def log(msg):
     print(line, flush=True)
     with open(os.path.join(LOGDIR, "daily_update.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def retry_call(fn, max_attempts=3, backoff_base=2.0, tag="Operation"):
+    """Executes fn with exponential backoff retry logic."""
+    attempt = 1
+    delay = 1.0
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            if attempt >= max_attempts:
+                raise e
+            log(f"  [RETRY] {tag} failed attempt {attempt}/{max_attempts}: {e}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            attempt += 1
+            delay *= backoff_base
 
 
 def sym_from_tag(tag):
@@ -144,7 +160,8 @@ def main():
     log(f"=== daily_update {'(dry) ' if dry else ''}start; window {frm} -> {to} CT ===")
 
     try:
-        urllib.request.urlopen(ingest.BRIDGE + "/api/health", timeout=15).read()
+        retry_call(lambda: urllib.request.urlopen(ingest.BRIDGE + "/api/health", timeout=15).read(),
+                   max_attempts=3, backoff_base=2.0, tag="Health check")
     except Exception as e:
         log(f"[FATAL] NT8 bridge unreachable at {ingest.BRIDGE}: {e}  (is NT8 running?)")
         return 2
@@ -159,7 +176,8 @@ def main():
         ins_new = 0
         for tag, (sym, is_seed) in sorted(cand.items()):
             try:
-                pulled, new, last = upsert(cx, canonical, tag, sym, frm, to)
+                pulled, new, last = retry_call(lambda: upsert(cx, canonical, tag, sym, frm, to),
+                                               max_attempts=3, backoff_base=2.0, tag=f"Upsert {sym}")
                 ins_new += new
                 log(f"  {key.upper():4} {sym} ({tag}){' [seed]' if is_seed else ''}: "
                     f"{pulled} pulled, {new} new" + (f", last bar {last}" if last else ""))
