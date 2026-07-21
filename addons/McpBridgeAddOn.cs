@@ -1,4 +1,4 @@
-﻿// McpBridgeAddOn.cs - NinjaTrader 8 AddOn, HTTP API on port 7890
+// McpBridgeAddOn.cs - NinjaTrader 8 AddOn, HTTP API on port 7890
 // Compile in NT8: File - Utilities - NinjaScript Editor - right-click - Compile (F5)
 // Or: copy to Documents\NinjaTrader 8\bin\Custom\AddOns\ and compile via NinjaScript Editor.
 //
@@ -182,7 +182,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/dev/reload-state":
                     return Post(method, () => ReloadRiskGuardState());
 
-                // - RiskGuard FSM observation (read-only, -7 of RiskGuardAddOn.md) -
+                // - RiskGuard FSM observation & Version (read-only) -
+                case "/api/riskguard/version":
+                    return new { success = true, version = RiskGuardAddOn.Version, name = "RiskGuardAddOn" };
                 case "/api/riskguard/fsm-state":
                     return GetFsmState(query["account"], query["instrument"]);
                 case "/api/riskguard/fsm-reset":
@@ -544,7 +546,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (RiskGuardAddOn.Instance != null)
                 {
-                    return new { success = true, states = GetMember(RiskGuardAddOn.Instance, "_accountStates") };
+                    return new { success = true, version = RiskGuardAddOn.Version, snapshots = RiskGuardAddOn.Instance.GetAccountSnapshots() };
                 }
                 return new { error = "RiskGuardAddOn instance not found." };
             }
