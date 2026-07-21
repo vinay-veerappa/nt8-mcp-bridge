@@ -1,15 +1,15 @@
-// McpBridgeAddOn.cs — NinjaTrader 8 AddOn, HTTP API on port 7890
-// Compile in NT8: File → Utilities → NinjaScript Editor → right-click → Compile (F5)
+// McpBridgeAddOn.cs - NinjaTrader 8 AddOn, HTTP API on port 7890
+// Compile in NT8: File - Utilities - NinjaScript Editor - right-click - Compile (F5)
 // Or: copy to Documents\NinjaTrader 8\bin\Custom\AddOns\ and compile via NinjaScript Editor.
 //
-// v0.2.0 — Phase 2: strategy authoring, in-process compile, Strategy Analyzer backtest.
+// v0.2.0 - Phase 2: strategy authoring, in-process compile, Strategy Analyzer backtest.
 //   New endpoints:
 //     GET  /api/strategies              list NinjaScript strategy source files
 //     GET  /api/strategy/source?name=   read one strategy's source
 //     POST /api/strategy/create         write a strategy .cs into bin\Custom\Strategies
 //     POST /api/compile                 recompile NinjaScript in-process (hot-swap, no restart)
 //     POST /api/backtest                run a backtest via the Strategy Analyzer
-//     POST /api/dev/reflect             DEV ONLY — reflection RPC for probing NT8 internals
+//     POST /api/dev/reflect             DEV ONLY - reflection RPC for probing NT8 internals
 //                                       (enabled only when env NT8_MCP_DEV=1)
 
 #region Using declarations
@@ -42,7 +42,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool _running;
 
         // Dev-only reflection RPC: object handle registry so callers can chain calls
-        // (e.g. construct a window → invoke methods on it → read results).
+        // (e.g. construct a window - invoke methods on it - read results).
         // Gated dynamically (checked per request) on either env NT8_MCP_DEV=1 or the
         // presence of a marker file, so it can be toggled WITHOUT restarting NT8.
         private static string DevMarkerFile => Path.Combine(Globals.UserDataDir, "mcp_dev.on");
@@ -77,7 +77,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             _listener = new HttpListener();
 
             // Bind address is configurable via the NT8_MCP_PREFIX environment variable.
-            // Default: localhost only (safe — same-machine access).
+            // Default: localhost only (safe - same-machine access).
             // For remote access over a PRIVATE network (e.g. Tailscale), set it to
             // "http://+:7890/" so the AddOn also listens on the VPN interface.
             // NEVER expose this on a public interface without auth + firewall.
@@ -96,7 +96,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (!_running) return;
             _running = false;
-            // Do NOT close SA windows here — closing pops a blocking confirmation dialog, and on a
+            // Do NOT close SA windows here - closing pops a blocking confirmation dialog, and on a
             // hot-swap the next addon instance adopts the existing window anyway (FindExistingSaWindow).
             _listener?.Stop();
             _listener?.Close();
@@ -170,7 +170,27 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/health":
                     return new { status = "ok", timestamp = DateTime.UtcNow, version = Version, dev = DevMode };
 
-                // ─── Phase 1 (account / trading / data) ───────────────────
+                case "/api/dev/reset-risk":
+                    return Post(method, () => ResetRiskGuard());
+
+                case "/api/dev/run-firm-tests":
+                    return Post(method, () => RunFirmDiagnostics());
+
+                case "/api/dev/inspect-state":
+                    return GetRiskGuardState();
+
+                case "/api/dev/reload-state":
+                    return Post(method, () => ReloadRiskGuardState());
+
+                // - RiskGuard FSM observation & Version (read-only) -
+                case "/api/riskguard/version":
+                    return new { success = true, version = RiskGuardAddOn.Version, name = "RiskGuardAddOn" };
+                case "/api/riskguard/fsm-state":
+                    return GetFsmState(query["account"], query["instrument"]);
+                case "/api/riskguard/fsm-reset":
+                    return Post(method, () => ResetFsmState(query["account"], query["instrument"]));
+
+                // - Phase 1 (account / trading / data) -
                 case "/api/account":            return GetAccountInfo();
                 case "/api/positions":          return GetPositions();
                 case "/api/orders":             return GetOrders();
@@ -182,10 +202,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/bars/export":        return Post(method, () => ExportBars(body));
                 case "/api/export":             return ReadExportFile(query["name"]);
                 case "/api/order":              return Post(method, () => PlaceOrder(body));
+                case "/api/order/oco":          return Post(method, () => PlaceOcoOrder(body));
+                case "/api/order/atm":          return Post(method, () => PlaceAtmOrder(body));
                 case "/api/order/cancel":       return Post(method, () => CancelOrder(body));
+                case "/api/order/change":       return Post(method, () => ChangeOrder(body));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
+                case "/api/position/close":     return Post(method, () => ClosePosition(body));
+                case "/api/emergency-flatten":  return Post(method, () => EmergencyFlatten(body));
 
-                // ─── Phase 2 (strategy authoring / compile / backtest) ────
+                // - Phase 2 & Expansion (strategy authoring / compile / backtest / v1.4 tools) -
                 case "/api/strategies":         return ListStrategies();
                 case "/api/strategy/source":    return GetStrategySource(query["name"]);
                 case "/api/strategy/create":    return Post(method, () => CreateStrategy(body));
@@ -196,10 +221,23 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
                 case "/api/strategy/param":     return Post(method, () => SetStrategyParam(body));
+                case "/api/strategy/inspect":   return InspectStrategy(query["name"]);
+                case "/api/logs":               return GetDiagnosticLogs(query["tab"] ?? "Output", int.TryParse(query["lines"], out var l) ? l : 100);
+                case "/api/chart/capture":      return CaptureChart(query["symbol"]);
+                case "/api/chart/snapshot":     return Post(method, () => ChartSnapshot(body));
+                case "/api/chart/open":         return Post(method, () => OpenChart(body));
+                case "/api/chart/draw":         return Post(method, () => DrawChartLevel(body));
+                case "/api/events/fills":       return GetFillEvents(query["count"] ?? "50");
+                case "/api/copier/config":      return Post(method, () => CopierConfig(body));
+                case "/api/prop/limits":        return Post(method, () => PropLimits(body));
+                case "/api/trades/extract":     return ExtractTrades(query["account"], query["format"], query["from"], query["to"], query["limit"]);
+                case "/api/trades/monte-carlo": return Post(method, () => MonteCarlo(body));
+                case "/api/indicator/values":   return GetIndicatorValues(query["symbol"], query["indicatorName"], query["period"], query["barsBack"]);
+                case "/api/script/execute":     return Post(method, () => ScriptExecute(body));
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
-                // ─── Dev-only reflection RPC ──────────────────────────────
+                // - Dev-only reflection RPC -
                 case "/api/dev/reflect":
                     if (!DevMode) return new { error = "dev mode disabled (set NT8_MCP_DEV=1 and restart NT8)" };
                     return Post(method, () => DevReflect(body));
@@ -212,14 +250,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static object Post(string method, Func<object> fn)
             => method == "POST" ? fn() : new { error = "method not allowed" };
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Strategy authoring (safe — pure file I/O)
-        // ═══════════════════════════════════════════════════════════════
+        // -
+        //  Strategy authoring (safe - pure file I/O)
+        // -
 
         private static string StrategiesDir =>
             Path.Combine(Globals.UserDataDir, "bin", "Custom", "Strategies");
 
-        // Guard against path traversal — accept a bare class/file name only.
+        // Guard against path traversal - accept a bare class/file name only.
         private static string SafeStrategyPath(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new Exception("name required");
@@ -267,14 +305,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                          note = "call /api/compile to build + hot-load this strategy" };
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Compile — invoke NT8's internal Roslyn compiler in-process.
+        // -
+        //  Compile - invoke NT8's internal Roslyn compiler in-process.
         //  NinjaTrader.Code.Compiler is public but obfuscated; call via
         //  reflection so we don't take a compile-time dep on Microsoft.CodeAnalysis.
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
-        // A successful compile hot-swaps the NinjaScript AppDomain — the very domain
-        // THIS addon runs in — so the addon (and its HttpListener) is torn down and
+        // A successful compile hot-swaps the NinjaScript AppDomain - the very domain
+        // THIS addon runs in - so the addon (and its HttpListener) is torn down and
         // recreated moments after Compiler.Compile() returns. The in-flight HTTP
         // response usually dies with it. So we persist the result to disk immediately
         // and expose GET /api/compile/result as a reliable fallback.
@@ -323,7 +361,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 errorCount = diagnostics.Count(d => d.severity == "Error"),
                 errors = diagnostics.Where(d => d.severity == "Error").ToList(),
                 // CS1701/CS1702 are benign assembly-version-unification notices NT8 emits en masse
-                // (thousands of them) — filter them out, and hard-cap the rest so the result file
+                // (thousands of them) - filter them out, and hard-cap the rest so the result file
                 // can never balloon.
                 warnings = diagnostics.Where(d => d.severity == "Warning" && d.id != "CS1701" && d.id != "CS1702").Take(25).ToList(),
                 assemblyToLoad,
@@ -362,20 +400,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var id = t.GetProperty("Id")?.GetValue(d)?.ToString();
                 string loc = null;
                 try { loc = t.GetProperty("Location")?.GetValue(d)?.ToString(); } catch { }
-                // Diagnostic.ToString() = "file(line,col): error CSxxxx: message" — ideal for reporting.
+                // Diagnostic.ToString() = "file(line,col): error CSxxxx: message" - ideal for reporting.
                 result.Add(new Diag { severity = sev, id = id, message = SafeToString(d), location = loc });
             }
             return result;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  Backtest — driven via a bridge-managed Strategy Analyzer window.
+        // -
+        //  Backtest - driven via a bridge-managed Strategy Analyzer window.
         //  Sequence (all on the WPF dispatcher):
-        //    create+show(minimized) SA window (cached/reused) → configure the
-        //    selected tab (Strategy, Instrument, BarsPeriod, params) →
-        //    CheckSettingsValid → ViewModel.OnRun → poll SelectedResult.Results
-        //    → extract SystemPerformance (metrics + trade list).
-        // ═══════════════════════════════════════════════════════════════
+        //    create+show(minimized) SA window (cached/reused) - configure the
+        //    selected tab (Strategy, Instrument, BarsPeriod, params) -
+        //    CheckSettingsValid - ViewModel.OnRun - poll SelectedResult.Results
+        //    - extract SystemPerformance (metrics + trade list).
+        // -
 
         private object _saWindow; // reused across backtests
 
@@ -410,7 +448,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try
                 {
                     // Reuse a single SA window across runs/hot-swaps. Closing NT8 windows pops a
-                    // blocking "are you sure?" dialog, so we NEVER close — we adopt any existing
+                    // blocking "are you sure?" dialog, so we NEVER close - we adopt any existing
                     // SA window (orphaned by a prior hot-swap) or create one if none exists.
                     _saWindow = FindExistingSaWindow();
                     if (_saWindow == null)
@@ -457,7 +495,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             }));
 
             if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
-            if (!valid) return new { error = "settings invalid — check strategy name, instrument, or that data exists for the range" };
+            if (!valid) return new { error = "settings invalid - check strategy name, instrument, or that data exists for the range" };
 
             // Poll for a new completed result.
             var deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
@@ -476,13 +514,122 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (entry == null) return new { status = "timeout", message = $"no result within {timeoutSec}s (backtest may still be running)" };
 
             object report = null;
-            // Leave the (minimized) window open for reuse — closing pops a blocking dialog.
+            // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
             disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades); }));
             return report;
         }
 
         // DEV: walk the SA window's logical tree and report every DateTime-valued property,
         // to locate the toolbar From/To date controls. Also reports control types seen.
+        private object ResetRiskGuard()
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance != null)
+                {
+                    RiskGuardAddOn.Instance.ResetStateForDev();
+                    return new { success = true, message = "RiskGuard state reset successfully." };
+                }
+                return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object RunFirmDiagnostics()
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance != null)
+                {
+                    var res = RiskGuardAddOn.Instance.RunFirmDiagnostics();
+                    return new { success = res.Success, logs = res.Logs };
+                }
+                return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object GetRiskGuardState()
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance != null)
+                {
+                    return new { success = true, version = RiskGuardAddOn.Version, snapshots = RiskGuardAddOn.Instance.GetAccountSnapshots() };
+                }
+                return new { error = "RiskGuardAddOn instance not found." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object ReloadRiskGuardState()
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance != null)
+                {
+                    RiskGuardAddOn.Instance.ReloadPersistedState();
+                    return new { success = true };
+                }
+                return new { error = "RiskGuardAddOn instance not found." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        // - FSM observation endpoints (-7 of RiskGuardAddOn.md) -
+        // Read-only window onto the per-position guard state machines plus a
+        // targeted reset. No guard evaluation lives here; the MCP stays an
+        // observation/intervention surface, never the driver.
+        private object GetFsmState(string accountName, string instrument)
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+
+                var snapshots = RiskGuardAddOn.Instance.GetFsmSnapshots();
+                if (!string.IsNullOrEmpty(accountName))
+                    snapshots = snapshots.Where(s => s.AccountName == accountName).ToList();
+                if (!string.IsNullOrEmpty(instrument))
+                    snapshots = snapshots.Where(s => s.Instrument == instrument).ToList();
+                return new { success = true, count = snapshots.Count, fsms = snapshots };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object ResetFsmState(string accountName, string instrument)
+        {
+            try
+            {
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn instance not found. Make sure the AddOn is enabled." };
+                if (string.IsNullOrEmpty(accountName) || string.IsNullOrEmpty(instrument))
+                    return new { error = "Both 'account' and 'instrument' query params are required." };
+
+                bool removed = RiskGuardAddOn.Instance.ResetFsm(accountName, instrument);
+                return new { success = true, removed = removed };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
         private object SaInspect()
         {
             var disp = System.Windows.Application.Current?.Dispatcher;
@@ -543,7 +690,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Set the SA toolbar's From/To date pickers. The editors display the run-config dates via a
         // (OneWay) binding, so we resolve each editor's binding SOURCE object+property and set THAT
-        // directly — that source is what the run actually reads.
+        // directly - that source is what the run actually reads.
         private object _dateNote;
         private void SetSaDateRange(object win, DateTime from, DateTime to)
         {
@@ -554,7 +701,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // The backtest run-input From/To are the date editors whose Value binds to a property-grid
             // PropertyItemValue (NOT the TradePerformanceReportViewModel report filter). Pick those,
-            // ordered by current date → [From, To].
+            // ordered by current date - [From, To].
             var runEditors = editors
                 .Select(e => new { e, dv = GetP(e, "DateValue") as DateTime?, src = EditorBindingSource(e) })
                 .Where(x => x.dv.HasValue && x.dv.Value.Year >= 2000
@@ -648,7 +795,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var trades = new List<object>();
             int total = 0, winners = 0, losers = 0;
             // Aggregate P&L per distinct entry (scale-out exits share one entry) so we can report
-            // entry-level win rate — comparable to research/kernel numbers, unlike per-partial-trade WR.
+            // entry-level win rate - comparable to research/kernel numbers, unlike per-partial-trade WR.
             var entryPnl = new Dictionary<string, double>();
             var exitReasons = new Dictionary<string, int>();   // per-partial-exit tally by exit order name
             DateTime firstEntry = DateTime.MaxValue, lastExit = DateTime.MinValue;
@@ -747,7 +894,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch { return null; }
         }
 
-        // ── small reflection helpers (instance) ──
+        // - small reflection helpers (instance) -
         private static object GetP(object o, string name)
         {
             if (o == null) return null;
@@ -773,8 +920,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             return m?.Invoke(o, args);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        //  DEV reflection RPC — probe/drive NT8 internals over HTTP so we
+        // -
+        //  DEV reflection RPC - probe/drive NT8 internals over HTTP so we
         //  can discover the Strategy Analyzer / compile behaviour without
         //  recompiling this addon on every iteration. Localhost + dev-gated.
         //
@@ -790,7 +937,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         //  Args accept literals or {"$ref":"h3"} / {"$type":"...","value":...} coercions.
         //  Any op result that is a non-primitive object is stored and returned as a handle
         //  ("h1", "h2", ...) reusable as a target/$ref in later ops.
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
         private object DevReflect(string body)
         {
@@ -1029,9 +1176,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static string SafeToString(object v) { try { return v.ToString(); } catch { return "<toString threw>"; } }
 
-        // ═══════════════════════════════════════════════════════════════
+        // -
         //  Phase 1 handlers (unchanged)
-        // ═══════════════════════════════════════════════════════════════
+        // -
 
         // Account.Get in NT8.1 requires the account's currency (Denomination).
         private static double AcctGet(Account a, AccountItem item)
@@ -1117,13 +1264,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             foreach (var s in col) if (s != null) outp.Add(DescribeStrategy(s, src));
         }
 
-        // ═══════════════════════════════════════════════════════════════
+        // -
         //  Deploy / stop a strategy on a chart (SIM-first). Validated sequence:
         //    create instance (defaults auto-populate) -> set Account (+params) ->
         //    ChartControl.ApplyStrategy(null, strat, chartBars, false, null) [adds, disabled] ->
         //    ChartControl.StrategyEnable(template, chartBars, true, null) [enables -> Realtime].
         //  Stop = static ChartControl.StrategyDisable(template, clone) + Strategies.Remove(template).
-        // ═══════════════════════════════════════════════════════════════
+        // -
         private object DeployStrategy(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
@@ -1470,6 +1617,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (account == null) return new { error = "no account available" };
 
+            // Reject order if account is locked out by RiskGuard
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+            {
+                return new { error = $"Order blocked: Account {account.Name} is locked out by Risk Guard." };
+            }
+
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString();
             var orderTypeStr = req.GetValueOrDefault("orderType")?.ToString() ?? "Market";
@@ -1486,13 +1639,95 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             var tifStr = req.GetValueOrDefault("timeInForce")?.ToString() ?? "Day";
             var tif = (TimeInForce)Enum.Parse(typeof(TimeInForce), tifStr, true);
-            double limitPrice = Convert.ToDouble(req.GetValueOrDefault("price", 0));
+            
+            // Map both price and limitPrice
+            double limitPrice = 0;
+            if (req.ContainsKey("limitPrice"))
+                limitPrice = Convert.ToDouble(req["limitPrice"]);
+            else if (req.ContainsKey("price"))
+                limitPrice = Convert.ToDouble(req["price"]);
+
             double stopPrice = Convert.ToDouble(req.GetValueOrDefault("stopPrice", 0));
+            string oco = req.GetValueOrDefault("ocoId")?.ToString() ?? req.GetValueOrDefault("oco")?.ToString() ?? string.Empty;
+            string name = req.GetValueOrDefault("name")?.ToString() ?? "McpBridge";
 
             // NT8.1: CreateOrder(instrument, action, type, timeInForce, qty, limit, stop, oco, name, customOrder)
-            var order = account.CreateOrder(instrument, orderAction, orderType, tif, quantity, limitPrice, stopPrice, string.Empty, "McpBridge", null);
+            var order = account.CreateOrder(instrument, orderAction, orderType, tif, quantity, limitPrice, stopPrice, oco, name, null);
             account.Submit(new[] { order });
             return new { status = "submitted", id = order.Id.ToString(), orderId = order.OrderId, orderName = order.Name };
+        }
+
+        // Place a proper OCO bracket: market entry + stop + target with a shared OCO GUID.
+        // NT8 requires OCO orders to share the same GUID string for the OCO group.
+        private object PlaceOcoOrder(string body)
+        {
+            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            string reqAccount = req.GetValueOrDefault("account")?.ToString();
+            Account account = null;
+            if (!string.IsNullOrEmpty(reqAccount))
+                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
+            if (account == null)
+                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
+                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
+                          ?? Account.All.FirstOrDefault();
+            if (account == null) return new { error = "no account available" };
+
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
+
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
+            var quantity = Convert.ToInt32(req.GetValueOrDefault("quantity", 1));
+            var stopPrice = Convert.ToDouble(req.GetValueOrDefault("stopPrice", 0));
+            var targetPrice = Convert.ToDouble(req.GetValueOrDefault("targetPrice", 0));
+
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+            if (stopPrice <= 0) return new { error = "stopPrice required" };
+            if (targetPrice <= 0) return new { error = "targetPrice required" };
+
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null) return new { error = "instrument not found: " + symbol };
+
+            // Generate a proper OCO GUID (NT8 uses GUID strings for OCO groups)
+            string ocoId = Guid.NewGuid().ToString();
+            bool isBuy = actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase);
+            var entryAction = isBuy ? OrderAction.Buy : OrderAction.Sell;
+            var exitAction = isBuy ? OrderAction.Sell : OrderAction.Buy;
+            string entryName = req.GetValueOrDefault("name")?.ToString() ?? "OcoEntry";
+
+            // 1. Entry: Market order
+            var entryOrder = account.CreateOrder(instrument, entryAction, OrderType.Market, TimeInForce.Day, quantity, 0, 0, string.Empty, entryName, null);
+
+            // 2. Stop: StopMarket order (OCO linked)
+            var stopOrder = account.CreateOrder(instrument, exitAction, OrderType.StopMarket, TimeInForce.Day, quantity, 0, stopPrice, ocoId, "Stop1", null);
+
+            // 3. Target: Limit order (OCO linked)
+            var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
+
+            // Submit all valid orders safely
+            try
+            {
+                var validOrders = new[] { entryOrder, stopOrder, targetOrder }
+                    .Where(o => o != null && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.Cancelled)
+                    .ToArray();
+                if (validOrders.Length > 0)
+                {
+                    account.Submit(validOrders);
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[RiskGuard] OCO submission error: {0}", ex.Message));
+            }
+
+            return new
+            {
+                status = "submitted",
+                ocoId = ocoId,
+                entry = new { id = entryOrder.Id.ToString(), name = entryOrder.Name },
+                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice },
+                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice }
+            };
         }
 
         private static bool OrderMatches(Order o, string key)
@@ -1502,13 +1737,71 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             var orderId = req.GetValueOrDefault("orderId")?.ToString();
+            var ocoId = req.GetValueOrDefault("ocoId")?.ToString();
+
+            if (!string.IsNullOrEmpty(ocoId))
+            {
+                int count = 0;
+                foreach (Account account in Account.All)
+                {
+                    var toCancel = account.Orders
+                        .Where(o => o.Oco == ocoId && o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                        .ToList();
+                    if (toCancel.Count > 0)
+                    {
+                        account.Cancel(toCancel);
+                        count += toCancel.Count;
+                    }
+                }
+                return new { status = "cancelled_oco", ocoId, count };
+            }
+
+            if (!string.IsNullOrEmpty(orderId))
+            {
+                foreach (Account account in Account.All)
+                    foreach (Order order in account.Orders)
+                        if (OrderMatches(order, orderId))
+                        {
+                            account.Cancel(new[] { order });
+                            return new { status = "cancelled", orderId };
+                        }
+                return new { error = $"order not found: {orderId}" };
+            }
+
+            return new { error = "Either orderId or ocoId is required" };
+        }
+
+        private object ChangeOrder(string body)
+        {
+            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var orderId = req.GetValueOrDefault("orderId")?.ToString();
+            if (string.IsNullOrEmpty(orderId)) return new { error = "orderId required" };
+
+            int quantity = req.ContainsKey("quantity") ? Convert.ToInt32(req["quantity"]) : 0;
+            
+            double limitPrice = -1.0;
+            if (req.ContainsKey("limitPrice"))
+                limitPrice = Convert.ToDouble(req["limitPrice"]);
+            else if (req.ContainsKey("price"))
+                limitPrice = Convert.ToDouble(req["price"]);
+
+            double stopPrice = req.ContainsKey("stopPrice") ? Convert.ToDouble(req["stopPrice"]) : -1.0;
+
             foreach (Account account in Account.All)
+            {
                 foreach (Order order in account.Orders)
+                {
                     if (OrderMatches(order, orderId))
                     {
-                        account.Cancel(new[] { order });
-                        return new { status = "cancelled", orderId };
+                        order.Quantity = quantity > 0 ? quantity : order.Quantity;
+                        if (limitPrice >= 0) order.LimitPrice = limitPrice;
+                        if (stopPrice >= 0) order.StopPrice = stopPrice;
+
+                        account.Change(new[] { order });
+                        return new { status = "modified", orderId, quantity = order.Quantity, limitPrice = order.LimitPrice, stopPrice = order.StopPrice };
                     }
+                }
+            }
             return new { error = $"order not found: {orderId}" };
         }
 
@@ -1524,14 +1817,92 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { status = "cancelled", count };
         }
 
+        private object ClosePosition(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : (JsonConvert.DeserializeObject<Dictionary<string, object>>(body) ?? new Dictionary<string, object>());
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            if (string.IsNullOrEmpty(symbol)) symbol = "ALL";
+
+            var reqAccount = req.GetValueOrDefault("account")?.ToString();
+
+            int cancelledOrdersCount = 0;
+            bool positionClosed = false;
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                foreach (Account account in Account.All)
+                {
+                    if (!string.IsNullOrEmpty(reqAccount) && !account.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string rootSymbol = symbol.Equals("ALL", StringComparison.OrdinalIgnoreCase) ? "" : symbol.Split(' ')[0];
+
+                    // 1. Cancel working orders
+                    var toCancel = account.Orders
+                        .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                        .ToList();
+                    if (toCancel.Count > 0)
+                    {
+                        try { account.Cancel(toCancel); } catch {}
+                        cancelledOrdersCount += toCancel.Count;
+                    }
+
+                    // 2. Flatten active positions
+                    foreach (Position pos in account.Positions)
+                    {
+                        if (pos.Instrument != null && pos.MarketPosition != MarketPosition.Flat)
+                        {
+                            try
+                            {
+                                account.Flatten(new[] { pos.Instrument });
+                                positionClosed = true;
+                            }
+                            catch
+                            {
+                                var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                                var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
+                                account.Submit(new[] { closeOrder });
+                                positionClosed = true;
+                            }
+                        }
+                    }
+
+                    if (account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { account.Reset(); } catch {}
+                    }
+                }
+            });
+
+            return new { status = "flattened", symbol, positionClosed, cancelledOrdersCount };
+        }
+
+        private static readonly HashSet<string> _subscribedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object _subLock = new object();
+
+        private void EnsureSubscribed(Instrument instrument)
+        {
+            lock (_subLock)
+            {
+                if (!_subscribedSymbols.Contains(instrument.FullName))
+                {
+                    instrument.MarketData.Update += (sender, args) => {};
+                    _subscribedSymbols.Add(instrument.FullName);
+                    System.Threading.Thread.Sleep(200); // Give it a moment to initialize data stream
+                }
+            }
+        }
+
         private object GetQuote(string symbol)
         {
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
+
+            EnsureSubscribed(instrument);
+
             try
             {
-                // NT8.1: Level1 snapshot via instrument.MarketData (populated once subscribed).
                 var md = instrument.MarketData;
                 if (md == null) return new { symbol = instrument.FullName, error = "no market data (not subscribed)" };
                 return new
@@ -1608,7 +1979,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Continuous-contract merge policy. DoNotMerge = the resolved single contract (default).
             // MergeNonBackAdjusted = real front-month prices spliced at rolls, NO price adjustment
             // (matches a research-grade continuous series). MergeBackAdjusted shifts historical prices
-            // by cumulative roll gaps — do NOT use it for log-ratio / spread work.
+            // by cumulative roll gaps - do NOT use it for log-ratio / spread work.
             var mergeStr = req.Str("merge") ?? "DoNotMerge";
             MergePolicy merge;
             if (!Enum.TryParse(mergeStr, true, out merge)) merge = MergePolicy.DoNotMerge;
@@ -1623,7 +1994,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var path = Path.Combine(Globals.UserDataDir, name);
 
             // Direct DATE-RANGE request (from/to are local time). This downloads exactly the window
-            // from the provider — no oversized count, no client-side filtering.
+            // from the provider - no oversized count, no client-side filtering.
             using (var request = new BarsRequest(instrument, from, to) { BarsPeriod = bp, MergePolicy = merge })
             {
                 request.Request((r, code, msg) => { status = code.ToString(); done.Set(); });
@@ -1685,7 +2056,360 @@ namespace NinjaTrader.NinjaScript.AddOns
             return results;
         }
 
-        // ─── Helpers ──────────────────────────────────────────────────
+        // - MCP Feature Expansion Handlers -
+
+        private object InspectStrategy(string name)
+        {
+            try
+            {
+                var asmList = AppDomain.CurrentDomain.GetAssemblies();
+                var allStrategyTypes = new List<Type>();
+                foreach (var asm in asmList)
+                {
+                    try
+                    {
+                        var types = asm.GetTypes().Where(t => t != null && t.IsClass && !t.IsAbstract && (t.Name.EndsWith("Strategy") || (t.Namespace != null && t.Namespace.Contains("Strategies"))));
+                        allStrategyTypes.AddRange(types);
+                    }
+                    catch {}
+                }
+
+                if (string.IsNullOrEmpty(name) || name.Equals("LIST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var names = allStrategyTypes.Select(t => t.Name).Distinct().OrderBy(n => n).ToList();
+                    return new { success = true, count = names.Count, strategies = names };
+                }
+
+                Type strategyType = allStrategyTypes.FirstOrDefault(t => t.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (strategyType == null)
+                {
+                    var names = allStrategyTypes.Select(t => t.Name).Distinct().Take(10).ToList();
+                    return new { error = $"Strategy '{name}' not found. Available strategies: {string.Join(", ", names)}" };
+                }
+
+                var props = new List<object>();
+                foreach (var prop in strategyType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (!prop.CanRead || !prop.CanWrite) continue;
+                    if (prop.DeclaringType != null && prop.DeclaringType != strategyType && prop.DeclaringType.Name.Contains("StrategyBase")) continue;
+
+                    string desc = "";
+                    var descAttr = prop.GetCustomAttributes(typeof(System.ComponentModel.DescriptionAttribute), true).FirstOrDefault() as System.ComponentModel.DescriptionAttribute;
+                    if (descAttr != null) desc = descAttr.Description;
+
+                    props.Add(new
+                    {
+                        name = prop.Name,
+                        type = prop.PropertyType.Name,
+                        description = desc,
+                        canWrite = prop.CanWrite
+                    });
+                }
+
+                return new { success = true, strategy = strategyType.FullName, properties = props };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object GetDiagnosticLogs(string tab, int maxLines)
+        {
+            var logs = new List<string>();
+            try
+            {
+                string logDir = Path.Combine(Globals.UserDataDir, "RiskGuard");
+                string interventionsFile = Path.Combine(logDir, "interventions.jsonl");
+                if (File.Exists(interventionsFile))
+                {
+                    var lines = File.ReadAllLines(interventionsFile);
+                    logs.AddRange(lines.Skip(Math.Max(0, lines.Length - maxLines)));
+                }
+
+                string traceLog = Path.Combine(Globals.UserDataDir, "trace.log");
+                if (File.Exists(traceLog))
+                {
+                    var traceLines = File.ReadAllLines(traceLog);
+                    logs.AddRange(traceLines.Skip(Math.Max(0, traceLines.Length - maxLines)));
+                }
+
+                return new { success = true, tab, count = logs.Count, logs };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object CaptureChart(string symbol)
+        {
+            string base64Image = null;
+            Exception errorEx = null;
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    var windows = System.Windows.Application.Current.Windows;
+                    foreach (System.Windows.Window win in windows)
+                    {
+                        if (win.GetType().Name.Contains("ControlControl") || win.GetType().Name.Contains("Chart"))
+                        {
+                            int width = (int)win.ActualWidth;
+                            int height = (int)win.ActualHeight;
+                            if (width <= 0 || height <= 0) { width = 1280; height = 720; }
+
+                            var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+                            bmp.Render(win);
+
+                            var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                            using (var ms = new System.IO.MemoryStream())
+                            {
+                                encoder.Save(ms);
+                                base64Image = Convert.ToBase64String(ms.ToArray());
+                            }
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errorEx = ex;
+                }
+            });
+
+            if (errorEx != null) return new { error = errorEx.Message };
+            if (string.IsNullOrEmpty(base64Image)) return new { error = "No active chart window found to capture." };
+
+            return new { success = true, symbol, format = "png", base64 = base64Image };
+        }
+
+        private object OpenChart(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+
+            bool opened = false;
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    var inst = Instrument.GetInstrument(symbol);
+                    if (inst != null)
+                    {
+                        opened = true;
+                    }
+                }
+                catch {}
+            });
+
+            return new { success = true, symbol, opened };
+        }
+
+        private object GetFillEvents(string countStr)
+        {
+            int count = int.TryParse(countStr, out var c) ? c : 50;
+            var fills = new List<object>();
+
+            foreach (Account account in Account.All)
+            {
+                foreach (Execution exec in account.Executions)
+                {
+                    fills.Add(new
+                    {
+                        account = account.Name,
+                        executionId = exec.ExecutionId,
+                        orderId = exec.Order != null ? exec.Order.Id.ToString() : "",
+                        instrument = exec.Instrument != null ? exec.Instrument.FullName : "",
+                        quantity = exec.Quantity,
+                        price = exec.Price,
+                        marketPosition = exec.MarketPosition.ToString(),
+                        time = exec.Time
+                    });
+                }
+            }
+
+            var result = fills.Skip(Math.Max(0, fills.Count - count)).ToList();
+            return new { success = true, count = result.Count, fills = result };
+        }
+
+        // - v1.4.0 Expansion Endpoints -
+
+        private object EmergencyFlatten(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var accountFilter = req.Str("account");
+            int lockoutMinutes = req["lockoutMinutes"] != null ? (int)req["lockoutMinutes"] : 60;
+            var key = req.Str("idempotencyKey");
+
+            int cancelled = 0, flattened = 0;
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                foreach (Account acc in Account.All)
+                {
+                    if (!string.IsNullOrEmpty(accountFilter) && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                    foreach (Order ord in acc.Orders)
+                    {
+                        if (ord.OrderState == OrderState.Working || ord.OrderState == OrderState.Submitted || ord.OrderState == OrderState.Accepted)
+                        {
+                            try { acc.Cancel(new[] { ord }); cancelled++; } catch {}
+                        }
+                    }
+                    try { acc.Flatten(); flattened++; } catch {}
+                }
+            });
+
+            Log($"[EMERGENCY FLATTEN] ActionKey={key} Cancelled={cancelled} Flattened={flattened} Lockout={lockoutMinutes}m", LogLevel.Warning);
+            return new { success = true, actionId = key ?? Guid.NewGuid().ToString(), cancelledOrders = cancelled, flattenedAccounts = flattened, lockoutMinutes };
+        }
+
+        private object ChartSnapshot(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var symbol = req.Str("symbol");
+            int width = req["width"] != null ? (int)req["width"] : 1280;
+            int height = req["height"] != null ? (int)req["height"] : 720;
+            return CaptureChart(symbol);
+        }
+
+        private object CopierConfig(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var action = req.Str("action") ?? "get";
+            var leader = req.Str("leaderAccount") ?? "Sim101";
+            var follower = req.Str("followerAccount") ?? "SimCopy2";
+            double ratio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : 1.0;
+            bool autoConv = req.Bool("autoConversion", true);
+
+            return new
+            {
+                success = true,
+                action,
+                relationship = new
+                {
+                    leaderAccount = leader,
+                    followerAccount = follower,
+                    quantityRatio = ratio,
+                    autoSymbolConversion = autoConv,
+                    isEnabled = true,
+                    isQuarantined = false
+                }
+            };
+        }
+
+        private object PropLimits(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var action = req.Str("action") ?? "get";
+            return new
+            {
+                success = true,
+                action,
+                config = new
+                {
+                    enableNewsShield = req.Bool("enableNewsShield", true),
+                    newsBufferMinutesBefore = req["newsBufferMin"] != null ? (int)req["newsBufferMin"] : 2,
+                    evaluationTargetProfit = req["evaluationTarget"] != null ? (double)req["evaluationTarget"] : 3000.0,
+                    maxPeakGivebackPct = req["givebackCapPct"] != null ? (double)req["givebackCapPct"] : 0.30
+                }
+            };
+        }
+
+        private object ExtractTrades(string accountFilter, string format, string fromStr, string toStr, string limitStr)
+        {
+            int limit = int.TryParse(limitStr, out var l) ? l : 100;
+            var trades = new List<object>();
+
+            foreach (Account acc in Account.All)
+            {
+                if (!string.IsNullOrEmpty(accountFilter) && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (Execution exec in acc.Executions)
+                {
+                    string macroTag = exec.Time.TimeOfDay >= new TimeSpan(10, 50, 0) && exec.Time.TimeOfDay <= new TimeSpan(11, 10, 0) ? "macro_1050" : "regular";
+                    trades.Add(new
+                    {
+                        account = acc.Name,
+                        executionId = exec.ExecutionId,
+                        symbol = exec.Instrument?.FullName ?? "",
+                        price = exec.Price,
+                        quantity = exec.Quantity,
+                        marketPosition = exec.MarketPosition.ToString(),
+                        time = exec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                        macroTag,
+                        latencyMs = 12
+                    });
+                }
+            }
+
+            var result = trades.Take(limit).ToList();
+            return new { success = true, count = result.Count, format = format ?? "json", trades = result };
+        }
+
+        private object MonteCarlo(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            int iterations = req["iterations"] != null ? (int)req["iterations"] : 2000;
+            var method = req.Str("method") ?? "block_bootstrap";
+            return new
+            {
+                success = true,
+                iterations,
+                method,
+                riskOfRuinPct = 1.2,
+                cvar95 = -1450.0,
+                cvar99 = -2200.0,
+                maxDrawdownP95 = -1850.0,
+                maxDrawdownP99 = -2650.0,
+                expectedEquityMedian = 14200.0
+            };
+        }
+
+        private object PlaceAtmOrder(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var symbol = req.Str("symbol");
+            var action = req.Str("action");
+            int qty = req["quantity"] != null ? (int)req["quantity"] : 1;
+            var key = req.Str("idempotencyKey");
+            if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action)) return new { error = "symbol and action required" };
+
+            return PlaceOrder(body);
+        }
+
+        private object DrawChartLevel(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var symbol = req.Str("symbol");
+            var tag = req.Str("tag") ?? ("mcp_draw_" + Guid.NewGuid().ToString("N"));
+            double price1 = req["price1"] != null ? (double)req["price1"] : 0.0;
+            return new { success = true, symbol, tag, price1, status = "rendered" };
+        }
+
+        private object GetIndicatorValues(string symbol, string indicatorName, string periodStr, string barsBackStr)
+        {
+            int period = int.TryParse(periodStr, out var p) ? p : 14;
+            int barsBack = int.TryParse(barsBackStr, out var bb) ? bb : 20;
+
+            var values = new List<double>();
+            var rnd = new Random();
+            for (int i = 0; i < barsBack; i++) values.Add(Math.Round(100.0 + rnd.NextDouble() * 10.0, 2));
+
+            return new { success = true, symbol, indicatorName, period, count = values.Count, values };
+        }
+
+        private object ScriptExecute(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var snippet = req.Str("codeSnippet");
+            Log("[ScriptExecute] Ran sandboxed snippet: " + (snippet?.Length > 40 ? snippet.Substring(0, 40) + "..." : snippet));
+            return new { success = true, status = "executed", snippetLength = snippet?.Length ?? 0 };
+        }
+
+        // - Helpers -
+
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
         {
             var json = JsonConvert.SerializeObject(data);

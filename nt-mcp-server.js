@@ -3,65 +3,110 @@
  * nt-mcp-server.js — MCP (Model Context Protocol) server for NinjaTrader 8
  *
  * Architecture:
- *   Claude/Hermes (MCP stdio)  →  nt-mcp-server.js  →  HTTP :7890  →  NT8 McpBridgeAddOn
+ *   Claude/Hermes (MCP stdio)  →  nt-mcp-server.js  →  HTTP :7890 (Bearer Auth)  →  NT8 McpBridgeAddOn
  *
  * Zero npm dependencies. Uses only Node.js builtins.
  * Run: node nt-mcp-server.js
+ * Version: 1.4.0
  */
 
 import { createInterface } from 'node:readline';
 import { request as httpRequest } from 'node:http';
 
 // ─── Config ─────────────────────────────────────────────────────────────
-const NT8_HOST = process.env.NT8_HOST || 'localhost';
+const NT8_HOST = process.env.NT8_HOST || '127.0.0.1';
 const NT8_PORT = parseInt(process.env.NT8_PORT || '7890', 10);
 const NT8_BASE = `http://${NT8_HOST}:${NT8_PORT}`;
+const NT8_MCP_TOKEN = process.env.NT8_MCP_TOKEN || '';
 
 const SERVER_NAME = 'nt-mcp-server';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '1.4.0';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 
 // ─── Tool Definitions ───────────────────────────────────────────────────
 const TOOLS = [
   {
     name: 'nt_health',
-    description: 'Check connection to NinjaTrader 8',
+    description: 'Check connection to NinjaTrader 8 AddOn, version, and auth status',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'nt_accounts',
-    description: 'List accounts and balances',
+    description: 'List accounts, cash balances, buying power, and total equity',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'nt_positions',
-    description: 'List open positions',
+    description: 'List open market positions with live P&L per account',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'nt_orders',
-    description: 'List working orders',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'nt_place_order',
-    description: 'Place an order',
+    description: 'List active/working orders with execution status and cursor pagination',
     inputSchema: {
       type: 'object',
       properties: {
-        symbol:    { type: 'string', description: 'Ticker (NQ, ES, MES)' },
-        action:    { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
-        quantity:  { type: 'number', description: 'Number of contracts' },
-        orderType: { type: 'string', enum: ['Market', 'Limit', 'StopMarket', 'StopLimit', 'MIT'], description: 'Order type' },
-        price:     { type: 'number', description: 'Price / Limit Price (for Limit/StopLimit/MIT)' },
-        limitPrice: { type: 'number', description: 'Limit Price (alternative to price)' },
-        stopPrice: { type: 'number', description: 'Stop price (for StopMarket/StopLimit)' },
-        timeInForce: { type: 'string', enum: ['Day', 'GTC', 'IOC', 'FOK'], description: 'Time in force' },
-        ocoId:     { type: 'string', description: 'Optional OCO group ID string' },
-        name:      { type: 'string', description: 'Optional custom order label / signal name' },
-        account:   { type: 'string', description: 'Optional target account name' },
+        account: { type: 'string', description: 'Filter by account name' },
+        limit:   { type: 'number', description: 'Max orders to return (default 50)', default: 50 },
+        offset:  { type: 'number', description: 'Offset for pagination', default: 0 },
       },
-      required: ['symbol', 'action', 'quantity'],
+    },
+  },
+  {
+    name: 'nt_place_order',
+    description: 'Place a Market, Limit, StopMarket, StopLimit, or MIT order. Requires idempotencyKey in production mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:         { type: 'string', description: 'Ticker (e.g. NQ 09-26, ES, MES)' },
+        action:         { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
+        quantity:       { type: 'number', description: 'Number of contracts' },
+        orderType:      { type: 'string', enum: ['Market', 'Limit', 'StopMarket', 'StopLimit', 'MIT'], description: 'Order type' },
+        price:          { type: 'number', description: 'Price / Limit Price (for Limit/StopLimit/MIT)' },
+        limitPrice:     { type: 'number', description: 'Limit Price (alternative to price)' },
+        stopPrice:      { type: 'number', description: 'Stop price (for StopMarket/StopLimit)' },
+        timeInForce:    { type: 'string', enum: ['Day', 'GTC', 'IOC', 'FOK'], description: 'Time in force' },
+        ocoId:          { type: 'string', description: 'Optional OCO group ID string' },
+        name:           { type: 'string', description: 'Optional custom order label / signal name' },
+        account:        { type: 'string', description: 'Optional target account name' },
+        idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+      },
+      required: ['symbol', 'action', 'quantity', 'idempotencyKey'],
+    },
+  },
+  {
+    name: 'nt_place_oco_order',
+    description: 'Place paired atomic OCO (One-Cancels-Other) limit/stop orders',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:         { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
+        quantity:       { type: 'number', description: 'Order quantity' },
+        account:        { type: 'string', description: 'Account name', default: 'Sim101' },
+        limitPrice:     { type: 'number', description: 'Profit target limit price' },
+        stopPrice:      { type: 'number', description: 'Stop loss price' },
+        action:         { type: 'string', enum: ['buy', 'sell'], description: 'Primary entry direction' },
+        idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+      },
+      required: ['symbol', 'quantity', 'limitPrice', 'stopPrice', 'action', 'idempotencyKey'],
+    },
+  },
+  {
+    name: 'nt_place_atm_order',
+    description: 'Place an order bound to server-side ATM strategy brackets (stop loss, profit target, auto-breakeven)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:         { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
+        action:         { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
+        quantity:       { type: 'number', description: 'Contracts' },
+        strategyName:   { type: 'string', description: 'ATM strategy template name (e.g. SwingPointTrailing, VolatilityAdaptive, DrawdownShield)', default: 'VolatilityAdaptive' },
+        stopTicks:      { type: 'number', description: 'Stop loss distance in ticks' },
+        targetTicks:    { type: 'number', description: 'Profit target distance in ticks' },
+        account:        { type: 'string', description: 'Target account', default: 'Sim101' },
+        idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+      },
+      required: ['symbol', 'action', 'quantity', 'idempotencyKey'],
     },
   },
   {
@@ -91,7 +136,7 @@ const TOOLS = [
   },
   {
     name: 'nt_cancel_all_orders',
-    description: 'Cancel all working orders',
+    description: 'Cancel all working orders across accounts',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -107,65 +152,260 @@ const TOOLS = [
     },
   },
   {
-    name: 'nt_quote',
-    description: 'Get the current quote',
+    name: 'nt_emergency_flatten',
+    description: 'Atomic Panic Kill-Switch: Cancels all orders, flattens all positions, and engages temporary RiskGuard lockout in one atomic C# call.',
     inputSchema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Ticker' },
+        account:        { type: 'string', description: 'Account name (omit = all accounts)' },
+        lockoutMinutes: { type: 'number', description: 'Minutes to lock account from new trades', default: 60 },
+        idempotencyKey: { type: 'string', description: 'Mandatory UUID string' },
+      },
+      required: ['idempotencyKey'],
+    },
+  },
+  {
+    name: 'nt_quote',
+    description: 'Get the current quote with auto-subscription',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
       },
       required: ['symbol'],
     },
   },
   {
     name: 'nt_bars',
-    description: 'Get historical bars (OHLCV)',
+    description: 'Fetch historical OHLCV bars (Minute, Day, Tick, Volume, Range) with pagination (max 5,000 rows)',
     inputSchema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Ticker' },
-        period: { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Volume', 'Range'], description: 'Period' },
+        symbol:      { type: 'string', description: 'Ticker' },
+        period:      { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Volume', 'Range'], description: 'Period', default: 'Minute' },
         periodValue: { type: 'number', description: 'Period value (e.g. 5 for 5m)', default: 1 },
-        count: { type: 'number', description: 'Number of bars', default: 100 },
+        count:       { type: 'number', description: 'Number of bars (max 5,000)', default: 100 },
+        offset:      { type: 'number', description: 'Pagination offset', default: 0 },
       },
       required: ['symbol'],
     },
   },
   {
     name: 'nt_search',
-    description: 'Search instruments by name',
+    description: 'Search available instrument master records by symbol or name',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query' },
+        query: { type: 'string', description: 'Search query (e.g. NQ, Gold, ES)' },
       },
       required: ['query'],
     },
   },
   {
     name: 'nt_export_bars',
-    description: 'Export historical OHLCV bars over a DATE RANGE to a CSV file on the NT8 machine (NT8 downloads missing history from the data provider on demand). Returns a summary (rows, actual range, filename). Fetch the CSV content with nt_get_export or GET /api/export?name=<file>.',
+    description: 'Export historical OHLCV bars over a UTC DATE RANGE to a CSV file on the NT8 machine (NT8 downloads missing history from data provider on demand).',
     inputSchema: {
       type: 'object',
       properties: {
         symbol:      { type: 'string', description: 'Instrument (e.g. RTY 03-25, ES 09-26, M2K 09-26)' },
-        from:        { type: 'string', description: 'Start date YYYY-MM-DD' },
-        to:          { type: 'string', description: 'End date YYYY-MM-DD (default: now)' },
+        from:        { type: 'string', description: 'UTC Start date YYYY-MM-DD (ISO-8601)' },
+        to:          { type: 'string', description: 'UTC End date YYYY-MM-DD (default: now)' },
         period:      { type: 'string', enum: ['Minute', 'Day', 'Second', 'Tick', 'Volume', 'Range'], description: 'Bars period type', default: 'Minute' },
         periodValue: { type: 'number', description: 'Bars period value (e.g. 5 for 5m)', default: 1 },
-        merge:       { type: 'string', enum: ['DoNotMerge', 'MergeNonBackAdjusted', 'MergeBackAdjusted'], description: 'DoNotMerge = the single anchored contract. MergeNonBackAdjusted = continuous series stitched across front months with NO price adjustment (anchor on any real contract like "ES 09-26"). NEVER use MergeBackAdjusted for spread/log-ratio work — it shifts historical prices by cumulative roll gaps.', default: 'DoNotMerge' },
-        timeoutSec:  { type: 'number', description: 'Max seconds to wait for the provider download', default: 180 },
+        merge:       { type: 'string', enum: ['DoNotMerge', 'MergeNonBackAdjusted', 'MergeBackAdjusted'], description: 'DoNotMerge = single contract. MergeNonBackAdjusted = continuous series stitched with real historical prices. MergeBackAdjusted = price-shifted series.', default: 'DoNotMerge' },
+        timeoutSec:  { type: 'number', description: 'Max seconds to wait for provider download', default: 180 },
       },
       required: ['symbol', 'from'],
     },
   },
   {
     name: 'nt_get_export',
-    description: 'Fetch the content of an export CSV created by nt_export_bars (or a signal log), by filename. WARNING: large files (100k+ bars) can be huge — prefer reading the file directly if on the NT8 machine.',
+    description: 'Fetch the content of an export CSV file by filename.',
     inputSchema: {
       type: 'object',
       properties: { name: { type: 'string', description: 'Export filename, e.g. mcp_bars_RTY_03_25_Minute1.csv' } },
       required: ['name'],
+    },
+  },
+  {
+    name: 'nt_capture_chart',
+    description: 'Capture active NinjaTrader WPF chart window as a base64 PNG screenshot image',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: 'Instrument symbol of chart to capture (e.g. NQ 09-26)' },
+      },
+    },
+  },
+  {
+    name: 'nt_chart_snapshot',
+    description: 'Generate high-res chart snapshot with visual execution markers (buy/sell), price lines, and indicator overlays',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:     { type: 'string', description: 'Instrument symbol' },
+        width:      { type: 'number', description: 'Width px', default: 1280 },
+        height:     { type: 'number', description: 'Height px', default: 720 },
+        markers:    { type: 'array', description: 'Overlay markers [{ time, price, label, color }]' },
+        indicators: { type: 'array', description: 'Indicator names to highlight' },
+      },
+    },
+  },
+  {
+    name: 'nt_open_chart',
+    description: 'Programmatically open a new chart window/tab for a symbol and period',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:      { type: 'string', description: 'Instrument symbol (e.g. NQ 09-26)' },
+        period:      { type: 'string', enum: ['Minute', 'Day', 'Second', 'Tick', 'Volume', 'Range'], default: 'Minute' },
+        periodValue: { type: 'number', default: 1 },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'nt_get_logs',
+    description: 'Tail NinjaTrader Output tab logs, Strategy Analyzer output, or interventions.jsonl audit file',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab:   { type: 'string', enum: ['Output', 'Log', 'Interventions'], default: 'Output' },
+        lines: { type: 'number', description: 'Number of lines to tail', default: 100 },
+      },
+    },
+  },
+  {
+    name: 'nt_fill_events',
+    description: 'Query account execution fill history with pagination',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Filter by account' },
+        count:   { type: 'number', description: 'Number of recent fills to return', default: 50 },
+        offset:  { type: 'number', description: 'Offset for pagination', default: 0 },
+      },
+    },
+  },
+  {
+    name: 'nt_inspect_strategy',
+    description: 'Inspect property declarations, input parameters, and metadata of compiled NinjaScript strategies',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Strategy class name (e.g. PathSignatureUnion or LIST)' },
+      },
+    },
+  },
+  {
+    name: 'nt_riskguard_state',
+    description: 'Read live RiskGuard account FSM state (Flat, InPosition, SoftStop, HardStop, Lockout), drawdown, and loss limits',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account:    { type: 'string', description: 'Account name' },
+        instrument: { type: 'string', description: 'Instrument name' },
+      },
+    },
+  },
+  {
+    name: 'nt_copier_config',
+    description: 'Get/Set TradeCopierEngine relationships (Leader-Follower account ratios, Micro/Mini scaling, account quarantine)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action:        { type: 'string', enum: ['get', 'set', 'quarantine'], default: 'get' },
+        leaderAccount: { type: 'string', description: 'Leader account name' },
+        followerAccount:{ type: 'string', description: 'Follower account name' },
+        quantityRatio: { type: 'number', description: 'Quantity scaling ratio', default: 1.0 },
+        autoConversion: { type: 'boolean', description: 'Auto Mini -> Micro conversion (NQ -> 10 MNQ)', default: true },
+      },
+    },
+  },
+  {
+    name: 'nt_prop_limits',
+    description: 'Query and update PropFirmProtectionSuite rules (Target Profit lock, Peak Equity Giveback cap, High-Impact News Shield blackout windows)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action:           { type: 'string', enum: ['get', 'set'], default: 'get' },
+        enableNewsShield: { type: 'boolean', description: 'Enable High-Impact USD news blackout shield' },
+        newsBufferMin:    { type: 'number', description: 'News blackout buffer minutes before/after' },
+        evaluationTarget: { type: 'number', description: 'Evaluation target profit lock ($)' },
+        givebackCapPct:   { type: 'number', description: 'Max peak equity giveback cap % (e.g. 0.30)' },
+      },
+    },
+  },
+  {
+    name: 'nt_extract_trades',
+    description: 'Extract trade execution records enriched with MAE, MFE, duration, commissions, macro session window tags, and latency metrics for trade journaling (JSON/CSV)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account:   { type: 'string', description: 'Account name' },
+        format:    { type: 'string', enum: ['json', 'csv'], default: 'json' },
+        from:      { type: 'string', description: 'UTC Start date YYYY-MM-DD (ISO-8601)' },
+        to:        { type: 'string', description: 'UTC End date YYYY-MM-DD' },
+        limit:     { type: 'number', description: 'Max trades', default: 100 },
+      },
+    },
+  },
+  {
+    name: 'nt_monte_carlo',
+    description: 'Run Block Bootstrap Monte Carlo simulations over trade history to evaluate Risk of Ruin %, CVaR @ 95%/99%, and drawdown confidence bands',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy:    { type: 'string', description: 'Strategy name or source dataset' },
+        iterations:  { type: 'number', description: 'Number of Monte Carlo runs (1,000 - 10,000)', default: 2000 },
+        method:      { type: 'string', enum: ['standard', 'block_bootstrap'], default: 'block_bootstrap' },
+        blockSize:   { type: 'number', description: 'Block size for block bootstrap', default: 5 },
+        sizingModel: { type: 'string', enum: ['fixed_lot', 'fixed_fractional', 'volatility_scaled'], default: 'fixed_lot' },
+      },
+    },
+  },
+  {
+    name: 'nt_draw_level',
+    description: 'Plot S/R levels, Midnight Open, HOD/LOD, or FVG boxes directly onto NT8 charts via native Draw.* methods',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:    { type: 'string', description: 'Instrument symbol' },
+        shapeType: { type: 'string', enum: ['line', 'rectangle', 'text'], default: 'line' },
+        tag:       { type: 'string', description: 'Drawing tag ID' },
+        price1:    { type: 'number', description: 'Primary price level' },
+        price2:    { type: 'number', description: 'Secondary price level (for rectangles)' },
+        time1:     { type: 'string', description: 'UTC Start time' },
+        time2:     { type: 'string', description: 'UTC End time' },
+        label:     { type: 'string', description: 'Text label' },
+        color:     { type: 'string', description: 'Hex color string (e.g. #FF0000)', default: '#0000FF' },
+      },
+      required: ['symbol', 'tag', 'price1'],
+    },
+  },
+  {
+    name: 'nt_indicator_values',
+    description: 'Retrieve calculated historical or live indicator values (SMA, EMA, VWAP, ATR, Daily NY Levels) for a symbol or running strategy',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:        { type: 'string', description: 'Instrument symbol' },
+        indicatorName: { type: 'string', description: 'Indicator class name (e.g. SMA, VWAP, ATR)' },
+        period:        { type: 'number', description: 'Indicator period setting', default: 14 },
+        barsBack:      { type: 'number', description: 'Number of historical values to return', default: 20 },
+      },
+      required: ['symbol', 'indicatorName'],
+    },
+  },
+  {
+    name: 'nt_script_execute',
+    description: 'Execute a sandboxed C# utility snippet or pre-approved helper function inside NinjaTrader',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        codeSnippet: { type: 'string', description: 'C# code snippet to execute' },
+      },
+      required: ['codeSnippet'],
     },
   },
 
@@ -207,18 +447,18 @@ const TOOLS = [
   },
   {
     name: 'nt_backtest',
-    description: 'Run a backtest of a compiled strategy via the NT8 Strategy Analyzer over a configurable symbol, date range, timeframe, and parameters. Returns performance metrics (net P&L, drawdown, gross P/L, trade count) + a capped trade list.',
+    description: 'Run a backtest of a compiled strategy via the NT8 Strategy Analyzer over a configurable symbol, UTC date range, timeframe, and parameters.',
     inputSchema: {
       type: 'object',
       properties: {
         strategy:    { type: 'string', description: 'Strategy class name (must be compiled first)' },
         symbol:      { type: 'string', description: 'Instrument (e.g. GC 08-26, NQ, ES)' },
-        from:        { type: 'string', description: 'Start date YYYY-MM-DD (defaults to the Strategy Analyzer range if omitted)' },
-        to:          { type: 'string', description: 'End date YYYY-MM-DD (defaults to the Strategy Analyzer range if omitted)' },
+        from:        { type: 'string', description: 'UTC Start date YYYY-MM-DD' },
+        to:          { type: 'string', description: 'UTC End date YYYY-MM-DD' },
         period:      { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Second', 'Range', 'Volume'], description: 'Bars period type', default: 'Minute' },
         periodValue: { type: 'number', description: 'Bars period value (e.g. 5 for 5m)', default: 1 },
         params:      { type: 'object', description: 'Strategy parameter overrides { paramName: value }' },
-        maxTrades:   { type: 'number', description: 'Max trades to include in the response (metrics always full)', default: 50 },
+        maxTrades:   { type: 'number', description: 'Max trades to include in the response', default: 50 },
         timeoutSec:  { type: 'number', description: 'Server-side wait for the run to finish', default: 180 },
       },
       required: ['strategy', 'symbol'],
@@ -231,7 +471,7 @@ const TOOLS = [
   },
   {
     name: 'nt_deploy_strategy',
-    description: 'Deploy a compiled strategy onto an OPEN chart and enable it (SIM-first). Adds the strategy to the chart for the given instrument, sets the account (default Sim101) + optional params, and enables it (Realtime). A live (non-sim) account requires confirmLive:true. Requires a chart already open for that instrument.',
+    description: 'Deploy a compiled strategy onto an OPEN chart and enable it (SIM-first). A live account requires confirmLive:true.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -247,25 +487,25 @@ const TOOLS = [
   },
   {
     name: 'nt_stop_strategy',
-    description: 'Stop running strategies: disable and remove them from the chart, and (by default) flatten any open position with an offsetting market order. Filter by strategy class name and/or account (omit both to stop all).',
+    description: 'Stop running strategies: disable and remove them from the chart, and flatten open positions.',
     inputSchema: {
       type: 'object',
       properties: {
         strategy: { type: 'string', description: 'Strategy class name to stop (omit = all)' },
         account:  { type: 'string', description: 'Limit to this account (omit = all)' },
-        flatten:  { type: 'boolean', description: 'Flatten the stopped strategy\'s open position via an offsetting market order', default: true },
+        flatten:  { type: 'boolean', description: 'Flatten open position via offsetting market order', default: true },
       },
     },
   },
   {
     name: 'nt_set_strategy_param',
-    description: 'Change inputs on a RUNNING strategy live, with no restart. Examples: { "Qty": 2 } to resize; { "AllowLong": false, "AllowShort": false } to pause trading (it keeps calculating but opens nothing new — un-pause by setting them true). Only affects inputs the strategy re-reads each bar; startup-only inputs (instrument, account, session windows) need a disable/enable. Filter by strategy class name and/or account.',
+    description: 'Change inputs on a RUNNING strategy live, with no restart.',
     inputSchema: {
       type: 'object',
       properties: {
         strategy: { type: 'string', description: 'Strategy class name (omit = all running)' },
         account:  { type: 'string', description: 'Limit to this account (omit = all)' },
-        params:   { type: 'object', description: 'Inputs to set, e.g. { "Qty": 2 } or { "AllowLong": false, "AllowShort": false }' },
+        params:   { type: 'object', description: 'Inputs to set' },
       },
       required: ['params'],
     },
@@ -281,9 +521,17 @@ function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
       hostname: url.hostname,
       port: url.port,
       path: url.pathname + url.search,
-      headers: { 'Accept': 'application/json' },
+      headers: {
+        'Accept': 'application/json',
+        'X-NT8-MCP-Version': SERVER_VERSION,
+      },
       timeout: timeoutMs,
     };
+
+    if (NT8_MCP_TOKEN) {
+      options.headers['Authorization'] = `Bearer ${NT8_MCP_TOKEN}`;
+    }
+
     if (body) {
       const data = JSON.stringify(body);
       options.headers['Content-Type'] = 'application/json';
@@ -314,8 +562,6 @@ function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
 // ─── MCP Protocol ──────────────────────────────────────────────────────
 const rl = createInterface({ input: process.stdin });
 
-let messageId = 0;
-
 function sendMessage(msg) {
   const str = JSON.stringify(msg);
   process.stdout.write(str + '\n');
@@ -334,7 +580,7 @@ async function handleToolCall(name, args) {
   switch (name) {
     case 'nt_health': {
       const res = await ntFetch('/api/health');
-      return { status: res.status === 200 ? 'connected' : 'error', nt8: res.data };
+      return { status: res.status === 200 ? 'connected' : 'error', version: SERVER_VERSION, nt8: res.data };
     }
 
     case 'nt_accounts': {
@@ -348,12 +594,26 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_orders': {
-      const res = await ntFetch('/api/orders');
-      return Array.isArray(res.data) ? res.data : [];
+      const params = new URLSearchParams();
+      if (args.account) params.append('account', args.account);
+      if (args.limit) params.append('limit', String(args.limit));
+      if (args.offset) params.append('offset', String(args.offset));
+      const res = await ntFetch(`/api/orders?${params}`);
+      return res.data;
     }
 
     case 'nt_place_order': {
       const res = await ntFetch('/api/order', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_place_oco_order': {
+      const res = await ntFetch('/api/order/oco', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_place_atm_order': {
+      const res = await ntFetch('/api/order/atm', 'POST', args);
       return res.data;
     }
 
@@ -377,6 +637,11 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    case 'nt_emergency_flatten': {
+      const res = await ntFetch('/api/emergency-flatten', 'POST', args);
+      return res.data;
+    }
+
     case 'nt_quote': {
       const res = await ntFetch(`/api/quote?symbol=${encodeURIComponent(args.symbol)}`);
       return res.data;
@@ -388,6 +653,7 @@ async function handleToolCall(name, args) {
         period: args.period || 'Minute',
         periodValue: String(args.periodValue || 1),
         count: String(args.count || 100),
+        offset: String(args.offset || 0),
       });
       const res = await ntFetch(`/api/bars?${params}`);
       return res.data;
@@ -411,6 +677,100 @@ async function handleToolCall(name, args) {
 
     case 'nt_get_export': {
       const res = await ntFetch(`/api/export?name=${encodeURIComponent(args.name)}`, 'GET', null, 60000);
+      return res.data;
+    }
+
+    case 'nt_capture_chart': {
+      const res = await ntFetch(`/api/chart/capture?symbol=${encodeURIComponent(args.symbol || '')}`);
+      return res.data;
+    }
+
+    case 'nt_chart_snapshot': {
+      const res = await ntFetch('/api/chart/snapshot', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_open_chart': {
+      const res = await ntFetch('/api/chart/open', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_get_logs': {
+      const params = new URLSearchParams({
+        tab: args.tab || 'Output',
+        lines: String(args.lines || 100),
+      });
+      const res = await ntFetch(`/api/logs?${params}`);
+      return res.data;
+    }
+
+    case 'nt_fill_events': {
+      const params = new URLSearchParams();
+      if (args.account) params.append('account', args.account);
+      if (args.count) params.append('count', String(args.count));
+      if (args.offset) params.append('offset', String(args.offset));
+      const res = await ntFetch(`/api/events/fills?${params}`);
+      return res.data;
+    }
+
+    case 'nt_inspect_strategy': {
+      const res = await ntFetch(`/api/strategy/inspect?name=${encodeURIComponent(args.name || 'LIST')}`);
+      return res.data;
+    }
+
+    case 'nt_riskguard_state': {
+      const params = new URLSearchParams();
+      if (args.account) params.append('account', args.account);
+      if (args.instrument) params.append('instrument', args.instrument);
+      const res = await ntFetch(`/api/riskguard/fsm-state?${params}`);
+      return res.data;
+    }
+
+    case 'nt_copier_config': {
+      const res = await ntFetch('/api/copier/config', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_prop_limits': {
+      const res = await ntFetch('/api/prop/limits', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_extract_trades': {
+      const params = new URLSearchParams({
+        format: args.format || 'json',
+        limit: String(args.limit || 100),
+      });
+      if (args.account) params.append('account', args.account);
+      if (args.from) params.append('from', args.from);
+      if (args.to) params.append('to', args.to);
+      const res = await ntFetch(`/api/trades/extract?${params}`);
+      return res.data;
+    }
+
+    case 'nt_monte_carlo': {
+      const res = await ntFetch('/api/trades/monte-carlo', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_draw_level': {
+      const res = await ntFetch('/api/chart/draw', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_indicator_values': {
+      const params = new URLSearchParams({
+        symbol: args.symbol,
+        indicatorName: args.indicatorName,
+        period: String(args.period || 14),
+        barsBack: String(args.barsBack || 20),
+      });
+      const res = await ntFetch(`/api/indicator/values?${params}`);
+      return res.data;
+    }
+
+    case 'nt_script_execute': {
+      const res = await ntFetch('/api/script/execute', 'POST', args);
       return res.data;
     }
 
@@ -455,28 +815,22 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_compile': {
-      // A SUCCESSFUL compile hot-swaps the NinjaScript AppDomain, which tears down
-      // the bridge's HTTP listener mid-response — the POST connection drops. That
-      // dropped connection is actually the success signal. Either way, the authoritative
-      // result is written to a durable file: read it back from /api/compile/result.
       try {
         await ntFetch('/api/compile', 'POST', { debug: !!args.debug }, 30000);
       } catch {
-        // expected on success (connection reset by the hot-swap) — fall through to poll
+        // expected on success (connection reset by hot-swap)
       }
-      // give the AppDomain a moment to reload, then fetch the durable result
       for (let i = 0; i < 15; i++) {
         await new Promise((r) => setTimeout(r, 1500));
         try {
           const res = await ntFetch('/api/compile/result', 'GET', null, 5000);
           if (res.status === 200 && res.data && typeof res.data === 'object') return res.data;
-        } catch { /* bridge still reloading — retry */ }
+        } catch { /* bridge reloading */ }
       }
-      return { error: 'compile result unavailable (bridge may still be reloading — try nt_compile result via /api/compile/result)' };
+      return { error: 'compile result unavailable' };
     }
 
     case 'nt_backtest': {
-      // Backtests run synchronously server-side and can take a while; use a long timeout.
       const res = await ntFetch('/api/backtest', 'POST', args, 300000);
       return res.data;
     }
@@ -492,7 +846,7 @@ rl.on('line', async (line) => {
   try {
     msg = JSON.parse(line);
   } catch {
-    return; // invalid JSON, ignore
+    return;
   }
 
   const { id, method, params } = msg;
@@ -509,7 +863,6 @@ rl.on('line', async (line) => {
       }
 
       case 'notifications/initialized': {
-        // no response needed
         break;
       }
 
@@ -521,7 +874,6 @@ rl.on('line', async (line) => {
       case 'tools/call': {
         const { name, arguments: args } = params;
         const result = await handleToolCall(name, args || {});
-        // Wrap result in content array as per MCP spec
         sendResult(id, {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         });
@@ -538,5 +890,5 @@ rl.on('line', async (line) => {
 });
 
 // ─── Startup ────────────────────────────────────────────────────────────
-console.error(`[nt-mcp] Server started — NT8 at ${NT8_BASE}`);
+console.error(`[nt-mcp] Server v${SERVER_VERSION} started — NT8 at ${NT8_BASE}`);
 console.error('[nt-mcp] Waiting for MCP messages on stdin...');

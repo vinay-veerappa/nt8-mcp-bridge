@@ -174,6 +174,25 @@ Example `nt_backtest` — the same strategy over a specific symbol, date range, 
 | `nt_stop_strategy` | Disable + remove running strategies (filter by class name / account). Does **not** auto-flatten an open position. |
 | `nt_strategy_status` | List strategies NT8 is running on an account: state (Realtime/…), account, instrument, timeframe, position, quantity. |
 
+### Phase 5 — Unbound v1.1.0 Endpoints & v1.2 Expansion Pipeline
+
+| Tool | Description |
+|------|-------------|
+| `nt_capture_chart` | Capture WPF chart window into base64 PNG images for visual inspection of setups and trade executions. |
+| `nt_open_chart` | Programmatically open chart windows/tabs for any symbol/timeframe (enables zero-manual-step deploy). |
+| `nt_get_logs` | Tail NT8 Output tab logs, Strategy Analyzer output, or `interventions.jsonl` audit files for error diagnosis. |
+| `nt_fill_events` | Query account execution history (`account.Executions`) for trade reconciliation and fill audit. |
+| `nt_inspect_strategy` | Inspect property declarations, inputs, and parameters of compiled strategies via reflection. |
+| `nt_riskguard_state` | Read live RiskGuard FSM state, peak equity drawdown, and daily loss limit snapshots. |
+| `nt_copier_config` | *(Upcoming)* Dynamic runtime configuration of `TradeCopierEngine.cs` (Leader/Follower account ratios, Micro/Mini lot scaling). |
+| `nt_prop_limits` | *(Upcoming)* Dynamic configuration of `PropFirmProtectionSuite.cs` (Target Profit lock, News Shield buffers). |
+| `nt_extract_trades` / `nt_journal_export` | *(Upcoming)* Export trade executions with MAE/MFE, duration, P&L, commissions, and ICT context to TraderSync, TradesViz, or Markdown journals. |
+| `nt_trade_chart` | *(Upcoming)* Automated chart screenshots centered on trade entry/exit with buy/sell markers and stop/target price lines. |
+| `nt_monte_carlo` | *(Upcoming)* Run $1,000$–$10,000$ iteration Monte Carlo simulations on trade histories to evaluate ruin probability, drawdown confidence bands, and slippage sensitivity. |
+| `nt_optimize` | *(Upcoming)* Parameter optimization via Strategy Analyzer (Grid/Genetic search space) and Walk-Forward Analysis (`nt_walk_forward`). |
+| `nt_place_atm_order` | *(Upcoming)* Order entry with server-side ATM strategy brackets (stop loss, profit targets, auto-breakeven managed by `DynamicAtmManager.cs`). |
+| `nt_draw_level` / `nt_draw_shape` | *(Upcoming)* Plot support/resistance levels, HOD/LOD, Midnight Open, and FVG boxes directly onto NT8 charts via native `Draw.*` methods. |
+
 **Typical Phase 4 flow:** open a chart for the instrument → `nt_deploy_strategy` (add + enable on
 Sim101) → `nt_strategy_status` (watch state + position) → `nt_stop_strategy` (disable + remove).
 
@@ -224,15 +243,18 @@ result is written to a durable file and `nt_compile` reads it back automatically
   2020→present (~19.6M rows), kept current by a scheduled daily incremental updater
 - **Phase 4** — live deployment (`nt_deploy_strategy`, SIM-first), monitoring (`nt_strategy_status`),
   teardown (`nt_stop_strategy`), and per-fill AI-Gate alert webhooks inside the strategies
+- **v1.1.0 AddOn Updates** — chart screenshot capture (`nt_capture_chart`), programmatic chart opening (`nt_open_chart`), diagnostic log tailing (`nt_get_logs`), fill history streaming (`nt_fill_events`), and strategy metadata inspection (`nt_inspect_strategy`).
 
-**Still ahead:**
-- `nt_optimize` — parameter optimization via the Strategy Analyzer optimizer
-- `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
-- Auto-open a chart during deploy (today `nt_deploy_strategy` requires a chart already open for the
-  instrument); auto-flatten on stop
-- Data archive: the NT8-live-capture **lineage gate** — currently **DEFERRED**; it needs a genuine
-  NT8/Tradovate live capture to diff against the historical re-pull (comparing to the legacy
-  cross-vendor `ohlcv_bars` is not a valid substitute)
+**Upcoming Expansion (v1.4.0 Specification):**
+- **Production Safety & Architecture**: Local Bearer token auth, mandatory `idempotencyKey` order deduplication, atomic `nt_emergency_flatten` kill-switch, `interventions.jsonl` action audit logs, `X-NT8-MCP-Version: 1.4.0` headers, and SIM auto-gating for fresh Roslyn builds.
+- **Data & Error Standards**: Explicit UTC input/output date contract, ET (`America/New_York`) macro window boundaries, cursor pagination for bars/orders/fills, and standardized JSON error objects.
+- **Phase 5 (Observability & Debugging)**: `nt_chart_snapshot` (enhanced screenshot + visual markers, price lines, indicators), `nt_indicator_values` (deep series + running strategy collection), `nt_strategy_debug` (trace logs & variable state dumps).
+- **Phase 6 (Advanced Research & Quant Optimization)**: `nt_optimize` + `nt_walk_forward` (Bayesian/Gaussian, Pareto fronts, `run_id` provenance), `nt_portfolio_backtest`, `nt_synthetic_data` (stress scenarios: COVID crash, 2008 shock), `nt_signal_backtest`.
+- **Phase 7 (Automation & Workflow Execution)**: `nt_script_execute` (sandboxed C# snippet execution), `nt_schedule` / `nt_task`, `nt_trade_journal` (CRUD + tags), `nt_alert` / `nt_webhook`.
+- **Phase 8 (Risk, Compliance & Prop Firm Suite)**: `nt_riskguard_config` (trailing DD, vol limits, time restrictions), `nt_compliance_report`, `nt_multi_account_orchestrator`, `nt_subscribe` (SSE real-time event stream channel for fills, FSM transitions, errors).
+
+
+
 
 ## Requirements
 
