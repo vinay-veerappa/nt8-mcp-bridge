@@ -219,6 +219,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
                 case "/api/strategy/param":     return Post(method, () => SetStrategyParam(body));
+                case "/api/strategy/inspect":   return InspectStrategy(query["name"]);
+                case "/api/logs":               return GetDiagnosticLogs(query["tab"] ?? "Output", int.TryParse(query["lines"], out var l) ? l : 100);
+                case "/api/chart/capture":      return CaptureChart(query["symbol"]);
+                case "/api/chart/open":         return Post(method, () => OpenChart(body));
+                case "/api/events/fills":       return GetFillEvents(query["count"] ?? "50");
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
@@ -1689,8 +1694,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             // 3. Target: Limit order (OCO linked)
             var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
 
-            // Submit all three as a batch
-            account.Submit(new[] { entryOrder, stopOrder, targetOrder });
+            // Submit all valid orders safely
+            try
+            {
+                var validOrders = new[] { entryOrder, stopOrder, targetOrder }
+                    .Where(o => o != null && o.OrderState != OrderState.CancelPending && o.OrderState != OrderState.Cancelled)
+                    .ToArray();
+                if (validOrders.Length > 0)
+                {
+                    account.Submit(validOrders);
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(string.Format("[RiskGuard] OCO submission error: {0}", ex.Message));
+            }
 
             return new
             {
@@ -1791,9 +1809,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object ClosePosition(string body)
         {
-            var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : (JsonConvert.DeserializeObject<Dictionary<string, object>>(body) ?? new Dictionary<string, object>());
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
-            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+            if (string.IsNullOrEmpty(symbol)) symbol = "ALL";
 
             var reqAccount = req.GetValueOrDefault("account")?.ToString();
 
@@ -1805,27 +1823,27 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!string.IsNullOrEmpty(reqAccount) && !account.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                string rootSymbol = string.IsNullOrEmpty(symbol) ? "" : symbol.Split(' ')[0];
                 // 1. Cancel working orders for this instrument
                 var toCancel = account.Orders
-                    .Where(o => o.Instrument != null && o.Instrument.FullName.Equals(symbol, StringComparison.OrdinalIgnoreCase)
+                    .Where(o => o.Instrument != null && (string.IsNullOrEmpty(rootSymbol) || o.Instrument.MasterInstrument.Name.Equals(rootSymbol, StringComparison.OrdinalIgnoreCase) || o.Instrument.FullName.IndexOf(rootSymbol, StringComparison.OrdinalIgnoreCase) >= 0)
                                 && o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
                     .ToList();
                 if (toCancel.Count > 0)
                 {
-                    account.Cancel(toCancel);
+                    try { account.Cancel(toCancel); } catch {}
                     cancelledOrdersCount += toCancel.Count;
                 }
 
                 // 2. Flatten active positions
                 foreach (Position pos in account.Positions)
                 {
-                    if (pos.Instrument != null && pos.Instrument.FullName.Equals(symbol, StringComparison.OrdinalIgnoreCase)
+                    if (pos.Instrument != null && (string.IsNullOrEmpty(rootSymbol) || pos.Instrument.MasterInstrument.Name.Equals(rootSymbol, StringComparison.OrdinalIgnoreCase) || pos.Instrument.FullName.IndexOf(rootSymbol, StringComparison.OrdinalIgnoreCase) >= 0)
                         && pos.MarketPosition != MarketPosition.Flat)
                     {
-                        var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.Buy;
+                        var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
                         var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
-                        account.Submit(new[] { closeOrder });
-                        positionClosed = true;
+                        try { account.Submit(new[] { closeOrder }); positionClosed = true; } catch {}
                     }
                 }
             }
@@ -2010,6 +2028,186 @@ namespace NinjaTrader.NinjaScript.AddOns
                     exchange = inst.Exchange.ToString(), type = inst.MasterInstrument?.InstrumentType.ToString(),
                 });
             return results;
+        }
+
+        // - MCP Feature Expansion Handlers -
+
+        private object InspectStrategy(string name)
+        {
+            try
+            {
+                var asmList = AppDomain.CurrentDomain.GetAssemblies();
+                var allStrategyTypes = new List<Type>();
+                foreach (var asm in asmList)
+                {
+                    try
+                    {
+                        var types = asm.GetTypes().Where(t => t != null && t.IsClass && !t.IsAbstract && (t.Name.EndsWith("Strategy") || (t.Namespace != null && t.Namespace.Contains("Strategies"))));
+                        allStrategyTypes.AddRange(types);
+                    }
+                    catch {}
+                }
+
+                if (string.IsNullOrEmpty(name) || name.Equals("LIST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var names = allStrategyTypes.Select(t => t.Name).Distinct().OrderBy(n => n).ToList();
+                    return new { success = true, count = names.Count, strategies = names };
+                }
+
+                Type strategyType = allStrategyTypes.FirstOrDefault(t => t.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (strategyType == null)
+                {
+                    var names = allStrategyTypes.Select(t => t.Name).Distinct().Take(10).ToList();
+                    return new { error = $"Strategy '{name}' not found. Available strategies: {string.Join(", ", names)}" };
+                }
+
+                var props = new List<object>();
+                foreach (var prop in strategyType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (!prop.CanRead || !prop.CanWrite) continue;
+                    if (prop.DeclaringType != null && prop.DeclaringType != strategyType && prop.DeclaringType.Name.Contains("StrategyBase")) continue;
+
+                    string desc = "";
+                    var descAttr = prop.GetCustomAttributes(typeof(System.ComponentModel.DescriptionAttribute), true).FirstOrDefault() as System.ComponentModel.DescriptionAttribute;
+                    if (descAttr != null) desc = descAttr.Description;
+
+                    props.Add(new
+                    {
+                        name = prop.Name,
+                        type = prop.PropertyType.Name,
+                        description = desc,
+                        canWrite = prop.CanWrite
+                    });
+                }
+
+                return new { success = true, strategy = strategyType.FullName, properties = props };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object GetDiagnosticLogs(string tab, int maxLines)
+        {
+            var logs = new List<string>();
+            try
+            {
+                string logDir = Path.Combine(Globals.UserDataDir, "RiskGuard");
+                string interventionsFile = Path.Combine(logDir, "interventions.jsonl");
+                if (File.Exists(interventionsFile))
+                {
+                    var lines = File.ReadAllLines(interventionsFile);
+                    logs.AddRange(lines.Skip(Math.Max(0, lines.Length - maxLines)));
+                }
+
+                string traceLog = Path.Combine(Globals.UserDataDir, "trace.log");
+                if (File.Exists(traceLog))
+                {
+                    var traceLines = File.ReadAllLines(traceLog);
+                    logs.AddRange(traceLines.Skip(Math.Max(0, traceLines.Length - maxLines)));
+                }
+
+                return new { success = true, tab, count = logs.Count, logs };
+            }
+            catch (Exception ex)
+            {
+                return new { error = ex.Message };
+            }
+        }
+
+        private object CaptureChart(string symbol)
+        {
+            string base64Image = null;
+            Exception errorEx = null;
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    var windows = System.Windows.Application.Current.Windows;
+                    foreach (System.Windows.Window win in windows)
+                    {
+                        if (win.GetType().Name.Contains("ControlControl") || win.GetType().Name.Contains("Chart"))
+                        {
+                            int width = (int)win.ActualWidth;
+                            int height = (int)win.ActualHeight;
+                            if (width <= 0 || height <= 0) { width = 1280; height = 720; }
+
+                            var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+                            bmp.Render(win);
+
+                            var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                            using (var ms = new System.IO.MemoryStream())
+                            {
+                                encoder.Save(ms);
+                                base64Image = Convert.ToBase64String(ms.ToArray());
+                            }
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errorEx = ex;
+                }
+            });
+
+            if (errorEx != null) return new { error = errorEx.Message };
+            if (string.IsNullOrEmpty(base64Image)) return new { error = "No active chart window found to capture." };
+
+            return new { success = true, symbol, format = "png", base64 = base64Image };
+        }
+
+        private object OpenChart(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
+            var symbol = req.GetValueOrDefault("symbol")?.ToString();
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+
+            bool opened = false;
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    var inst = Instrument.GetInstrument(symbol);
+                    if (inst != null)
+                    {
+                        opened = true;
+                    }
+                }
+                catch {}
+            });
+
+            return new { success = true, symbol, opened };
+        }
+
+        private object GetFillEvents(string countStr)
+        {
+            int count = int.TryParse(countStr, out var c) ? c : 50;
+            var fills = new List<object>();
+
+            foreach (Account account in Account.All)
+            {
+                foreach (Execution exec in account.Executions)
+                {
+                    fills.Add(new
+                    {
+                        account = account.Name,
+                        executionId = exec.ExecutionId,
+                        orderId = exec.Order != null ? exec.Order.Id.ToString() : "",
+                        instrument = exec.Instrument != null ? exec.Instrument.FullName : "",
+                        quantity = exec.Quantity,
+                        price = exec.Price,
+                        marketPosition = exec.MarketPosition.ToString(),
+                        time = exec.Time
+                    });
+                }
+            }
+
+            var result = fills.Skip(Math.Max(0, fills.Count - count)).ToList();
+            return new { success = true, count = result.Count, fills = result };
         }
 
         // - Helpers -
