@@ -2285,12 +2285,27 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        private void SafeDispatch(Action action, int timeoutMs = 5000)
+        {
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+            {
+                action();
+                return;
+            }
+            var task = dispatcher.InvokeAsync(action);
+            if (!task.Task.Wait(timeoutMs))
+            {
+                Log("Dispatcher action timed out after " + timeoutMs + "ms", LogLevel.Warning);
+            }
+        }
+
         private object CaptureChart(string symbol)
         {
             string base64Image = null;
             Exception errorEx = null;
 
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            SafeDispatch(() =>
             {
                 try
                 {
@@ -2321,7 +2336,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     errorEx = ex;
                 }
-            });
+            }, 5000);
 
             if (errorEx != null) return new { error = errorEx.Message };
             if (string.IsNullOrEmpty(base64Image)) return new { error = "No active chart window found to capture." };
@@ -2336,7 +2351,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
 
             bool opened = false;
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            SafeDispatch(() =>
             {
                 try
                 {
@@ -2347,10 +2362,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                 }
                 catch {}
-            });
+            }, 3000);
 
             return new { success = true, symbol, opened };
         }
+
 
         private object GetFillEvents(string countStr)
         {
