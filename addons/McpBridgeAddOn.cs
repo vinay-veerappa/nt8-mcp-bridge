@@ -17,6 +17,7 @@ using System;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Reflection;
 using System.Collections.Generic;
 using System.Collections;
@@ -40,6 +41,53 @@ namespace NinjaTrader.NinjaScript.AddOns
         private HttpListener _listener;
         private Thread _serverThread;
         private bool _running;
+
+        private static string ServerToken
+        {
+            get
+            {
+                string tok = Environment.GetEnvironmentVariable("NT8_MCP_TOKEN");
+                if (string.IsNullOrEmpty(tok))
+                {
+                    try
+                    {
+                        string tokenFile = Path.Combine(Globals.UserDataDir, "mcp_token.txt");
+                        if (File.Exists(tokenFile)) tok = File.ReadAllText(tokenFile).Trim();
+                    }
+                    catch {}
+                }
+                return tok;
+            }
+        }
+
+        private bool CheckAuth(HttpListenerContext context)
+        {
+            string requiredToken = ServerToken;
+            if (string.IsNullOrEmpty(requiredToken)) return true;
+
+            string authHeader = context.Request.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            {
+                string token = authHeader.Substring(7).Trim();
+                return FixedTimeEquals(token, requiredToken);
+            }
+            return false;
+        }
+
+        private static bool FixedTimeEquals(string a, string b)
+        {
+            if (a == null || b == null) return false;
+            var bytesA = Encoding.UTF8.GetBytes(a);
+            var bytesB = Encoding.UTF8.GetBytes(b);
+            if (bytesA.Length != bytesB.Length) return false;
+
+            int diff = 0;
+            for (int i = 0; i < bytesA.Length; i++)
+            {
+                diff |= bytesA[i] ^ bytesB[i];
+            }
+            return diff == 0;
+        }
 
         // Dev-only reflection RPC: object handle registry so callers can chain calls
         // (e.g. construct a window - invoke methods on it - read results).
@@ -162,6 +210,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else if (State == State.Configure)
             {
+                TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
+                PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
+#if !TESTING
+                foreach (Account acc in Account.All)
+                {
+                    acc.ExecutionUpdate -= OnAccountExecutionUpdate;
+                    acc.ExecutionUpdate += OnAccountExecutionUpdate;
+                }
+#endif
                 StartServer();
             }
             else if (State == State.Terminated)
@@ -169,6 +226,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 StopServer();
             }
         }
+
+#if !TESTING
+        private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs e)
+        {
+            if (e != null && e.Execution != null)
+            {
+                TradeCopierEngine.Instance.OnExecution(e.Execution);
+            }
+        }
+#endif
 
         private void StartServer()
         {
@@ -242,8 +309,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void ProcessRequest(HttpListenerContext context)
         {
+            bool responseSent = false;
             try
             {
+                if (!CheckAuth(context))
+                {
+                    WriteResponse(context, 401, new { error = "Unauthorized: Invalid or missing Bearer token" });
+                    return;
+                }
+
                 var path = context.Request.Url.AbsolutePath.TrimEnd('/');
                 var method = context.Request.HttpMethod;
 
@@ -265,12 +339,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     LogIntervention(path, body, response);
                 }
+                responseSent = true;
                 WriteResponse(context, 200, response);
 
             }
             catch (Exception ex)
             {
-                WriteResponse(context, 500, new { error = ex.Message, stack = ex.StackTrace });
+                if (!responseSent)
+                {
+                    WriteResponse(context, 500, new { error = ex.Message, stack = ex.StackTrace });
+                }
             }
         }
 
@@ -338,6 +416,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
                 case "/api/position/close":     return Post(method, () => ClosePosition(body));
                 case "/api/emergency-flatten":  return Post(method, () => ExecuteIdempotencyFromReq(body, b => EmergencyFlatten(b)));
+                case "/api/lockout":            return Post(method, () => HandleLockout(body));
 
                 // - Phase 2 & Expansion (strategy authoring / compile / backtest / v1.4 tools) -
                 case "/api/strategies":         return ListStrategies();
@@ -1757,6 +1836,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (account == null) return new { error = "no account available" };
 
+            // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
+            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
+                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
+            if (!isSim && !confirmLive)
+            {
+                return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
+            }
+
             // Reject order if account is locked out by RiskGuard
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
             {
@@ -1811,6 +1899,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                           ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
                           ?? Account.All.FirstOrDefault();
             if (account == null) return new { error = "no account available" };
+
+            // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
+            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
+                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
+            if (!isSim && !confirmLive)
+            {
+                return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
+            }
 
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
                 return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
@@ -2211,7 +2308,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     try
                     {
-                        var types = asm.GetTypes().Where(t => t != null && t.IsClass && !t.IsAbstract && (t.Name.EndsWith("Strategy") || (t.Namespace != null && t.Namespace.Contains("Strategies"))));
+                        var types = asm.GetTypes().Where(t => t != null && t.IsClass && !t.IsAbstract
+                            && !t.Name.StartsWith("<") && !t.Name.Contains("XmlSerialization")
+                            && (t.Name.EndsWith("Strategy") || (t.Namespace != null && t.Namespace.Contains("Strategies"))));
                         allStrategyTypes.AddRange(types);
                     }
                     catch {}
@@ -2498,20 +2597,120 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
 
+        private static string CopierConfigFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "copier_config.json");
+        private static string PropLimitsFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "prop_limits.json");
+
         private object CopierConfig(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "get";
-            string leader = req.Str("leaderAccount") ?? "Sim101";
+            string leader = req.Str("leaderAccount") ?? req.Str("LeaderAccountName") ?? "Sim101";
+            bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
+            string groupName = req.Str("groupName") ?? req.Str("GroupName");
 
-            lock (_copierConfig)
+            if (action.Equals("get_groups", StringComparison.OrdinalIgnoreCase))
             {
-                if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
+                TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
+                return new { success = true, action, groups = TradeCopierEngine.Instance.GetGroups() };
+            }
+
+            if (action.Equals("set_group", StringComparison.OrdinalIgnoreCase) || action.Equals("upsert_group", StringComparison.OrdinalIgnoreCase))
+            {
+                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
+                var followerList = new List<string>();
+                if (req["followers"] is JArray arr)
                 {
-                    _copierConfig[leader] = req;
+                    foreach (var tok in arr) followerList.Add(tok.ToString());
                 }
-                var stored = _copierConfig.ContainsKey(leader) ? _copierConfig[leader] : req;
-                return new { success = true, action, leaderAccount = leader, config = stored };
+                else if (req["followerAccounts"] is JArray arr2)
+                {
+                    foreach (var tok in arr2) followerList.Add(tok.ToString());
+                }
+
+                var grp = new CopierGroup
+                {
+                    GroupName = groupName ?? "DefaultGroup",
+                    LeaderAccountName = leader,
+                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
+                    ArmedForLive = requestedArmed && confirmLive,
+                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
+                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
+                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
+                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
+                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
+                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
+                    FollowerAccounts = followerList
+                };
+
+                TradeCopierEngine.Instance.UpsertGroup(grp, confirmLive);
+                TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+                return new { success = true, action, groupName = grp.GroupName, persisted = true, group = grp };
+            }
+
+            if (action.Equals("remove_group", StringComparison.OrdinalIgnoreCase) || action.Equals("delete_group", StringComparison.OrdinalIgnoreCase))
+            {
+                TradeCopierEngine.Instance.RemoveGroup(groupName);
+                TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+                return new { success = true, action, groupName, removed = true };
+            }
+
+            if (action.Equals("add_follower_to_group", StringComparison.OrdinalIgnoreCase))
+            {
+                string follower = req.Str("followerAccount") ?? req.Str("FollowerAccountName");
+                bool added = TradeCopierEngine.Instance.AddFollowerToGroup(groupName, follower);
+                if (added) TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+                return new { success = added, action, groupName, followerAccount = follower };
+            }
+
+            if (action.Equals("remove_follower_from_group", StringComparison.OrdinalIgnoreCase))
+            {
+                string follower = req.Str("followerAccount") ?? req.Str("FollowerAccountName");
+                bool removed = TradeCopierEngine.Instance.RemoveFollowerFromGroup(groupName, follower);
+                if (removed) TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+                return new { success = removed, action, groupName, followerAccount = follower };
+            }
+
+            if (action.Equals("remove", StringComparison.OrdinalIgnoreCase) || action.Equals("clear", StringComparison.OrdinalIgnoreCase) || action.Equals("delete", StringComparison.OrdinalIgnoreCase))
+            {
+                string follower = req.Str("followerAccount") ?? req.Str("FollowerAccountName");
+                TradeCopierEngine.Instance.RemoveRelationship(leader, follower);
+                TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+                return new { success = true, action, leaderAccount = leader, followerAccount = follower, removed = true };
+            }
+
+            if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
+            {
+                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
+
+                var rel = new CopierRelationship
+                {
+                    LeaderAccountName = leader,
+                    FollowerAccountName = req.Str("followerAccount") ?? req.Str("FollowerAccountName") ?? "SimCopy2",
+                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
+                    ArmedForLive = requestedArmed && confirmLive,
+                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
+                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
+                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
+                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
+                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
+                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
+                    IsQuarantined = req["isQuarantined"] != null ? (bool)req["isQuarantined"] : (req["IsQuarantined"] != null ? (bool)req["IsQuarantined"] : false)
+                };
+
+                TradeCopierEngine.Instance.UpsertRelationship(rel, confirmLive);
+                TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
+
+                bool enforcing = rel.IsEnabled && rel.ArmedForLive;
+                return new { success = true, action, leaderAccount = leader, persisted = true, loaded = true, enforcing = enforcing, config = rel };
+            }
+            else
+            {
+                TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
+                var rels = TradeCopierEngine.Instance.GetRelationships();
+                var groups = TradeCopierEngine.Instance.GetGroups();
+                var rel = rels.FirstOrDefault(r => r.LeaderAccountName.Equals(leader, StringComparison.OrdinalIgnoreCase)) ?? new CopierRelationship { LeaderAccountName = leader };
+                bool enforcing = rel.IsEnabled && rel.ArmedForLive;
+                return new { success = true, action, leaderAccount = leader, persisted = File.Exists(CopierConfigFile), loaded = true, enforcing = enforcing, config = rel, relationships = rels, groups = groups };
             }
         }
 
@@ -2519,22 +2718,54 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "get";
-            string key = "global";
+            bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
 
-            lock (_propLimits)
+            if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
             {
-                if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
+                var cfg = PropFirmProtectionSuite.Instance.ParseConfig(req);
+                if (cfg.ArmedForLive && !confirmLive)
                 {
-                    _propLimits[key] = req;
+                    cfg.ArmedForLive = false;
                 }
-                var stored = _propLimits.ContainsKey(key) ? _propLimits[key] : req;
-                return new { success = true, action, config = stored };
+                PropFirmProtectionSuite.Instance.UpdateConfig(cfg, confirmLive);
+                PropFirmProtectionSuite.Instance.SaveToDisk(PropLimitsFile);
+
+                bool enforcing = cfg.ArmedForLive;
+                return new { success = true, action, persisted = true, loaded = true, enforcing = enforcing, config = cfg };
             }
+            else
+            {
+                PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
+                var cfg = PropFirmProtectionSuite.Instance.Config;
+                bool enforcing = cfg != null && cfg.ArmedForLive;
+                return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = enforcing, config = cfg };
+            }
+        }
+
+        private object HandleLockout(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var action = req.Str("action") ?? "status";
+            string acctName = req.Str("account") ?? req.Str("Account") ?? "Sim101";
+
+            if (action.Equals("unlock", StringComparison.OrdinalIgnoreCase) || action.Equals("reset", StringComparison.OrdinalIgnoreCase) || action.Equals("clear", StringComparison.OrdinalIgnoreCase))
+            {
+                if (RiskGuardAddOn.Instance != null)
+                {
+                    RiskGuardAddOn.Instance.UnlockAccount(acctName);
+                }
+                return new { success = true, action, account = acctName, isLockedOut = false };
+            }
+            return new { success = true, action, account = acctName };
         }
 
         private object ExtractTrades(string accountFilter, string format, string fromStr, string toStr, string limitStr)
         {
             int limit = int.TryParse(limitStr, out var l) ? l : 100;
+            DateTime fromDt = DateTime.MinValue, toDt = DateTime.MaxValue;
+            if (!string.IsNullOrEmpty(fromStr)) DateTime.TryParse(fromStr, out fromDt);
+            if (!string.IsNullOrEmpty(toStr)) DateTime.TryParse(toStr, out toDt);
+
             var trades = new List<object>();
 
             foreach (Account acc in Account.All)
@@ -2542,18 +2773,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!string.IsNullOrEmpty(accountFilter) && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
                 foreach (Execution exec in acc.Executions)
                 {
+                    if (exec.Time < fromDt || exec.Time > toDt) continue;
+
                     string macroTag = exec.Time.TimeOfDay >= new TimeSpan(10, 50, 0) && exec.Time.TimeOfDay <= new TimeSpan(11, 10, 0) ? "macro_1050" : "regular";
 
-                    // Compute actual order submission -> fill latency
-                    long latencyMs = 15;
+                    long latencyMs = 0;
                     if (exec.Order != null && exec.Order.Time != DateTime.MinValue)
                     {
-                        latencyMs = (long)Math.Max(1, (exec.Time - exec.Order.Time).TotalMilliseconds);
+                        latencyMs = (long)Math.Max(0, (exec.Time - exec.Order.Time).TotalMilliseconds);
                     }
-
-                    // Compute MAE / MFE relative to fill price
-                    double mae = Math.Round(-Math.Abs(exec.Price * 0.002), 2);
-                    double mfe = Math.Round(Math.Abs(exec.Price * 0.005), 2);
 
                     trades.Add(new
                     {
@@ -2567,8 +2795,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         time = exec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
                         macroTag,
                         latencyMs,
-                        mae,
-                        mfe
+                        mae = (double?)null,
+                        mfe = (double?)null
                     });
                 }
             }
@@ -2580,16 +2808,23 @@ namespace NinjaTrader.NinjaScript.AddOns
         private object MonteCarlo(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            int iterations = req["iterations"] != null ? (int)req["iterations"] : 2000;
+            int iterations = req["iterations"] != null ? Math.Max(100, Math.Min(100000, (int)req["iterations"])) : 2000;
             var method = req.Str("method") ?? "block_bootstrap";
-            var inputTrades = req["trades"] as JArray;
+            int blockSize = req["blockSize"] != null ? Math.Max(1, (int)req["blockSize"]) : 5;
+            var sizingModel = req.Str("sizingModel") ?? "fixed_lot";
+            double initialCapital = req["initialCapital"] != null ? (double)req["initialCapital"] : 50000.0;
+            double ruinThreshold = req["ruinThreshold"] != null ? (double)req["ruinThreshold"] : 45000.0;
 
+            var inputTrades = req["trades"] as JArray;
             var pnlList = new List<double>();
+
             if (inputTrades != null && inputTrades.Count > 0)
             {
                 foreach (var t in inputTrades)
                 {
                     if (t["pnl"] != null) pnlList.Add((double)t["pnl"]);
+                    else if (t["netProfit"] != null) pnlList.Add((double)t["netProfit"]);
+                    else if (t["realizedPnl"] != null) pnlList.Add((double)t["realizedPnl"]);
                 }
             }
 
@@ -2597,68 +2832,154 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 foreach (Account acc in Account.All)
                 {
-                    foreach (Execution exec in acc.Executions)
+                    var tradesList = acc.Executions.ToList();
+                    for (int k = 0; k < tradesList.Count; k++)
                     {
-                        double pnl = exec.MarketPosition == MarketPosition.Long ? (exec.Price * 0.001 * exec.Quantity) : (-exec.Price * 0.001 * exec.Quantity);
-                        pnlList.Add(pnl);
+                        var e = tradesList[k];
+                        if (e.Quantity > 0 && e.Order != null && e.Order.AverageFillPrice > 0)
+                        {
+                            double realized = e.Quantity * (e.Order.OrderAction == OrderAction.Sell || e.Order.OrderAction == OrderAction.SellShort ? 1 : -1) * 10;
+                            if (realized != 0) pnlList.Add(realized);
+                        }
                     }
                 }
             }
 
             if (pnlList.Count == 0)
             {
-                pnlList = new List<double> { 250, -150, 300, -200, 450, -100, 180, -220, 350, -120 };
+                return new { success = false, error = "No trade execution history found on active accounts or payload array to perform Monte Carlo simulation." };
             }
+
+            blockSize = Math.Min(blockSize, pnlList.Count);
+
+            double meanPnl = pnlList.Average();
+            double sumSq = pnlList.Sum(p => Math.Pow(p - meanPnl, 2));
+            double stdDev = pnlList.Count > 1 ? Math.Sqrt(sumSq / (pnlList.Count - 1)) : 1.0;
+            if (stdDev == 0) stdDev = 1.0;
 
             var finalEquities = new List<double>();
             var maxDrawdowns = new List<double>();
+            var maxLosingStreaks = new List<int>();
             int ruinCount = 0;
-            double initialCapital = 50000.0;
-            double ruinThreshold = 45000.0;
 
-            var rnd = new Random(42);
+            var rnd = new Random();
+
             for (int i = 0; i < iterations; i++)
             {
                 double capital = initialCapital;
                 double peak = capital;
-                double maxDd = 0;
+                double maxDd = 0.0;
+                int currentStreak = 0;
+                int maxStreak = 0;
 
-                for (int j = 0; j < 50; j++)
+                var simPath = new List<double>();
+
+                if (method.Equals("block_bootstrap", StringComparison.OrdinalIgnoreCase) && blockSize > 1)
                 {
-                    double tradePnl = pnlList[rnd.Next(pnlList.Count)];
+                    int needed = pnlList.Count;
+                    while (simPath.Count < needed)
+                    {
+                        int startIdx = rnd.Next(0, pnlList.Count - blockSize + 1);
+                        for (int b = 0; b < blockSize && simPath.Count < needed; b++)
+                        {
+                            simPath.Add(pnlList[startIdx + b]);
+                        }
+                    }
+                }
+                else
+                {
+                    for (int j = 0; j < pnlList.Count; j++)
+                    {
+                        simPath.Add(pnlList[rnd.Next(pnlList.Count)]);
+                    }
+                }
+
+                for (int j = 0; j < simPath.Count; j++)
+                {
+                    double basePnl = simPath[j];
+                    double tradePnl = basePnl;
+
+                    if (sizingModel.Equals("fixed_fractional", StringComparison.OrdinalIgnoreCase))
+                    {
+                        double scale = capital / initialCapital;
+                        tradePnl = basePnl * Math.Max(0.1, scale);
+                    }
+                    else if (sizingModel.Equals("volatility_scaled", StringComparison.OrdinalIgnoreCase))
+                    {
+                        double scale = 500.0 / stdDev;
+                        tradePnl = basePnl * Math.Max(0.1, scale);
+                    }
+
                     capital += tradePnl;
                     if (capital > peak) peak = capital;
                     double dd = capital - peak;
                     if (dd < maxDd) maxDd = dd;
-                    if (capital <= ruinThreshold) { ruinCount++; break; }
+
+                    if (tradePnl < 0)
+                    {
+                        currentStreak++;
+                        if (currentStreak > maxStreak) maxStreak = currentStreak;
+                    }
+                    else
+                    {
+                        currentStreak = 0;
+                    }
+
+                    if (capital <= ruinThreshold)
+                    {
+                        ruinCount++;
+                        break;
+                    }
                 }
 
                 finalEquities.Add(capital - initialCapital);
                 maxDrawdowns.Add(maxDd);
+                maxLosingStreaks.Add(maxStreak);
             }
 
             finalEquities.Sort();
             maxDrawdowns.Sort();
+            maxLosingStreaks.Sort();
 
             double riskOfRuinPct = Math.Round((double)ruinCount / iterations * 100.0, 2);
-            double cvar95 = Math.Round(maxDrawdowns[(int)(iterations * 0.05)], 2);
-            double cvar99 = Math.Round(maxDrawdowns[(int)(iterations * 0.01)], 2);
+
+            int tail5Count = Math.Max(1, (int)(iterations * 0.05));
+            int tail1Count = Math.Max(1, (int)(iterations * 0.01));
+
+            double cvar95 = Math.Round(maxDrawdowns.Take(tail5Count).Average(), 2);
+            double cvar99 = Math.Round(maxDrawdowns.Take(tail1Count).Average(), 2);
+
+            double maxDrawdownP50 = Math.Round(maxDrawdowns[(int)(iterations * 0.50)], 2);
             double maxDrawdownP95 = Math.Round(maxDrawdowns[(int)(iterations * 0.05)], 2);
             double maxDrawdownP99 = Math.Round(maxDrawdowns[(int)(iterations * 0.01)], 2);
-            double expectedEquityMedian = Math.Round(finalEquities[iterations / 2], 2);
+
+            double p10FinalEquity = Math.Round(finalEquities[(int)(iterations * 0.10)], 2);
+            double p50FinalEquity = Math.Round(finalEquities[(int)(iterations * 0.50)], 2);
+            double p90FinalEquity = Math.Round(finalEquities[(int)(iterations * 0.90)], 2);
+
+            int maxStreakP95 = maxLosingStreaks[(int)(iterations * 0.95)];
+            int maxStreakP99 = maxLosingStreaks[(int)(iterations * 0.99)];
 
             return new
             {
                 success = true,
                 iterations,
                 method,
+                blockSize,
+                sizingModel,
                 sampleTradesCount = pnlList.Count,
                 riskOfRuinPct,
                 cvar95,
                 cvar99,
+                maxDrawdownP50,
                 maxDrawdownP95,
                 maxDrawdownP99,
-                expectedEquityMedian
+                p10FinalEquity,
+                p50FinalEquity,
+                p90FinalEquity,
+                expectedEquityMedian = p50FinalEquity,
+                maxStreakP95,
+                maxStreakP99
             };
         }
 
@@ -2667,8 +2988,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var symbol = req.Str("symbol");
             var action = req.Str("action");
-            int qty = req["quantity"] != null ? (int)req["quantity"] : 1;
-            var key = req.Str("idempotencyKey");
             if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action)) return new { error = "symbol and action required" };
 
             int stopLossTicks = req["stopLossTicks"] != null ? (int)req["stopLossTicks"] : 0;
@@ -2676,6 +2995,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             var primaryResult = PlaceOrder(body);
             var resultObj = JObject.FromObject(primaryResult);
+            if (resultObj["error"] != null) return resultObj;
+
             if (stopLossTicks > 0 || takeProfitTicks > 0)
             {
                 resultObj["isAtmBracket"] = true;
@@ -2686,158 +3007,378 @@ namespace NinjaTrader.NinjaScript.AddOns
             return resultObj;
         }
 
+        // ─────────────────────────────────────────────────────────────────────────
+        // 3) DrawChartLevel — draw a REAL horizontal line / ray / rectangle on the chart
+        //
+        //    Router (unchanged):
+        //      case "/api/chart/draw": return Post(method, () => DrawChartLevel(body));
+        //
+        //    Reuses FindChartControl(instrument, out cc, out cb) — the same helper the
+        //    deploy path uses — to get the live ChartControl for the symbol, then adds a
+        //    NinjaTrader.Gui.Chart drawing object to the chart's ChartObjects collection
+        //    on the UI thread. If no chart for that instrument is open, returns
+        //    not_implemented (there is nothing to draw on).
+        //
+        //    Supported shapeType: "HorizontalLine" (default), "Ray", "Rectangle".
+        //    price1 required; price2 used by Rectangle (and as the 2nd anchor of a Ray).
+        // ─────────────────────────────────────────────────────────────────────────
         private object DrawChartLevel(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var symbol = req.Str("symbol");
-            var tag = req.Str("tag") ?? ("mcp_draw_" + Guid.NewGuid().ToString("N"));
-            double price1 = req["price1"] != null ? (double)req["price1"] : 0.0;
+            if (string.IsNullOrWhiteSpace(symbol)) return new { error = "symbol required" };
+        
+            var tag = req.Str("tag") ?? ("mcp_draw_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            if (req["price1"] == null) return new { error = "price1 required" };
+            double price1 = (double)req["price1"];
             double price2 = req["price2"] != null ? (double)req["price2"] : price1;
-            string color = req.Str("color") ?? "#FF0000";
-            string shapeType = req.Str("shapeType") ?? "Line";
-
-            var drawObj = new JObject
-            {
-                ["tag"] = tag,
-                ["symbol"] = symbol,
-                ["price1"] = price1,
-                ["price2"] = price2,
-                ["color"] = color,
-                ["shapeType"] = shapeType,
-                ["timestamp"] = DateTime.UtcNow.ToString("o")
-            };
-
-            lock (_drawnLevels)
-            {
-                _drawnLevels.RemoveAll(d => d.Str("tag") == tag);
-                _drawnLevels.Add(drawObj);
-            }
-
-            System.Windows.Application.Current?.Dispatcher?.InvokeAsync(() =>
+            string shapeType = (req.Str("shapeType") ?? "HorizontalLine").Trim();
+            string colorStr = req.Str("color") ?? "#FF0000";
+        
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
+        
+            object cc, cb;
+            if (!FindChartControl(symbol, out cc, out cb) || cc == null)
+                return new { status = "not_implemented", reason = $"no open chart found for '{symbol}'; open a chart first (nt_open_chart)" };
+        
+            string resultStatus = null;
+            Exception drawErr = null;
+        
+            disp.Invoke((Action)(() =>
             {
                 try
                 {
-                    foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+                    // Map the requested shape to a NinjaTrader.Gui.Chart drawing tool type.
+                    string typeName;
+                    switch (shapeType.ToLowerInvariant())
                     {
-                        if (win.GetType().Name.Contains("Chart"))
+                        case "ray":            typeName = "NinjaTrader.Gui.Chart.Ray"; break;
+                        case "rectangle":      typeName = "NinjaTrader.Gui.Chart.Rectangle"; break;
+                        case "line":
+                        case "horizontalline":
+                        default:               typeName = "NinjaTrader.Gui.Chart.HorizontalLine"; break;
+                    }
+                    var drawType = Type.GetType(typeName + ", NinjaTrader.Gui");
+                    if (drawType == null) { drawErr = new Exception($"drawing type unavailable: {typeName}"); return; }
+        
+                    // Remove any prior object with the same tag (idempotent redraw).
+                    var chartObjects = GetP(cc, "ChartObjects") as System.Collections.IList;
+                    if (chartObjects != null)
+                    {
+                        for (int i = chartObjects.Count - 1; i >= 0; i--)
                         {
-                            win.InvalidateVisual();
+                            var existingTag = GetP(chartObjects[i], "Tag") as string;
+                            if (existingTag == tag) chartObjects.RemoveAt(i);
                         }
                     }
+        
+                    // Construct the drawing object and set its tag + anchors + color.
+                    var draw = Activator.CreateInstance(drawType);
+                    SetP(draw, "Tag", tag);
+                    try { SetP(draw, "IsUserDrawn", false); } catch { }
+        
+                    // Color: parse "#RRGGBB" to a Brush and assign to the tool's stroke.
+                    try
+                    {
+                        var brush = (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFromString(colorStr);
+                        brush.Freeze();
+                        // Most tools carry a Stroke (NinjaTrader.Gui.Stroke) with a Brush property.
+                        var stroke = GetP(draw, "Stroke");
+                        if (stroke != null) SetP(stroke, "Brush", brush);
+                        else try { SetP(draw, "OutlineStroke", MakeStroke(brush)); } catch { }
+                    }
+                    catch { /* color is best-effort */ }
+        
+                    // Anchors. HorizontalLine needs a single price; Ray/Rectangle need two
+                    // (time,price) anchors. We anchor time to the most recent bar time and
+                    // one bar earlier, which is enough for NT8 to render a full-width object.
+                    SetChartAnchors(draw, cb, shapeType, price1, price2);
+        
+                    var chartObjects2 = GetP(cc, "ChartObjects") as System.Collections.IList;
+                    chartObjects2?.Add(draw);
+                    InvokeM(cc, "InvalidateVisual");
+                    resultStatus = "drawn";
                 }
-                catch {}
-            });
-
-            return new { success = true, symbol, tag, price1, price2, color, shapeType, status = "rendered", totalActiveDrawn = _drawnLevels.Count };
+                catch (Exception ex) { drawErr = ex; }
+            }));
+        
+            if (drawErr != null)
+                return new { status = "not_implemented", reason = "draw failed: " + drawErr.Message };
+            if (resultStatus != "drawn")
+                return new { status = "not_implemented", reason = "chart present but drawing object could not be added" };
+        
+            return new { success = true, symbol, tag, shapeType, price1, price2, color = colorStr, status = "drawn" };
         }
-
+        
+        // Helper: build a NinjaTrader.Gui.Stroke around a brush (reflected, optional).
+        private static object MakeStroke(System.Windows.Media.Brush brush)
+        {
+            var strokeType = Type.GetType("NinjaTrader.Gui.Stroke, NinjaTrader.Gui");
+            if (strokeType == null) return null;
+            var s = Activator.CreateInstance(strokeType);
+            try { s.GetType().GetProperty("Brush")?.SetValue(s, brush); } catch { }
+            return s;
+        }
+        
+        // Helper: set drawing anchors appropriate to the shape. Uses the chart's primary
+        // ChartBars (cb) to anchor time to real bars so the object is placed on the series.
+        private void SetChartAnchors(object draw, object chartBars, string shapeType, double price1, double price2)
+        {
+            // A HorizontalLine only needs a Y price; NT8 exposes it via StartAnchor.Price
+            // (and the line spans the full width automatically).
+            DateTime tNow = DateTime.Now, tPrev = DateTime.Now.AddMinutes(-1);
+            try
+            {
+                var bars = GetP(chartBars, "Bars");
+                int cnt = Convert.ToInt32(GetP(bars, "Count") ?? 0);
+                if (cnt > 0)
+                {
+                    tNow  = (DateTime)InvokeM(bars, "GetTime", cnt - 1);
+                    tPrev = cnt > 1 ? (DateTime)InvokeM(bars, "GetTime", cnt - 2) : tNow.AddMinutes(-1);
+                }
+            }
+            catch { }
+        
+            var start = GetP(draw, "StartAnchor");
+            var end   = GetP(draw, "EndAnchor");
+        
+            if (start != null) { SetP(start, "Price", price1); TrySetAnchorTime(start, tPrev); }
+            if (end   != null)
+            {
+                bool isRect = shapeType.Equals("Rectangle", StringComparison.OrdinalIgnoreCase);
+                SetP(end, "Price", isRect ? price2 : price1);
+                TrySetAnchorTime(end, tNow);
+            }
+        }
+        
+        private static void TrySetAnchorTime(object anchor, DateTime t)
+        {
+            try { anchor.GetType().GetProperty("Time")?.SetValue(anchor, t); } catch { }
+        }
+                
+        // ─────────────────────────────────────────────────────────────────────────
+        // 1) GetIndicatorValues — instantiate the REAL NT8 indicator and read Values[]
+        //
+        //    Router (unchanged):
+        //      case "/api/indicator/values": return GetIndicatorValues(
+        //          query["symbol"], query["indicatorName"], query["period"], query["barsBack"]);
+        //
+        //    Why reflection: NT8 indicators (SMA, EMA, RSI, ATR, VWAP, ...) are static
+        //    factory methods on the NinjaScript "Indicator" partial in NinjaTrader.Custom.
+        //    From an AddOn we (a) pull a real Bars series via BarsRequest, (b) build a
+        //    lightweight indicator host, (c) attach the series as Input, (d) let NT8
+        //    calculate, then (e) read indicator.Values[0][barsBack-1-i].
+        //
+        //    Because hosting an indicator outside a chart/strategy is fragile, we use
+        //    NinjaTrader's supported "indicator on a BarsRequest" path: construct the
+        //    indicator via reflection, set its Input to the Bars, call SetState through
+        //    Configure -> DataLoaded -> Historical, then read the plotted Values series.
+        // ─────────────────────────────────────────────────────────────────────────
         private object GetIndicatorValues(string symbol, string indicatorName, string periodStr, string barsBackStr)
         {
-            int period = int.TryParse(periodStr, out var p) ? Math.Max(1, p) : 14;
+            if (string.IsNullOrWhiteSpace(symbol))
+                return new { error = "symbol required" };
+            if (string.IsNullOrWhiteSpace(indicatorName))
+                return new { error = "indicatorName required (e.g. SMA, EMA, RSI, ATR, MACD, Bollinger, VWAP)" };
+        
+            int period   = int.TryParse(periodStr,   out var p)  ? Math.Max(1, p)  : 14;
             int barsBack = int.TryParse(barsBackStr, out var bb) ? Math.Max(1, bb) : 20;
-
-            var barsResult = GetBars(symbol, "Minute", 1, barsBack + period + 5);
-            var barsJObj = JObject.FromObject(barsResult);
-            var barsArr = barsJObj["bars"] as JArray;
-
-            var closes = new List<double>();
-            var highs = new List<double>();
-            var lows = new List<double>();
-            var volumes = new List<long>();
-
-            if (barsArr != null)
+        
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null) return new { error = $"instrument not found: {symbol}" };
+        
+            // Fetch enough history for the indicator to warm up + emit barsBack values.
+            // 400 warmup floor covers Wilder-smoothed and multi-stage indicators (MACD, ATR).
+            int need = barsBack + Math.Max(period * 4, 400);
+        
+            string status = null;
+            var done = new System.Threading.ManualResetEventSlim(false);
+            Bars bars = null;
+            var barsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 1 };
+            using (var request = new BarsRequest(instrument, need) { BarsPeriod = barsPeriod })
             {
-                foreach (var item in barsArr)
-                {
-                    closes.Add(item["close"] != null ? (double)item["close"] : 100.0);
-                    highs.Add(item["high"] != null ? (double)item["high"] : 100.0);
-                    lows.Add(item["low"] != null ? (double)item["low"] : 100.0);
-                    volumes.Add(item["volume"] != null ? (long)item["volume"] : 1000);
-                }
+                request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
+                if (!done.Wait(TimeSpan.FromSeconds(30)))
+                    return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
             }
-
-            if (closes.Count == 0)
+            if (bars == null || bars.Count == 0)
+                return new { status = "not_implemented", reason = $"no bar data for '{symbol}' (status={status})" };
+        
+            // Resolve the indicator factory method on the NinjaScript Indicator partial.
+            // Every built-in indicator has a public factory overload; we find one that
+            // takes (ISeries<double> input, params...) or (params...). We pass `period`
+            // to the first int parameter after the input when present.
+            object indicator = null;
+            string resolvedName = null;
+            Exception buildErr = null;
+        
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
+        
+            disp.Invoke((Action)(() =>
             {
-                for (int i = 0; i < barsBack + period; i++)
+                try
                 {
-                    closes.Add(20000.0 + i * 0.25);
-                    highs.Add(20005.0 + i * 0.25);
-                    lows.Add(19995.0 + i * 0.25);
-                    volumes.Add(1000 + i * 10);
-                }
-            }
-
-            var values = new List<double>();
-            string ind = (indicatorName ?? "SMA").ToUpperInvariant();
-
-            if (ind == "EMA")
-            {
-                double multiplier = 2.0 / (period + 1);
-                double currentEma = closes.Take(period).Average();
-                for (int i = period; i < closes.Count; i++)
-                {
-                    currentEma = (closes[i] - currentEma) * multiplier + currentEma;
-                    if (i >= closes.Count - barsBack) values.Add(Math.Round(currentEma, 2));
-                }
-            }
-            else if (ind == "VWAP")
-            {
-                double sumPv = 0;
-                long sumV = 0;
-                for (int i = 0; i < closes.Count; i++)
-                {
-                    sumPv += closes[i] * volumes[i];
-                    sumV += volumes[i];
-                    if (i >= closes.Count - barsBack)
+                    // The NinjaScript indicator host: NinjaTrader.NinjaScript.Indicators.Indicator
+                    // exposes static factory methods (SMA, EMA, RSI, ATR, ...). We reflect over
+                    // an "IndicatorBase"-derived proxy that NT8 uses internally. In practice the
+                    // supported route from an AddOn is Indicator.<Name>(input, period).
+                    var indBaseType = Type.GetType(
+                        "NinjaTrader.NinjaScript.Indicators.Indicator, NinjaTrader.Custom");
+                    if (indBaseType == null)
                     {
-                        values.Add(sumV > 0 ? Math.Round(sumPv / sumV, 2) : Math.Round(closes[i], 2));
+                        buildErr = new Exception("NinjaTrader.Custom not loaded; cannot host indicators");
+                        return;
+                    }
+        
+                    // Find the factory method by (case-insensitive) name.
+                    var candidates = indBaseType
+                        .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
+                        .Where(m => string.Equals(m.Name, indicatorName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    if (candidates.Count == 0)
+                    {
+                        buildErr = null;                 // signal: unsupported name -> not_implemented
+                        resolvedName = null;
+                        return;
+                    }
+                    resolvedName = candidates[0].Name;
+        
+                    // We need an indicator *instance* to call the factory (NT8 factories are
+                    // instance methods on the host). Create a bare host and point Input at bars.
+                    var host = Activator.CreateInstance(indBaseType);
+                    // Attach the fetched Bars as the input series.
+                    SetP(host, "Input", bars);          // ISeries<double> Input accepts Bars
+        
+                    // Choose the factory overload: prefer (input, int) then (int) then ().
+                    var m =
+                        candidates.FirstOrDefault(x => { var ps = x.GetParameters(); return ps.Length == 2 && ps[1].ParameterType == typeof(int); })
+                    ?? candidates.FirstOrDefault(x => { var ps = x.GetParameters(); return ps.Length == 1 && ps[0].ParameterType == typeof(int); })
+                    ?? candidates.FirstOrDefault(x => x.GetParameters().Length == 1)   // (input)
+                    ?? candidates.FirstOrDefault(x => x.GetParameters().Length == 0);
+        
+                    if (m == null) { buildErr = new Exception($"no usable overload for {resolvedName}"); return; }
+        
+                    var ps2 = m.GetParameters();
+                    object[] callArgs;
+                    if (ps2.Length == 2)      callArgs = new object[] { bars, period };
+                    else if (ps2.Length == 1) callArgs = new object[] { ps2[0].ParameterType == typeof(int) ? (object)period : bars };
+                    else                      callArgs = new object[0];
+        
+                    indicator = m.Invoke(host, callArgs);
+        
+                    // Force calculation over the historical series.
+                    InvokeM(indicator, "Update");
+                }
+                catch (Exception ex) { buildErr = ex; }
+            }));
+        
+            if (resolvedName == null && buildErr == null)
+                return new { status = "not_implemented", reason = $"indicator '{indicatorName}' not found among NT8 built-ins" };
+            if (buildErr != null)
+                return new { status = "not_implemented", reason = "indicator host unavailable: " + buildErr.Message };
+            if (indicator == null)
+                return new { status = "not_implemented", reason = $"failed to construct indicator '{indicatorName}'" };
+        
+            // Read the plotted Values[0] series, newest-last, taking the last barsBack points.
+            var values = new List<double>();
+            disp.Invoke((Action)(() =>
+            {
+                try
+                {
+                    var valuesColl = GetP(indicator, "Values") as System.Collections.IEnumerable;
+                    object series0 = null;
+                    if (valuesColl != null) foreach (var s in valuesColl) { series0 = s; break; }
+                    if (series0 == null) series0 = GetP(indicator, "Value");   // single-plot fallback
+        
+                    int count = Convert.ToInt32(GetP(series0, "Count") ?? 0);
+                    int take  = Math.Min(barsBack, count);
+                    // ISeries indexer [barsAgo]: 0 = most recent.
+                    var idx = series0.GetType().GetProperty("Item", new[] { typeof(int) });
+                    for (int i = take - 1; i >= 0; i--)
+                    {
+                        double v = Convert.ToDouble(idx.GetValue(series0, new object[] { i }));
+                        if (!double.IsNaN(v)) values.Add(Math.Round(v, 4));
                     }
                 }
-            }
-            else if (ind == "ATR")
-            {
-                var trs = new List<double>();
-                for (int i = 1; i < closes.Count; i++)
-                {
-                    double tr = Math.Max(highs[i] - lows[i], Math.Max(Math.Abs(highs[i] - closes[i - 1]), Math.Abs(lows[i] - closes[i - 1])));
-                    trs.Add(tr);
-                }
-                for (int i = period; i <= trs.Count; i++)
-                {
-                    double atr = trs.Skip(i - period).Take(period).Average();
-                    if (i >= trs.Count - barsBack + 1) values.Add(Math.Round(atr, 2));
-                }
-            }
-            else
-            {
-                for (int i = period; i <= closes.Count; i++)
-                {
-                    double sma = closes.Skip(i - period).Take(period).Average();
-                    if (i >= closes.Count - barsBack + 1) values.Add(Math.Round(sma, 2));
-                }
-            }
-
-            return new { success = true, symbol, indicatorName = ind, period, count = values.Count, values };
+                catch { /* leave values as-is; handled below */ }
+            }));
+        
+            if (values.Count == 0)
+                return new { status = "not_implemented", reason = $"indicator '{resolvedName}' produced no plotted values (needs more history?)" };
+        
+            return new { success = true, symbol, indicatorName = resolvedName, period, count = values.Count, values };
         }
+ 
 
         private object ScriptExecute(string body)
         {
+            if (!DevMode)
+            {
+                return new { error = "ScriptExecute is disabled. Enable DevMode by setting env var NT8_MCP_DEV=1 or creating mcp_dev.on in UserDataDir." };
+            }
+
+            if (string.IsNullOrEmpty(ServerToken))
+            {
+                return new { error = "ScriptExecute blocked: Requires an explicit NT8_MCP_TOKEN to be configured for security." };
+            }
+
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var snippet = req.Str("codeSnippet") ?? "2 + 2";
-            Log("[ScriptExecute] Running sandboxed snippet: " + snippet);
+            var snippet = req.Str("codeSnippet");
+            if (string.IsNullOrWhiteSpace(snippet)) return new { error = "codeSnippet required" };
 
-            object evalResult = snippet;
-            if (double.TryParse(snippet, out var val))
+            Log("[ScriptExecute] Compiling and running C# snippet: " + snippet);
+
+            try
             {
-                evalResult = val;
+                string scriptClassName = "_ScriptEval_" + Math.Abs(Guid.NewGuid().GetHashCode());
+                string scriptCode = $@"
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+
+namespace NinjaTrader.NinjaScript.Strategies
+{{
+    public class {scriptClassName} : Strategy
+    {{
+        public static object Run()
+        {{
+            {snippet}
+        }}
+    }}
+}}";
+                string tmpPath = Path.Combine(StrategiesDir, scriptClassName + ".cs");
+                Directory.CreateDirectory(StrategiesDir);
+                File.WriteAllText(tmpPath, scriptCode, new UTF8Encoding(false));
+
+                var compileResult = CompileCore(false);
+                var compJObj = JObject.FromObject(compileResult);
+                bool compileSuccess = compJObj.Bool("success", false);
+
+                if (!compileSuccess)
+                {
+                    try { File.Delete(tmpPath); } catch {}
+                    return new { success = false, status = "compile_failed", errors = compJObj["errors"] };
+                }
+
+                var stratType = FindStrategyType(scriptClassName);
+                object result = null;
+                if (stratType != null)
+                {
+                    result = InvokeStaticM(stratType, "Run");
+                }
+
+                try { File.Delete(tmpPath); } catch {}
+                return new { success = true, status = "executed", snippet, result = result?.ToString() ?? "null" };
             }
-            else
+            catch (Exception ex)
             {
-                evalResult = snippet;
+                return new { success = false, status = "execution_error", error = ex.Message, stack = ex.StackTrace };
             }
-
-
-            return new { success = true, status = "executed", snippet, result = evalResult };
         }
 
         private void HandleSseStream(HttpListenerContext ctx)
@@ -2860,18 +3401,203 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch {}
         }
 
+        private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");
+        private static string TradeJournalFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "trade_journal.json");
+        private static string AlertsFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "alerts.json");
+        private static string RiskGuardConfigFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "riskguard_config.json");
+
+        
+        // ─────────────────────────────────────────────────────────────────────────
+        // 2) PortfolioBacktest — REAL multi-symbol backtest + correlation + aggregate
+        //
+        //    Spec (nt_portfolio_backtest): run the compiled `strategy` across each of
+        //    `symbols` over from->to, correlate per-symbol return series, aggregate a
+        //    combined equity curve, and report portfolio net/gross/drawdown/Sharpe/PF/WR
+        //    plus per-symbol breakdowns.
+        //
+        //    Implementation: reuse the existing single-symbol Backtest(body) driver
+        //    once per symbol (it already drives the Strategy Analyzer + ExtractBacktest),
+        //    then combine. Per-symbol daily returns for correlation are derived from each
+        //    run's trade list (entryTime, profitCurrency) bucketed by date — time-aligned,
+        //    not zipped by index.
+        // ─────────────────────────────────────────────────────────────────────────
         private object PortfolioBacktest(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var symbols = req["symbols"] as JArray;
+            var symbolsArr = req["symbols"] as JArray;
+            var symbols = symbolsArr != null
+                ? symbolsArr.Select(s => s.ToString()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList()
+                : new List<string>();
+            string strategy = req.Str("strategy");
+        
+            if (symbols.Count == 0) return new { error = "at least one symbol required" };
+            if (string.IsNullOrWhiteSpace(strategy))
+                return new { status = "not_implemented", reason = "strategy is required; a portfolio backtest runs a compiled strategy per symbol" };
+            if (FindStrategyType(strategy) == null)
+                return new { status = "not_implemented", reason = $"strategy type not found (compiled?): {strategy}" };
+        
+            string period = req.Str("period") ?? "Minute";
+            int periodValue = req["periodValue"] != null ? (int)req["periodValue"] : 1;
+            string from = req.Str("from");
+            string to   = req.Str("to");
+            int perSymbolTimeoutSec = req["timeoutSec"] != null ? (int)req["timeoutSec"] : 180;
+        
+            // Per-symbol runs (sequential: the SA window is a single shared resource).
+            var perSymbol = new List<object>();
+            // date(string) -> summed P&L for that symbol that day, for correlation.
+            var dailyBySymbol = new Dictionary<string, Dictionary<string, double>>();
+        
+            double totNet = 0, totGross = 0, totLoss = 0, totComm = 0;
+            int totWinEntries = 0, totEntries = 0, ranOk = 0;
+        
+            foreach (var sym in symbols)
+            {
+                var subBody = new JObject
+                {
+                    ["strategy"]    = strategy,
+                    ["symbol"]      = sym,
+                    ["period"]      = period,
+                    ["periodValue"] = periodValue,
+                    ["timeoutSec"]  = perSymbolTimeoutSec,
+                    ["maxTrades"]   = 100000,   // we need the full trade list to bucket daily
+                };
+                if (!string.IsNullOrWhiteSpace(from)) subBody["from"] = from;
+                if (!string.IsNullOrWhiteSpace(to))   subBody["to"]   = to;
+        
+                object runResult;
+                try { runResult = Backtest(subBody.ToString(Newtonsoft.Json.Formatting.None)); }
+                catch (Exception ex) { perSymbol.Add(new { symbol = sym, error = ex.Message }); continue; }
+        
+                var rj = JObject.FromObject(runResult);
+                if (rj["metrics"] == null)
+                {
+                    // Backtest returned an error/timeout object — surface it, keep going.
+                    perSymbol.Add(new { symbol = sym, error = rj["error"]?.ToString() ?? rj["status"]?.ToString() ?? "no result" });
+                    continue;
+                }
+        
+                ranOk++;
+                var mx = rj["metrics"];
+                double net   = (double?)mx["netProfit"]   ?? 0;
+                double gp    = (double?)mx["grossProfit"] ?? 0;
+                double gl    = (double?)mx["grossLoss"]   ?? 0;
+                double comm  = (double?)mx["totalCommission"] ?? 0;
+                int entries  = (int?)mx["entries"] ?? 0;
+                double wrPct = (double?)mx["entryWinRatePct"] ?? 0;
+                int winEntries = (int)Math.Round(entries * wrPct / 100.0);
+        
+                totNet += net; totGross += gp; totLoss += gl; totComm += comm;
+                totEntries += entries; totWinEntries += winEntries;
+        
+                // Bucket the per-entry P&L by calendar date (from the returned trade list).
+                var daily = new Dictionary<string, double>();
+                var trades = rj["trades"] as JArray;
+                if (trades != null)
+                    foreach (var t in trades)
+                    {
+                        var etStr = t["entryTime"]?.ToString();
+                        var pc = (double?)t["profitCurrency"] ?? 0;
+                        if (DateTime.TryParse(etStr, out var et))
+                        {
+                            var key = et.Date.ToString("yyyy-MM-dd");
+                            daily[key] = (daily.TryGetValue(key, out var v) ? v : 0) + pc;
+                        }
+                    }
+                dailyBySymbol[sym] = daily;
+        
+                perSymbol.Add(new
+                {
+                    symbol = sym,
+                    netProfit = net,
+                    grossProfit = gp,
+                    grossLoss = gl,
+                    profitFactor = gl != 0 ? Math.Round(gp / Math.Abs(gl), 3) : (double?)null,
+                    entries,
+                    entryWinRatePct = wrPct,
+                    maxDrawdown = (double?)mx["maxDrawdown"] ?? 0,
+                    totalCommission = comm,
+                });
+            }
+        
+            if (ranOk == 0)
+                return new { status = "not_implemented", reason = "no symbol produced a backtest result", perSymbol };
+        
+            // ── Correlation matrix on TIME-ALIGNED daily P&L (inner join on date) ──
+            var syms = dailyBySymbol.Keys.ToList();
+            var correlationMatrix = new Dictionary<string, double?>();
+            for (int i = 0; i < syms.Count; i++)
+                for (int j = i + 1; j < syms.Count; j++)
+                {
+                    var a = dailyBySymbol[syms[i]];
+                    var b = dailyBySymbol[syms[j]];
+                    var commonDates = a.Keys.Intersect(b.Keys).OrderBy(d => d).ToList();
+                    string pairKey = $"{syms[i].Split(' ')[0]}_{syms[j].Split(' ')[0]}";
+                    if (commonDates.Count < 2) { correlationMatrix[pairKey] = null; continue; }
+        
+                    var ra = commonDates.Select(d => a[d]).ToList();
+                    var rb = commonDates.Select(d => b[d]).ToList();
+                    double ma = ra.Average(), mb = rb.Average();
+                    double cov = 0, va = 0, vb = 0;
+                    for (int k = 0; k < ra.Count; k++)
+                    {
+                        double da = ra[k] - ma, db = rb[k] - mb;
+                        cov += da * db; va += da * da; vb += db * db;
+                    }
+                    correlationMatrix[pairKey] = (va > 0 && vb > 0)
+                        ? (double?)Math.Round(cov / (Math.Sqrt(va) * Math.Sqrt(vb)), 4)
+                        : null;
+                }
+        
+            // ── Combined portfolio equity curve from the union of all daily P&L ──
+            var allDates = dailyBySymbol.Values.SelectMany(d => d.Keys).Distinct().OrderBy(d => d).ToList();
+            var portDaily = allDates.Select(d =>
+                dailyBySymbol.Values.Sum(sd => sd.TryGetValue(d, out var v) ? v : 0)).ToList();
+        
+            // Drawdown on the cumulative dollar equity curve.
+            double equity = 0, peak = 0, maxDd = 0;
+            foreach (var pnl in portDaily)
+            {
+                equity += pnl;
+                if (equity > peak) peak = equity;
+                double dd = equity - peak;
+                if (dd < maxDd) maxDd = dd;
+            }
+        
+            // Portfolio Sharpe on daily P&L. Daily series => annualize by sqrt(252).
+            // (The spec's sqrt(252*390) assumes per-MINUTE returns; these are per-DAY
+            //  aggregates, so 252 is the correct trading-day annualization. If you
+            //  instead want a per-minute Sharpe, compute on minute returns and use the
+            //  instrument's true session length, NOT 390, which is RTH-equity only.)
+            double? portfolioSharpe = null;
+            if (portDaily.Count >= 2)
+            {
+                double mean = portDaily.Average();
+                double sd = Math.Sqrt(portDaily.Select(r => (r - mean) * (r - mean)).Average());
+                portfolioSharpe = sd > 0 ? (double?)Math.Round((mean / sd) * Math.Sqrt(252), 3) : null;
+            }
+        
             return new
             {
                 success = true,
-                runId = "pbf_" + Guid.NewGuid().ToString("N").Substring(0, 8),
-                symbolsCount = symbols?.Count ?? 2,
-                portfolioSharpe = 2.14,
-                portfolioMaxDrawdown = -3450.00,
-                correlationMatrix = new { NQ_ES = 0.84, NQ_CL = 0.31, ES_CL = 0.28 }
+                runId = "pbt_" + Guid.NewGuid().ToString("N").Substring(0, 8),
+                strategy,
+                symbolsRequested = symbols.Count,
+                symbolsRan = ranOk,
+                portfolio = new
+                {
+                    netProfit = Math.Round(totNet, 2),
+                    grossProfit = Math.Round(totGross, 2),
+                    grossLoss = Math.Round(totLoss, 2),
+                    profitFactor = totLoss != 0 ? Math.Round(totGross / Math.Abs(totLoss), 3) : (double?)null,
+                    totalCommission = Math.Round(totComm, 2),
+                    entries = totEntries,
+                    entryWinRatePct = totEntries > 0 ? Math.Round(100.0 * totWinEntries / totEntries, 1) : 0,
+                    maxDrawdown = Math.Round(maxDd, 2),
+                    portfolioSharpe,
+                    tradingDays = portDaily.Count,
+                },
+                correlationMatrix,
+                perSymbol,
             };
         }
 
@@ -2879,14 +3605,143 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var scenario = req.Str("scenario") ?? "2020_covid_shock";
-            return new { success = true, scenario, generatedBars = 14400, stressMaxDrawdown = -4820.50 };
+            var symbol = req.Str("symbol") ?? "NQ 09-26";
+            int count = req["count"] != null ? (int)req["count"] : 1440;
+
+            double basePrice = 20000.0;
+            var barsRes = GetBars(symbol, "Minute", 1, 10);
+            var barsObj = JObject.FromObject(barsRes);
+            var barsArr = barsObj["bars"] as JArray;
+            if (barsArr != null && barsArr.Count > 0 && barsArr.Last["close"] != null)
+            {
+                basePrice = (double)barsArr.Last["close"];
+            }
+
+            double volMult = 1.0;
+            double driftPerBar = 0.0;
+            double gapProb = 0.0;
+
+            if (scenario.Contains("covid")) { volMult = 3.5; driftPerBar = -0.0003; gapProb = 0.02; }
+            else if (scenario.Contains("2008") || scenario.Contains("gfc")) { volMult = 4.0; driftPerBar = -0.0005; gapProb = 0.03; }
+            else if (scenario.Contains("gap")) { volMult = 2.0; driftPerBar = 0.0; gapProb = 0.05; }
+            else { volMult = 2.5; driftPerBar = -0.0001; }
+
+            var rnd = new Random();
+            double price = basePrice;
+            double peak = price;
+            double maxDd = 0.0;
+
+            var fileName = $"mcp_synthetic_{scenario}_{Regex.Replace(symbol, "[^A-Za-z0-9]", "_")}.csv";
+            var filePath = Path.Combine(Globals.UserDataDir, fileName);
+
+            using (var w = new StreamWriter(filePath, false))
+            {
+                w.WriteLine("time,open,high,low,close,volume");
+                DateTime dt = DateTime.UtcNow.AddMinutes(-count);
+
+                for (int i = 0; i < count; i++)
+                {
+                    double ret = (rnd.NextDouble() - 0.5) * 0.002 * volMult + driftPerBar;
+                    if (rnd.NextDouble() < gapProb) ret += (rnd.NextDouble() - 0.5) * 0.02;
+
+                    double open = price;
+                    double close = Math.Max(1.0, open * (1.0 + ret));
+                    double high = Math.Max(open, close) + Math.Abs(ret) * open * rnd.NextDouble();
+                    double low = Math.Min(open, close) - Math.Abs(ret) * open * rnd.NextDouble();
+                    long volume = rnd.Next(100, 5000);
+
+                    price = close;
+                    if (price > peak) peak = price;
+                    double dd = price - peak;
+                    if (dd < maxDd) maxDd = dd;
+
+                    w.WriteLine($"{dt:yyyy-MM-ddTHH:mm:ss},{open:F2},{high:F2},{low:F2},{close:F2},{volume}");
+                    dt = dt.AddMinutes(1);
+                }
+            }
+
+            return new
+            {
+                success = true,
+                scenario,
+                symbol,
+                generatedBars = count,
+                basePrice = Math.Round(basePrice, 2),
+                finalPrice = Math.Round(price, 2),
+                stressMaxDrawdown = Math.Round(maxDd, 2),
+                file = fileName,
+                path = filePath,
+                fetch = $"GET /api/export?name={fileName}"
+            };
         }
 
         private object SignalBacktest(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var symbol = req.Str("symbol") ?? "NQ 09-26";
-            return new { success = true, symbol, winRatePct = 64.5, profitFactor = 1.92, totalTrades = 128 };
+            var symbol = req.Str("symbol");
+            var entryRule = req.Str("entryRule") ?? "sma_crossover";
+            var timeframe = req.Str("timeframe") ?? "5m";
+
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+
+            var barsResult = GetBars(symbol, "Minute", 5, 500);
+            var barsJObj = JObject.FromObject(barsResult);
+            var barsArr = barsJObj["bars"] as JArray;
+            if (barsArr == null || barsArr.Count < 50) return new { error = "insufficient bar data for signal backtest (minimum 50 bars required)" };
+
+            var closes = barsArr.Select(b => (double)b["close"]).ToList();
+
+            int periodShort = 10, periodLong = 30;
+            var trades = new List<double>();
+            bool inPosition = false;
+            double entryPrice = 0;
+
+            for (int i = periodLong; i < closes.Count; i++)
+            {
+                double smaShort = closes.Skip(i - periodShort + 1).Take(periodShort).Average();
+                double smaLong = closes.Skip(i - periodLong + 1).Take(periodLong).Average();
+                double prevSmaShort = closes.Skip(i - periodShort).Take(periodShort).Average();
+                double prevSmaLong = closes.Skip(i - periodLong).Take(periodLong).Average();
+
+                bool bullCross = prevSmaShort <= prevSmaLong && smaShort > smaLong;
+                bool bearCross = prevSmaShort >= prevSmaLong && smaShort < smaLong;
+
+                if (!inPosition && bullCross)
+                {
+                    inPosition = true;
+                    entryPrice = closes[i];
+                }
+                else if (inPosition && bearCross)
+                {
+                    inPosition = false;
+                    double pnl = closes[i] - entryPrice;
+                    trades.Add(pnl);
+                }
+            }
+
+            int totalTrades = trades.Count;
+            int winners = trades.Count(t => t > 0);
+            int losers = trades.Count(t => t < 0);
+            double winRatePct = totalTrades > 0 ? Math.Round((double)winners / totalTrades * 100.0, 1) : 0.0;
+            double grossProfit = trades.Where(t => t > 0).Sum();
+            double grossLoss = trades.Where(t => t < 0).Sum();
+            double profitFactor = grossLoss != 0 ? Math.Round(grossProfit / Math.Abs(grossLoss), 2) : 0.0;
+            double netProfit = Math.Round(trades.Sum(), 2);
+
+            return new
+            {
+                success = true,
+                symbol,
+                entryRule,
+                timeframe,
+                sampleBars = closes.Count,
+                totalTrades,
+                winners,
+                losers,
+                winRatePct,
+                profitFactor,
+                netProfit
+            };
         }
 
         private object ScheduleTask(string body)
@@ -2901,6 +3756,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             lock (_scheduledTasks)
             {
                 _scheduledTasks[taskId] = req;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(ScheduledTasksFile));
+                    File.WriteAllText(ScheduledTasksFile, JsonConvert.SerializeObject(_scheduledTasks));
+                }
+                catch {}
             }
             return new { success = true, taskId, cronExpression = cron, status = "scheduled", totalScheduled = _scheduledTasks.Count };
         }
@@ -2916,6 +3777,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (action.Equals("add", StringComparison.OrdinalIgnoreCase) || action.Equals("create", StringComparison.OrdinalIgnoreCase))
                 {
                     _tradeJournal[id] = req;
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(TradeJournalFile));
+                        File.WriteAllText(TradeJournalFile, JsonConvert.SerializeObject(_tradeJournal));
+                    }
+                    catch {}
+                }
+                else if (File.Exists(TradeJournalFile) && !_tradeJournal.ContainsKey(id))
+                {
+                    try
+                    {
+                        var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(TradeJournalFile));
+                        if (loaded != null) foreach (var kv in loaded) _tradeJournal[kv.Key] = kv.Value;
+                    }
+                    catch {}
                 }
                 return new { success = true, action, count = _tradeJournal.Count, entries = _tradeJournal.Values.ToList() };
             }
@@ -2933,6 +3809,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             lock (_alerts)
             {
                 _alerts[alertId] = req;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(AlertsFile));
+                    File.WriteAllText(AlertsFile, JsonConvert.SerializeObject(_alerts));
+                }
+                catch {}
             }
             return new { success = true, alertId, symbol, status = "active", totalAlerts = _alerts.Count };
         }
@@ -2944,6 +3826,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             lock (_riskGuardConfig)
             {
                 _riskGuardConfig[key] = req;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile));
+                    File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig));
+                }
+                catch {}
                 return new { success = true, status = "updated", config = req };
             }
         }
@@ -2958,6 +3846,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             foreach (Account acc in Account.All)
             {
                 if (!string.IsNullOrEmpty(accountName) && !acc.Name.Equals(accountName, StringComparison.OrdinalIgnoreCase)) continue;
+                dailyPnL += AcctGet(acc, AccountItem.RealizedProfitLoss) + AcctGet(acc, AccountItem.UnrealizedProfitLoss);
                 totalTrades += acc.Executions.Count;
                 foreach (Position pos in acc.Positions)
                 {
@@ -2983,7 +3872,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "sync_hedge";
-            return new { success = true, action, targetAccounts = new[] { "Sim101", "SimCopy2" }, status = "executed" };
+            var accList = req["accounts"] as JArray;
+            var targetAccounts = accList != null ? accList.Select(a => a.ToString()).ToList() : Account.All.Select(a => a.Name).ToList();
+            return new { success = true, action, targetAccounts, status = "executed" };
         }
 
         // - Helpers -
@@ -2992,14 +3883,19 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
         {
-            var json = JsonConvert.SerializeObject(data);
-            var buffer = Encoding.UTF8.GetBytes(json);
-            ctx.Response.Headers.Add("X-NT8-MCP-Version", Version);
-            ctx.Response.StatusCode = code;
-            ctx.Response.ContentType = "application/json";
-            ctx.Response.ContentLength64 = buffer.Length;
-            ctx.Response.OutputStream.Write(buffer, 0, buffer.Length);
-            ctx.Response.OutputStream.Close();
+            try
+            {
+                if (ctx == null || ctx.Response == null) return;
+                var json = JsonConvert.SerializeObject(data);
+                var buffer = Encoding.UTF8.GetBytes(json);
+                try { ctx.Response.Headers.Add("X-NT8-MCP-Version", Version); } catch {}
+                try { ctx.Response.StatusCode = code; } catch {}
+                try { ctx.Response.ContentType = "application/json"; } catch {}
+                try { ctx.Response.ContentLength64 = buffer.Length; } catch {}
+                ctx.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                ctx.Response.OutputStream.Close();
+            }
+            catch {}
         }
 
 
