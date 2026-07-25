@@ -2496,33 +2496,132 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // - v1.4.0 Expansion Endpoints -
 
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lockoutExpiry =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
         private object EmergencyFlatten(string body)
         {
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var accountFilter = req.Str("account");
-            int lockoutMinutes = req["lockoutMinutes"] != null ? (int)req["lockoutMinutes"] : 60;
-            var key = req.Str("idempotencyKey");
-
-            int cancelled = 0, flattened = 0;
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            JObject req;
+            try
             {
-                foreach (Account acc in Account.All)
+                req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            }
+            catch (Exception ex)
+            {
+                Log($"[EMERGENCY FLATTEN] Invalid JSON body: {ex.Message}", LogLevel.Error);
+                return new { success = false, error = "Invalid JSON body" };
+            }
+
+            string accountFilter = req.Str("account");
+            int lockoutMinutes = req["lockoutMinutes"] != null ? (int)req["lockoutMinutes"] : 60;
+            string key = req.Str("idempotencyKey") ?? Guid.NewGuid().ToString();
+
+            var errors = new List<string>();
+            int cancelled = 0;
+            int residualCancelled = 0;
+            int flattened = 0;
+
+            var activeStates = new[]
+            {
+                OrderState.Working,
+                OrderState.Submitted,
+                OrderState.Accepted,
+                OrderState.ChangePending,
+                OrderState.PartFilled
+            };
+
+            try
+            {
+                var dispatcher = System.Windows.Application.Current?.Dispatcher;
+                if (dispatcher == null)
                 {
-                    if (!string.IsNullOrEmpty(accountFilter) && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
-                    foreach (Order ord in acc.Orders)
-                    {
-                        if (ord.OrderState == OrderState.Working || ord.OrderState == OrderState.Submitted || ord.OrderState == OrderState.Accepted)
-                        {
-                            try { acc.Cancel(new[] { ord }); cancelled++; } catch {}
-                        }
-                    }
-                    try { acc.Flatten(acc.Positions.Select(p => p.Instrument).ToList()); flattened++; } catch {}
-
+                    errors.Add("No UI dispatcher available.");
+                    return new { success = false, actionId = key, cancelledOrders = 0, residualCancelled = 0, flattenedAccounts = 0, lockoutMinutes, errors };
                 }
-            });
 
-            Log($"[EMERGENCY FLATTEN] ActionKey={key} Cancelled={cancelled} Flattened={flattened} Lockout={lockoutMinutes}m", LogLevel.Warning);
-            return new { success = true, actionId = key ?? Guid.NewGuid().ToString(), cancelledOrders = cancelled, flattenedAccounts = flattened, lockoutMinutes };
+                dispatcher.Invoke(() =>
+                {
+                    var accounts = Account.All.ToList();
+                    foreach (Account acc in accounts)
+                    {
+                        if (!string.IsNullOrEmpty(accountFilter) && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        // 1. Terminate automated strategies on this account (Snapshot to avoid live collection mutation)
+                        try
+                        {
+                            var strategies = acc.Strategies?.ToList() ?? new List<NinjaTrader.NinjaScript.StrategyBase>();
+                            foreach (NinjaTrader.NinjaScript.StrategyBase str in strategies)
+                            {
+                                try { str.SetState(State.Terminated); }
+                                catch (Exception sex) { errors.Add($"[{acc.Name}] Strategy terminate failed: {sex.Message}"); }
+                            }
+                        }
+                        catch (Exception aex) { errors.Add($"[{acc.Name}] Strategy enumeration failed: {aex.Message}"); }
+
+                        // 2. First cancel pass: all active working/partfilled orders
+                        var firstOrders = acc.Orders.Where(o => activeStates.Contains(o.OrderState)).ToList();
+                        foreach (Order ord in firstOrders)
+                        {
+                            try
+                            {
+                                acc.Cancel(new[] { ord });
+                                cancelled++;
+                            }
+                            catch (Exception cex) { errors.Add($"[{acc.Name}] Cancel order {ord.OrderId}: {cex.Message}"); }
+                        }
+
+                        // 3. Close open positions (Snapshot positions)
+                        var positions = acc.Positions.ToList();
+                        if (positions.Count > 0)
+                        {
+                            try
+                            {
+                                acc.Flatten(positions.Select(p => p.Instrument).ToList());
+                                flattened++;
+                            }
+                            catch (Exception fex) { errors.Add($"[{acc.Name}] Flatten failed: {fex.Message}"); }
+                        }
+
+                        // 4. Second cancel pass for residual bracket/OCO orders
+                        var residualOrders = acc.Orders.Where(o => activeStates.Contains(o.OrderState)).ToList();
+                        foreach (Order ord in residualOrders)
+                        {
+                            try
+                            {
+                                acc.Cancel(new[] { ord });
+                                residualCancelled++;
+                            }
+                            catch (Exception cex) { errors.Add($"[{acc.Name}] Residual cancel order {ord.OrderId}: {cex.Message}"); }
+                        }
+
+                        // 5. Apply lockout record
+                        var until = DateTime.UtcNow.AddMinutes(lockoutMinutes);
+                        _lockoutExpiry.AddOrUpdate(acc.Name, until, (_, __) => until);
+                    }
+                });
+            }
+            catch (Exception dex)
+            {
+                errors.Add($"Dispatcher invocation failed: {dex.Message}");
+            }
+
+            int totalCancelled = cancelled + residualCancelled;
+            bool success = errors.Count == 0 || (totalCancelled + flattened) > 0;
+            var level = errors.Count > 0 ? LogLevel.Error : LogLevel.Warning;
+
+            Log($"[EMERGENCY FLATTEN AUDIT-NT8-001] Key={key} Cancelled={totalCancelled} Flattened={flattened} Lockout={lockoutMinutes}m Errors={errors.Count}", level);
+            return new
+            {
+                success,
+                actionId = key,
+                cancelledOrders = totalCancelled,
+                firstPassCancelled = cancelled,
+                residualCancelled,
+                flattenedAccounts = flattened,
+                lockoutMinutes,
+                errors
+            };
         }
 
         private object ChartSnapshot(string body)
