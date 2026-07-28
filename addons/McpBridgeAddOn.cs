@@ -661,6 +661,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             bool valid = false;
             object tabRef = null;
             object baseline = null;
+            object baselineResults = null;  // SystemPerformance ref before run — detects SA reusing the entry object
 
             disp.Invoke((Action)(() =>
             {
@@ -707,6 +708,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         SetSaDateRange(_saWindow, fromDt, toDt);
 
                     baseline = GetP(tab, "SelectedResult");
+                    // Also capture the baseline Results reference. NT8's SA may REUSE the same
+                    // SelectedResult object across runs and just swap its Results (SystemPerformance).
+                    // Detecting a new Results reference is more reliable than a new SelectedResult.
+                    baselineResults = baseline != null ? GetP(baseline, "Results") : null;
                     valid = Convert.ToBoolean(InvokeM(vm, "CheckSettingsValid"));
                     if (valid) InvokeM(vm, "OnRun", null, null);
                 }
@@ -716,7 +721,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
             if (!valid) return new { error = "settings invalid - check strategy name, instrument, or that data exists for the range" };
 
-            // Poll for a new completed result.
+            // Poll for a new completed result. Two signals:
+            //   (a) SelectedResult becomes a NEW object reference (classic), OR
+            //   (b) SelectedResult.Results becomes a NEW object reference (SA reused the entry
+            //       but created a fresh SystemPerformance for this run).
+            // Either signal + non-null Results = done. 0-trade runs still produce a SystemPerformance.
             var deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
             object entry = null;
             while (DateTime.UtcNow < deadline)
@@ -726,7 +735,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 disp.Invoke((Action)(() =>
                 {
                     sel = GetP(tabRef, "SelectedResult");
-                    if (sel != null && !ReferenceEquals(sel, baseline)) results = GetP(sel, "Results");
+                    if (sel == null) return;
+                    bool selChanged = !ReferenceEquals(sel, baseline);
+                    results = GetP(sel, "Results");
+                    bool resultsChanged = results != null && !ReferenceEquals(results, baselineResults);
+                    // Accept if either the entry or the Results object changed AND results is non-null.
+                    if (results != null && (selChanged || resultsChanged)) return;
+                    results = null;  // not ready yet — keep polling
                 }));
                 if (results != null) { entry = sel; break; }
             }
