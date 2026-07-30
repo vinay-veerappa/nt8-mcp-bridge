@@ -556,17 +556,29 @@ namespace NinjaTrader.NinjaScript.AddOns
                 new[] { typeof(bool), typeof(bool), typeof(IEnumerable<string>), typeof(IEnumerable<string>) }, null);
             if (compile == null) return Persist(new { success = false, error = "Compiler.Compile(bool,bool,IEnumerable<string>,IEnumerable<string>) not found" });
 
-            object emit;
-            try
+            object emit = null;
+            Exception compileEx = null;
+
+            // Marshal to UI thread — NT8's NinjaScript compiler requires the WPF Dispatcher.
+            // Without this, Compiler.Compile() deadlocks/crashes when called from the HTTP listener thread.
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return Persist(new { success = false, error = "no WPF dispatcher (is NT8 UI up?)" });
+
+            disp.Invoke((Action)(() =>
             {
-                // Compile everything from disk: no ignores, no tmp overlay (files already written to Custom\Strategies).
-                emit = compile.Invoke(null, new object[] { false, debug, new List<string>(), new List<string>() });
-            }
-            catch (Exception ex)
-            {
-                var inner = (ex as TargetInvocationException)?.InnerException ?? ex;
-                return Persist(new { success = false, error = "compile threw: " + inner.Message, stack = inner.StackTrace });
-            }
+                try
+                {
+                    // Compile everything from disk: no ignores, no tmp overlay (files already written to Custom\Strategies).
+                    emit = compile.Invoke(null, new object[] { false, debug, new List<string>(), new List<string>() });
+                }
+                catch (Exception ex)
+                {
+                    compileEx = (ex as TargetInvocationException)?.InnerException ?? ex;
+                }
+            }));
+
+            if (compileEx != null)
+                return Persist(new { success = false, error = "compile threw: " + compileEx.Message, stack = compileEx.StackTrace });
 
             // EmitResult.Success (bool) + EmitResult.Diagnostics (IEnumerable<Diagnostic>)
             var success = (bool?)emit?.GetType().GetProperty("Success")?.GetValue(emit) ?? false;
