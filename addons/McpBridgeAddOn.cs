@@ -3322,12 +3322,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             var done = new System.Threading.ManualResetEventSlim(false);
             Bars bars = null;
             var barsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 1 };
-            using (var request = new BarsRequest(instrument, need) { BarsPeriod = barsPeriod })
+
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
+
+            disp.Invoke((Action)(() =>
             {
-                request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
-                if (!done.Wait(TimeSpan.FromSeconds(30)))
-                    return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
-            }
+                using (var request = new BarsRequest(instrument, need) { BarsPeriod = barsPeriod })
+                {
+                    request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
+                }
+            }));
+            if (!done.Wait(TimeSpan.FromSeconds(30)))
+                return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
             if (bars == null || bars.Count == 0)
                 return new { status = "not_implemented", reason = $"no bar data for '{symbol}' (status={status})" };
         
@@ -3338,10 +3345,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             object indicator = null;
             string resolvedName = null;
             Exception buildErr = null;
-        
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
-        
+
+            // disp already declared above for BarsRequest — reuse it
             disp.Invoke((Action)(() =>
             {
                 try
