@@ -651,7 +651,7 @@ const TOOLS = [
 ];
 
 // ─── HTTP Client to NT8 AddOn ──────────────────────────────────────────
-function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
+function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000, retries = 3) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, NT8_BASE);
     const options = {
@@ -664,6 +664,10 @@ function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
         'X-NT8-MCP-Version': SERVER_VERSION,
       },
       timeout: timeoutMs,
+      // Disable connection pooling — each request opens a fresh TCP connection.
+      // Without this, stale keep-alive sockets from a previous bridge session
+      // (e.g. after compile hot-swap or NT8 restart) cause ECONNRESET.
+      agent: false,
     };
 
     if (NT8_MCP_TOKEN) {
@@ -676,24 +680,35 @@ function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
       options.headers['Content-Length'] = Buffer.byteLength(data);
     }
 
-    const req = httpRequest(options, (res) => {
-      let chunks = '';
-      res.on('data', (chunk) => { chunks += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(chunks);
-          resolve({ status: res.statusCode, data: parsed });
-        } catch {
-          resolve({ status: res.statusCode, data: chunks });
+    const doRequest = (attempt) => {
+      const req = httpRequest(options, (res) => {
+        let chunks = '';
+        res.on('data', (chunk) => { chunks += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(chunks);
+            resolve({ status: res.statusCode, data: parsed });
+          } catch {
+            resolve({ status: res.statusCode, data: chunks });
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        if (attempt < retries && (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED')) {
+          // Retry with fresh connection — bridge may have hot-swapped
+          setTimeout(() => doRequest(attempt + 1), 500);
+        } else {
+          reject(new Error(`NT8 connection failed: ${err.message}`));
         }
       });
-    });
+      req.on('timeout', () => { req.destroy(); reject(new Error('NT8 timeout')); });
 
-    req.on('error', (err) => reject(new Error(`NT8 connection failed: ${err.message}`)));
-    req.on('timeout', () => { req.destroy(); reject(new Error('NT8 timeout')); });
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    };
 
-    if (body) req.write(JSON.stringify(body));
-    req.end();
+    doRequest(0);
   });
 }
 

@@ -2,38 +2,16 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Connect AI agents (Claude, Hermes, ChatGPT, Cursor, Cline) to **NinjaTrader 8** via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+Connect AI agents (GitHub Copilot, Claude, Cursor, Cline, etc.) to **NinjaTrader 8** via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-Through a single stdio interface, this MCP lets an AI agent:
+Through a single stdio interface, this MCP server lets an AI agent:
 
-**Account Management**
-- List accounts with balances and buying power
-- Read open positions with live P&L
-- List working orders with their status
-
-**Live Trading**
-- Place Market / Limit / StopMarket / StopLimit orders
-- Cancel an order by ID/name, or cancel all working orders at once
-- Stream real-time quotes (bid, ask, last, volume, daily high/low)
-
-**Strategy Development**
-- Author full NinjaScript strategy source
-- Compile it in-process via NinjaTrader's own Roslyn compiler — hot-swapped, **no NT8 restart**
-
-**Live Deployment & Monitoring**
-- Deploy a compiled strategy onto a chart and enable it — **SIM-first** (live needs explicit confirm)
-- List running strategies with state, account, instrument, and position; stop (disable + remove)
-- Strategies can POST a per-fill **notification webhook** to an external "AI Gate" (TradingView-style)
-
-**Backtesting**
-- Run backtests through the Strategy Analyzer over a configurable **symbol, date range, timeframe, and parameters**
-- Read back net P&L, drawdown, gross P/L, trade count, and the full trade list
-
-**Historical Market Data**
-- Export OHLCV bar ranges (Minute/Day/Tick/Volume/Range) to CSV
-- Build a single-vendor, provenance-tagged 1-minute Postgres archive (`nt8_ohlcv_bars`)
-- Keep it current with a scheduled daily incremental updater
-- Search instruments by name or symbol
+- **Account & Risk** — list accounts/positions/orders, read RiskGuard FSM state, pull compliance reports
+- **Live Trading** — place Market / Limit / StopMarket / StopLimit / OCO / ATM orders, cancel/change orders, close positions, emergency flatten
+- **Quotes & Data** — stream real-time quotes, historical bars, export date ranges to CSV, search instruments
+- **Strategy Development** — author NinjaScript source, compile in-process (Roslyn hot-swap, **no NT8 restart**), backtest, inspect, deploy, stop, and tune parameters
+- **Research & Automation** — signal backtests, portfolio backtests, synthetic stress data, Monte Carlo, scheduled tasks, C# snippet execution, chart drawing/capture
+- **Observability** — tail NT8 logs, capture chart screenshots, stream fills/FSM events via SSE, export trade journals
 
 ## Architecture
 
@@ -41,7 +19,11 @@ Through a single stdio interface, this MCP lets an AI agent:
 AI Client (MCP stdio)  →  nt-mcp-server.js  →  HTTP :7890  →  NT8 McpBridgeAddOn
 ```
 
-Three layers, zero external APIs, everything runs locally on your machine.
+Three layers, zero external APIs, everything runs locally on the NT8 machine.
+
+## Version
+
+**AddOn + MCP server version: 1.5.0** (`X-NT8-MCP-Version: 1.5.0`)
 
 ## Quick Start
 
@@ -50,7 +32,7 @@ Three layers, zero external APIs, everything runs locally on your machine.
 1. Open **NinjaTrader 8**
 2. `New` → `NinjaScript Editor` (F11)
 3. Right-click `AddOns` in the left panel → `New AddOn...`
-4. Replace the file contents with `nt8-addon/McpBridgeAddOn.cs`
+4. Replace the file contents with `nt8-addon/McpBridgeAddOn.cs` (or the compiled source at `C:\Users\<user>\Documents\NinjaTrader 8\bin\Custom\AddOns\McpBridgeAddOn.cs`)
 5. Press **F5** to compile
 6. Restart NinjaTrader
 
@@ -63,7 +45,7 @@ and compile via NinjaScript Editor (F5).
 Verify the AddOn is running:
 ```powershell
 curl http://localhost:7890/api/health
-# {"status":"ok","timestamp":"...","version":"0.2.1","dev":false}
+# {"status":"ok","timestamp":"...","version":"1.5.0","dev":true|false,"accounts":N,"feedConnected":true|false}
 ```
 
 ### 2. Start the MCP Server
@@ -74,11 +56,26 @@ node nt-mcp-server.js
 
 Expected output:
 ```
-[nt-mcp] Server started — NT8 at http://127.0.0.1:7890
+[nt-mcp] Server v1.5.0 started — NT8 at http://127.0.0.1:7890
 [nt-mcp] Waiting for MCP messages on stdin...
 ```
 
 ### 3. Configure Your AI Client
+
+**VS Code / GitHub Copilot** (`.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "ninjatrader": {
+      "command": "node",
+      "args": ["C:/path/to/nt-mcp-server.js"],
+      "env": {
+        "NT8_MCP_TOKEN": "YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
 
 **Claude Desktop** (`claude_desktop_config.json`):
 ```json
@@ -86,126 +83,204 @@ Expected output:
   "mcpServers": {
     "ninjatrader": {
       "command": "node",
-      "args": ["C:/path/to/nt-mcp-server.js"]
+      "args": ["C:/path/to/nt-mcp-server.js"],
+      "env": { "NT8_MCP_TOKEN": "YOUR_TOKEN_HERE" }
     }
   }
 }
 ```
 
-**Hermes Agent** (`~/.hermes/config.yaml`):
-```yaml
-mcpServers:
-  ninjatrader:
-    command: node
-    args: ['C:\path\to\nt-mcp-server.js']
-    transport: stdio
+## Tools Reference
+
+The server exposes the following MCP tools, mapped to the HTTP endpoints listed in the **Endpoint column**.
+
+### Account, Position, Order
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `nt_health` | `GET /api/health` | Bridge status, version, dev mode, account count, feed connected |
+| `nt_accounts` | `GET /api/account` | List accounts with balances, PnL, buying power |
+| `nt_positions` | `GET /api/positions` | Open positions with market position, quantity, avg price, unrealized PnL |
+| `nt_orders` | `GET /api/orders?account=&limit=&offset=` | Working/historical orders with state, price, quantity |
+| `nt_place_order` | `POST /api/order` | Place Market / Limit / StopMarket / StopLimit / MIT order |
+| `nt_place_oco_order` | `POST /api/order/oco` | Place paired OCO entry + stop + target |
+| `nt_place_atm_order` | `POST /api/order/atm` | Place order bound to a server-side ATM strategy |
+| `nt_change_order` | `POST /api/order/change` | Modify limit/stop price or quantity of a working order |
+| `nt_cancel_order` | `POST /api/order/cancel` | Cancel by `orderId` or entire OCO group by `ocoId` |
+| `nt_cancel_all_orders` | `POST /api/orders/cancel-all` | Cancel all working orders across accounts |
+| `nt_close_position` | `POST /api/position/close` | Flatten a symbol position for an account |
+| `nt_emergency_flatten` | `POST /api/emergency-flatten` | Atomic panic kill-switch: cancel all, flatten all, optional lockout |
+| `nt_lockout` | `POST /api/lockout` | Engage or query account lockout status |
+
+### Quotes, Bars, Instruments
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `nt_quote` | `GET /api/quote?symbol=` | Real-time quote: bid, ask, last, volume, high, low |
+| `nt_bars` | `GET /api/bars?symbol=&period=&periodValue=&count=` | Historical OHLCV bars (bar-close time in NT8 timezone) |
+| `nt_export_bars` | `POST /api/bars/export` | Export date range of OHLCV to CSV on NT8 machine |
+| `nt_get_export` | `GET /api/export?name=` | Retrieve exported CSV content |
+| `nt_search` | `GET /api/search?query=` | Search instruments by name or symbol |
+
+### Strategy Authoring, Compile, Backtest
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `nt_list_strategies` | `GET /api/strategies` | List NinjaScript source files in `bin\Custom\Strategies` |
+| `nt_strategy_source` | `GET /api/strategy/source?name=` | Read source of one strategy |
+| `nt_create_strategy` | `POST /api/strategy/create` | Write full NinjaScript source to `bin\Custom\Strategies` |
+| `nt_compile` | `POST /api/compile` then `GET /api/compile/result` | In-process Roslyn compile + hot-swap; returns errors/warnings |
+| `nt_backtest` | `POST /api/backtest` | Run Strategy Analyzer backtest |
+| `nt_portfolio_backtest` | `POST /api/backtest/portfolio` | Multi-symbol simultaneous backtests with correlation matrix |
+| `nt_signal_backtest` | `POST /api/backtest/signal` | Lightweight what-if signal rule testing |
+| `nt_inspect_strategy` | `GET /api/strategy/inspect?name=` | Reflect strategy properties and inputs |
+| `nt_strategy_status` | `GET /api/strategy/running` | List running strategies, state, position |
+| `nt_deploy_strategy` | `POST /api/strategy/deploy` | Add compiled strategy to an **open chart** (SIM-first). Best-effort: NT8 has no public API to open a chart or attach a strategy from an AddOn, so the chart must already be open. |
+| `nt_stop_strategy` | `POST /api/strategy/stop` | Disable + remove running strategies |
+| `nt_set_strategy_param` | `POST /api/strategy/param` | Change inputs on a running strategy live |
+| `nt_sa_close` | `POST /api/sa/close` | Close Strategy Analyzer windows |
+| `nt_sa_inspect` | `GET /api/sa/inspect` | Inspect Strategy Analyzer date/control bindings |
+
+### Observability & Logs
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `nt_get_logs` | `GET /api/logs?tab=&lines=` | Tail Output tab, Strategy Analyzer, or `interventions.jsonl` |
+| `nt_fill_events` | `GET /api/events/fills?account=&count=` | Query account execution fill history |
+| `nt_subscribe` | `GET /api/events/stream` (SSE) | Subscribe to real-time fills/FSM/error SSE stream |
+| `nt_capture_chart` | `GET /api/chart/capture?symbol=` | Capture chart window as base64 PNG. Symbol-specific matching is best-effort; falls back to any visible chart |
+| `nt_chart_snapshot` | `POST /api/chart/snapshot` | Enhanced screenshot with visual markers |
+| `nt_open_chart` | `POST /api/chart/open` | Validates instrument and focuses Control Center. NT8 has no public AddOn API to open a chart window — use Ctrl+Shift+N |
+| `nt_draw_level` | `POST /api/chart/draw` | Draw line/rectangle/text onto a chart (best-effort; requires visible chart for exact instrument) |
+| `nt_trade_chart` | `POST /api/chart/trade` | Chart screenshot centered on trade entry/exit |
+
+### Research, Risk, Automation
+
+| Tool | Endpoint | Description |
+|------|----------|-------------|
+| `nt_extract_trades` | `GET /api/trades/extract?account=&from=&to=&format=` | Export trade records with MAE/MFE, commissions, tags |
+| `nt_monte_carlo` | `POST /api/trades/monte-carlo` | Block-bootstrap Monte Carlo over trade history |
+| `nt_synthetic_data` | `POST /api/data/synthetic` | Generate stress-scenario OHLCV datasets |
+| `nt_trade_journal` | `POST /api/trades/journal` | CRUD + tag + export trade journal entries |
+| `nt_schedule` | `POST /api/schedule/task` | Register cron-based tasks inside NT8 |
+| `nt_script_execute` | `POST /api/script/execute` | Execute sandboxed C# snippet inside NT8 |
+| `nt_alert` | `POST /api/alert/create` | Create persistent price/indicator alerts |
+| `nt_riskguard_state` | `GET /api/riskguard/fsm-state?account=&instrument=` | Read RiskGuard FSM state, drawdown, limits |
+| `nt_riskguard_config` | `POST /api/riskguard/config` | Configure trailing drawdown, vol caps, blackouts |
+| `nt_compliance_report` | `GET /api/compliance/report?account=` | Generate prop/broker compliance report |
+| `nt_copier_config` | `POST /api/copier/config` | Get/Set TradeCopierEngine leader/follower config |
+| `nt_prop_limits` | `POST /api/prop/limits` | Get/Set PropFirmProtectionSuite rules |
+| `nt_multi_account_orchestrator` | `POST /api/orchestrator/multi-account` | Coordinated multi-account order routing/hedging |
+| `nt_indicator_values` | `GET /api/indicator/values?symbol=&indicatorName=` | Retrieve indicator values. Scans loaded assemblies to resolve the NinjaScript indicator host, fixing the original `NinjaTrader.Custom` AssemblyLoadContext mismatch |
+
+## Instrument Symbols
+
+**Root tickers like `ES`, `NQ`, `MNQ` are rejected as unknown instruments.** Use the full futures format that matches the active front month:
+
+```json
+{ "symbol": "ES 09-26" }   // resolves to ES SEP26
+{ "symbol": "NQ 09-26" }   // resolves to NQ SEP26
+{ "symbol": "MNQ 09-26" }  // resolves to MNQ SEP26
+{ "symbol": "GC 08-26" }   // resolves to GC AUG26
 ```
 
-## Tools
+Use `GET /api/search?query=NQ` to discover available contract months.
 
-### Phase 1 — account, trading, data
+## Common Payload Examples
 
-| Tool | Description |
-|------|-------------|
-| `nt_health` | Check connection to NinjaTrader 8 |
-| `nt_accounts` | List accounts, balances, buying power |
-| `nt_positions` | List open positions with PnL |
-| `nt_orders` | List working orders with status |
-| `nt_place_order` | Place Market / Limit / StopMarket / StopLimit orders |
-| `nt_cancel_order` | Cancel an order by ID or name |
-| `nt_cancel_all_orders` | Cancel all working orders across all accounts |
-| `nt_quote` | Real-time quote (bid, ask, last, volume, daily high/low) |
-| `nt_bars` | Historical OHLCV bars (Minute, Day, Tick, Volume, Range) |
-| `nt_search` | Search instruments by name or symbol |
-
-### Phase 2 — strategy authoring, compile, backtest
-
-| Tool | Description |
-|------|-------------|
-| `nt_list_strategies` | List NinjaScript strategy files in `bin\Custom\Strategies` |
-| `nt_strategy_source` | Read one strategy's NinjaScript source |
-| `nt_create_strategy` | Write full NinjaScript source into `bin\Custom\Strategies` |
-| `nt_compile` | Recompile NinjaScript in-process (Roslyn, hot-swap, **no NT8 restart**); returns compile errors |
-| `nt_backtest` | Run a backtest via the Strategy Analyzer over a configurable **symbol, date range (`from`/`to`), timeframe (`period`/`periodValue`), and `params`**; returns net P&L, drawdown, gross P/L, trade count + trade list |
-
-**Typical Phase 2 flow:** `nt_create_strategy` (agent writes the NinjaScript) → `nt_compile` (build + hot-load, reports any errors) → `nt_backtest` (run it, read metrics) → iterate.
-
-Example `nt_backtest` — the same strategy over a specific symbol, date range, timeframe, and parameters:
+### Place a market order
 ```jsonc
-{ "strategy": "MyStrategy", "symbol": "GC 08-26",
-  "from": "2026-03-01", "to": "2026-04-30",
-  "period": "Minute", "periodValue": 5,
-  "params": { "Fast": 5, "Slow": 50 }, "maxTrades": 50 }
+POST /api/order
+{
+  "symbol": "MNQ 09-26",
+  "action": "buy",
+  "quantity": 1,
+  "orderType": "Market",
+  "idempotencyKey": "uuid-or-unique-string"
+}
 ```
 
-### Phase 3 — historical data extraction
-
-| Tool | Description |
-|------|-------------|
-| `nt_export_bars` | Export a **date range** of OHLCV bars to a CSV on the NT8 machine (NT8 downloads missing history on demand). Configurable `symbol`, `from`/`to`, `period`/`periodValue`, and `merge` policy. Returns a summary (rows, actual range, filename). |
-| `nt_get_export` | Return the content of an export CSV by filename (for pulling it over the private network). |
-
-**Two extraction modes:**
-
-1. **Return CSV** — `nt_export_bars` writes `mcp_bars_<symbol>_<period>.csv`; fetch it with
-   `nt_get_export` (or read the file directly if you're on the NT8 machine).
-   ```jsonc
-   { "symbol": "GC 08-26", "from": "2020-01-01", "to": "2026-07-10",
-     "period": "Minute", "periodValue": 1, "merge": "DoNotMerge" }
-   ```
-   - `merge`: **`DoNotMerge`** = the single resolved contract; **`MergeNonBackAdjusted`** = a continuous
-     series stitched across front months with **no price adjustment** (anchor on a real contract, e.g.
-     `GC 08-26`). **Never `MergeBackAdjusted`** for spread/ratio work — it shifts historical prices by
-     cumulative roll gaps and corrupts the signal.
-   - Depth (Tradovate feed): ES/GC/CL/SI/NQ ~2006–2008, **RTY ~2017**, **M2K ~2019** (launch-limited).
-   - Timestamps are NT8-local **bar-close**; convert to your target convention on load (see below).
-
-2. **Load to a Postgres table** — [`nt8_ingest/`](nt8_ingest/) builds a **single-vendor, provenance-tagged**
-   1-minute archive (`nt8_ohlcv_bars`) from these exports: per-contract, non-back-adjusted, roll-overlap
-   bars kept, UTC bar-open timestamps (converted from NT8's Central bar-close), idempotent + resumable,
-   with QA (density/rolls/spot-check) and a `nt8_data_gaps` registry that **records feed holes instead of
-   cross-vendor patching them**. See [nt8_ingest/README.md](nt8_ingest/README.md).
-
-### Phase 4 — live deployment, monitoring, alerts
-
-| Tool | Description |
-|------|-------------|
-| `nt_deploy_strategy` | Add a compiled strategy to an **open chart** and enable it (**SIM-first**). Sets account (default `Sim101`) + `params`; a live account requires `confirmLive: true`. |
-| `nt_stop_strategy` | Disable + remove running strategies (filter by class name / account). Does **not** auto-flatten an open position. |
-| `nt_strategy_status` | List strategies NT8 is running on an account: state (Realtime/…), account, instrument, timeframe, position, quantity. |
-
-### Phase 5 — Unbound v1.1.0 Endpoints & v1.2 Expansion Pipeline
-
-| Tool | Description |
-|------|-------------|
-| `nt_capture_chart` | Capture WPF chart window into base64 PNG images for visual inspection of setups and trade executions. |
-| `nt_open_chart` | Programmatically open chart windows/tabs for any symbol/timeframe (enables zero-manual-step deploy). |
-| `nt_get_logs` | Tail NT8 Output tab logs, Strategy Analyzer output, or `interventions.jsonl` audit files for error diagnosis. |
-| `nt_fill_events` | Query account execution history (`account.Executions`) for trade reconciliation and fill audit. |
-| `nt_inspect_strategy` | Inspect property declarations, inputs, and parameters of compiled strategies via reflection. |
-| `nt_riskguard_state` | Read live RiskGuard FSM state, peak equity drawdown, and daily loss limit snapshots. |
-| `nt_copier_config` | *(Upcoming)* Dynamic runtime configuration of `TradeCopierEngine.cs` (Leader/Follower account ratios, Micro/Mini lot scaling). |
-| `nt_prop_limits` | *(Upcoming)* Dynamic configuration of `PropFirmProtectionSuite.cs` (Target Profit lock, News Shield buffers). |
-| `nt_extract_trades` / `nt_journal_export` | *(Upcoming)* Export trade executions with MAE/MFE, duration, P&L, commissions, and ICT context to TraderSync, TradesViz, or Markdown journals. |
-| `nt_trade_chart` | *(Upcoming)* Automated chart screenshots centered on trade entry/exit with buy/sell markers and stop/target price lines. |
-| `nt_monte_carlo` | *(Upcoming)* Run $1,000$–$10,000$ iteration Monte Carlo simulations on trade histories to evaluate ruin probability, drawdown confidence bands, and slippage sensitivity. |
-| `nt_optimize` | *(Upcoming)* Parameter optimization via Strategy Analyzer (Grid/Genetic search space) and Walk-Forward Analysis (`nt_walk_forward`). |
-| `nt_place_atm_order` | *(Upcoming)* Order entry with server-side ATM strategy brackets (stop loss, profit targets, auto-breakeven managed by `DynamicAtmManager.cs`). |
-| `nt_draw_level` / `nt_draw_shape` | *(Upcoming)* Plot support/resistance levels, HOD/LOD, Midnight Open, and FVG boxes directly onto NT8 charts via native `Draw.*` methods. |
-
-**Typical Phase 4 flow:** open a chart for the instrument → `nt_deploy_strategy` (add + enable on
-Sim101) → `nt_strategy_status` (watch state + position) → `nt_stop_strategy` (disable + remove).
-
+### Place an OCO order
 ```jsonc
-{ "strategy": "PathSignatureUnion", "instrument": "NQ 09-26",
-  "account": "Sim101", "params": { "Qty": 1 }, "enable": true }
+POST /api/order/oco
+{
+  "symbol": "MNQ 09-26",
+  "action": "buy",
+  "quantity": 1,
+  "stopPrice": 28400.0,
+  "targetPrice": 28700.0,
+  "idempotencyKey": "oco-uuid"
+}
+```
+Note: use `targetPrice`, not `limitPrice`.
+
+### Place an ATM order
+```jsonc
+POST /api/order/atm
+{
+  "symbol": "MNQ 09-26",
+  "action": "buy",
+  "quantity": 1,
+  "strategyName": "Standard_ATM",
+  "stopTicks": 20,
+  "targetTicks": 40,
+  "idempotencyKey": "atm-uuid"
+}
 ```
 
-**Strategy alerts (AI-Gate webhook).** A strategy can also POST a **notification** to an external
-"AI Gate" on every fill (the TradingView-webhook pattern) — a lean, notify-only payload (`source=nt8`,
-`event`, `side`, `qty`, `price`, …) so a downstream relay does **not** cross-execute (NT8 already
-filled the trade). This lives inside the NinjaScript strategy (an `AlertUrl` input + fire-and-forget
-POST), independent of the MCP tools above.
+### Run a backtest
+```jsonc
+POST /api/backtest
+{
+  "strategy": "IBBreakoutBot",
+  "symbol": "NQ 09-26",
+  "from": "2026-07-20",
+  "to": "2026-07-25",
+  "period": "Minute",
+  "periodValue": 5,
+  "params": { "ActivePlay": 1 },
+  "maxTrades": 50
+}
+```
+
+### Export bars to CSV
+```jsonc
+POST /api/bars/export
+{
+  "symbol": "NQ 09-26",
+  "from": "2026-07-20",
+  "to": "2026-07-25",
+  "period": "Minute",
+  "periodValue": 5,
+  "merge": "DoNotMerge",
+  "timeoutSec": 180
+}
+```
+Fetch the file with `GET /api/export?name=mcp_bars_NQ_09_26_Minute5.csv`.
+
+### Deploy a strategy to a chart
+```jsonc
+POST /api/strategy/deploy
+{
+  "strategy": "MyStrategy",
+  "instrument": "NQ 09-26",
+  "account": "Sim101",
+  "params": { "Qty": 1 },
+  "enable": true,
+  "confirmLive": false
+}
+```
+**Important**: the chart must already host at least one strategy for that instrument via the NT8 Strategies dialog; `nt_deploy_strategy` can then add/manage further strategies on it.
+
+### Emergency flatten
+```jsonc
+POST /api/emergency-flatten
+{
+  "account": "Sim101",
+  "lockoutMinutes": 5,
+  "idempotencyKey": "panic-uuid"
+}
+```
 
 ## Configuration
 
@@ -215,65 +290,67 @@ POST), independent of the MCP tools above.
 |----------|---------|-------------|
 | `NT8_HOST` | `127.0.0.1` | NT8 AddOn hostname |
 | `NT8_PORT` | `7890` | NT8 AddOn HTTP port |
+| `NT8_MCP_TOKEN` | — | Bearer token for bridge auth |
 
 **AddOn** (`McpBridgeAddOn.cs`, on the NinjaTrader machine):
 
 | Variable / marker | Default | Description |
 |-------------------|---------|-------------|
 | `NT8_MCP_PREFIX` | `http://localhost:7890/` | HTTP bind prefix. Set to `http://+:7890/` to also listen on a **private** VPN interface (e.g. Tailscale) for remote access. Never expose publicly without auth + firewall. |
-| `NT8_MCP_DEV` env or `mcp_dev.on` marker file (in the NT8 user-data dir) | off | Enables the dev-only reflection endpoint (`/api/dev/reflect`) for internal probing. Off by default; leave off in normal use. |
+| `NT8_MCP_DEV` env or `mcp_dev.on` marker file (in the NT8 user-data dir) | off | Enables dev-only reflection endpoint (`/api/dev/reflect`) for internal probing. Off by default; leave off in normal use. |
 
-## How Phase 2 works
+## Important Operational Rules
 
-The AddOn calls NinjaTrader's own internal Roslyn compiler (`NinjaTrader.Code.Compiler`) via
-reflection, then lets NT8 hot-swap the NinjaScript AppDomain — the same thing pressing **F5** does,
-but triggered over HTTP with **no restart**. Backtests are run by driving a bridge-managed
-**Strategy Analyzer** window and reading its `SystemPerformance` (the same engine and numbers you get
-from the GUI). A successful compile briefly drops the HTTP connection as the AppDomain reloads; the
-result is written to a durable file and `nt_compile` reads it back automatically.
+### ALWAYS use the MCP tool for compile
+`nt_compile` calls `POST /api/compile` and polls `GET /api/compile/result`. Direct HTTP calls (`curl`, `Invoke-RestMethod`, Python `requests`) crash because the compile hot-swap resets the connection. The MCP server handles this correctly.
 
-## Roadmap
+### Instrument symbols must include contract month
+Using `ES`, `NQ`, `MNQ` alone returns `unknown instrument`. Use `ES 09-26`, `NQ 09-26`, `MNQ 09-26`.
 
-**Shipped:**
-- **Phase 1** — account management, live trading, quotes, historical bars, instrument search
-- **Phase 2** — strategy authoring, in-process hot-swap compile (no NT8 restart), Strategy Analyzer
-  backtesting with configurable symbol / date range / timeframe / parameters
-- **Phase 3** — historical data extraction (CSV) **and** a single-vendor, provenance-tagged 1-minute
-  Postgres archive (`nt8_ohlcv_bars`) covering all six instruments (CL/GC/SI/ES/NQ/RTY),
-  2020→present (~19.6M rows), kept current by a scheduled daily incremental updater
-- **Phase 4** — live deployment (`nt_deploy_strategy`, SIM-first), monitoring (`nt_strategy_status`),
-  teardown (`nt_stop_strategy`), and per-fill AI-Gate alert webhooks inside the strategies
-- **v1.1.0 AddOn Updates** — chart screenshot capture (`nt_capture_chart`), programmatic chart opening (`nt_open_chart`), diagnostic log tailing (`nt_get_logs`), fill history streaming (`nt_fill_events`), and strategy metadata inspection (`nt_inspect_strategy`).
+### Use temp JSON files for curl on Windows
+PowerShell strips double quotes from inline JSON. Always write the body to a file:
+```powershell
+$body = @{ symbol='MNQ 09-26'; action='buy'; quantity=1; orderType='Market'; idempotencyKey='test-1' } | ConvertTo-Json -Compress
+$body | Set-Content -Path C:\tmp\order.json -NoNewline
+curl.exe -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data @C:\tmp\order.json http://localhost:7890/api/order
+```
 
-**Upcoming Expansion (v1.4.0 Specification):**
-- **Production Safety & Architecture**: Local Bearer token auth, mandatory `idempotencyKey` order deduplication, atomic `nt_emergency_flatten` kill-switch, `interventions.jsonl` action audit logs, `X-NT8-MCP-Version: 1.4.0` headers, and SIM auto-gating for fresh Roslyn builds.
-- **Data & Error Standards**: Explicit UTC input/output date contract, ET (`America/New_York`) macro window boundaries, cursor pagination for bars/orders/fills, and standardized JSON error objects.
-- **Phase 5 (Observability & Debugging)**: `nt_chart_snapshot` (enhanced screenshot + visual markers, price lines, indicators), `nt_indicator_values` (deep series + running strategy collection), `nt_strategy_debug` (trace logs & variable state dumps).
-- **Phase 6 (Advanced Research & Quant Optimization)**: `nt_optimize` + `nt_walk_forward` (Bayesian/Gaussian, Pareto fronts, `run_id` provenance), `nt_portfolio_backtest`, `nt_synthetic_data` (stress scenarios: COVID crash, 2008 shock), `nt_signal_backtest`.
-- **Phase 7 (Automation & Workflow Execution)**: `nt_script_execute` (sandboxed C# snippet execution), `nt_schedule` / `nt_task`, `nt_trade_journal` (CRUD + tags), `nt_alert` / `nt_webhook`.
-- **Phase 8 (Risk, Compliance & Prop Firm Suite)**: `nt_riskguard_config` (trailing DD, vol limits, time restrictions), `nt_compliance_report`, `nt_multi_account_orchestrator`, `nt_subscribe` (SSE real-time event stream channel for fills, FSM transitions, errors).
+### PowerShell expands `$` variables in inline JSON
+JSON bodies containing `$ref`, `$result`, `$type`, etc., must be passed via a file. PowerShell expands `$` as variables when used inline with `python -c` or `curl --data '...'`.
+```powershell
+$body = '{"op":"describe","args":["$result"]}'
+$body | Set-Content -Path C:\tmp\reflect.json -NoNewline
+curl.exe -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data @C:\tmp\reflect.json http://localhost:7890/api/dev/reflect
+```
 
+### Indicator values resolve via assembly scan
+`/api/indicator/values` now scans all loaded assemblies to find the NinjaScript indicator host, which fixes the original `NinjaTrader.Custom` AssemblyLoadContext mismatch. If the indicator type is still unavailable, it must be hosted on an active chart or strategy so the assembly is loaded into the AppDomain.
 
-
-
-## Known Issues & Fixes (2026-07-30)
+## Known Issues & Fixes
 
 ### Compile endpoint crash (FIXED)
-**Issue**: `POST /api/compile` crashed (connection forcibly closed) because `Compiler.Compile()` was called on the HTTP listener thread, not the WPF UI Dispatcher. NT8's NinjaScript compiler requires the UI thread.
+`POST /api/compile` was crashing because compilation ran on the HTTP listener thread instead of the WPF UI Dispatcher. Wrapped in `Dispatcher.Invoke`. The MCP tool's `/api/compile/result` polling handles the brief connection reset.
 
-**Fix**: Wrapped `compile.Invoke()` in `disp.Invoke((Action)(() => ...))` in `CompileCore()`. The MCP tool `nt_compile` already handled this via `/api/compile/result` polling fallback, but direct HTTP calls (curl, Invoke-RestMethod) did not.
+### Indicator values endpoint (FIXED)
+`Type.GetType("..., NinjaTrader.Custom")` failed because `NinjaTrader.Custom` lives in a separate `AssemblyLoadContext`. Replaced with an `AppDomain.CurrentDomain.GetAssemblies()` scan, using the same pattern as strategy type resolution.
 
-**Rule**: ALWAYS use the `mcp_nt-mcp-server_nt_compile` MCP tool. NEVER use curl/Invoke-RestMethod/Python requests to call `/api/compile`.
+### Dev/reflect metadata tokens (FIXED)
+Json.NET strips `$ref`/`$result` as metadata tokens by default. Fixed by parsing `/api/dev/reflect` payloads with `MetadataPropertyHandling.Ignore` and resolving placeholders by scanning `JObject.Properties()`.
 
-### Indicator values endpoint (PARTIAL FIX)
-**Issue**: `/api/indicator/values` returned `barsCount=0` because `BarsRequest` ran off the UI thread.
+### Chart discovery (FIXED)
+`FindChartControl()` previously missed charts in secondary tabs or windows because it used `Application.Current.Windows` and a stale `MainTabControl` field. Rewritten to scan `Globals.AllWindows`, read the private `tabControl` on each `Chart` window, and fall back to a visual-tree walk to locate `ChartControl` instances.
 
-**Fix**: Marshaled `BarsRequest` to UI Dispatcher. Bars now load correctly.
+### Chart open / strategy deploy are best-effort
+NinjaTrader 8 does not expose a public API to create a chart window or attach a strategy from an AddOn. `/api/chart/open` validates the instrument and focuses the Control Center; `/api/strategy/deploy` attaches to an already-open chart. Use the Control Center shortcut `Ctrl+Shift+N` to open charts.
 
-**Remaining limitation**: `Type.GetType("NinjaTrader.NinjaScript.Indicators.Indicator, NinjaTrader.Custom")` returns null because `NinjaTrader.Custom` is loaded in a separate AppDomain (NT8 AppDomain isolation). Built-in indicators work if `NinjaTrader.Custom` is loaded (after F5 compile), but custom indicators (SessionRanges, LiquidityLevels, RedTail) require the indicator to be on an active chart or accessed via a strategy-hosted approach.
+### Chart draw endpoint (PENDING)
+`/api/chart/draw` fails because it searches for `NinjaTrader.Gui.Chart.HorizontalLine`. The correct namespace is `NinjaTrader.NinjaScript.DrawingTools.HorizontalLine` (also `Ray`, `Rectangle`, etc.). Fix also needs `ChartAnchor` construction for each drawing tool.
+
+### Chart capture endpoint (PENDING)
+`/api/chart/capture` returns a transparent PNG because the AddOn renders the chart `Window` instead of the `ChartControl` directly. It also still references the removed `MainTabControl` field. Fix in progress.
 
 ### Stale Roslyn cache
-If `nt_compile` returns errors referencing line numbers beyond the file's actual length or code you've already fixed, NT8 is caching a stale version. Restart NT8 to clear the Roslyn cache.
+If `nt_compile` reports errors referencing line numbers beyond the file length or already-fixed code, restart NT8 to clear the Roslyn cache.
 
 ## Requirements
 
@@ -287,8 +364,5 @@ MIT — do what you want, no strings attached. See [LICENSE](LICENSE).
 
 ## Credits
 
-- **Phase 1** (accounts, trading, quotes, bars, instrument search) — original work by
-  [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
-- **Phase 2** (strategy authoring, in-process compile with hot-swap, and Strategy Analyzer
-  backtesting with configurable symbol / date range / timeframe / parameters) — by
-  [**Quant Trading Pro**](https://www.quanttradingpro.com/).
+- **Phase 1** (accounts, trading, quotes, bars, instrument search) — original work by [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
+- **Phase 2+** (strategy authoring, in-process compile, Strategy Analyzer backtesting, live deployment, risk/copier/orchestration, and v1.5.0 expansion) — extended by the tvDownloadOHLC project.
