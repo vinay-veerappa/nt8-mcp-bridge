@@ -256,6 +256,25 @@ result is written to a durable file and `nt_compile` reads it back automatically
 
 
 
+## Known Issues & Fixes (2026-07-30)
+
+### Compile endpoint crash (FIXED)
+**Issue**: `POST /api/compile` crashed (connection forcibly closed) because `Compiler.Compile()` was called on the HTTP listener thread, not the WPF UI Dispatcher. NT8's NinjaScript compiler requires the UI thread.
+
+**Fix**: Wrapped `compile.Invoke()` in `disp.Invoke((Action)(() => ...))` in `CompileCore()`. The MCP tool `nt_compile` already handled this via `/api/compile/result` polling fallback, but direct HTTP calls (curl, Invoke-RestMethod) did not.
+
+**Rule**: ALWAYS use the `mcp_nt-mcp-server_nt_compile` MCP tool. NEVER use curl/Invoke-RestMethod/Python requests to call `/api/compile`.
+
+### Indicator values endpoint (PARTIAL FIX)
+**Issue**: `/api/indicator/values` returned `barsCount=0` because `BarsRequest` ran off the UI thread.
+
+**Fix**: Marshaled `BarsRequest` to UI Dispatcher. Bars now load correctly.
+
+**Remaining limitation**: `Type.GetType("NinjaTrader.NinjaScript.Indicators.Indicator, NinjaTrader.Custom")` returns null because `NinjaTrader.Custom` is loaded in a separate AppDomain (NT8 AppDomain isolation). Built-in indicators work if `NinjaTrader.Custom` is loaded (after F5 compile), but custom indicators (SessionRanges, LiquidityLevels, RedTail) require the indicator to be on an active chart or accessed via a strategy-hosted approach.
+
+### Stale Roslyn cache
+If `nt_compile` returns errors referencing line numbers beyond the file's actual length or code you've already fixed, NT8 is caching a stale version. Restart NT8 to clear the Roslyn cache.
+
 ## Requirements
 
 - **Node.js 18+** (uses only built-in modules — zero npm dependencies)
