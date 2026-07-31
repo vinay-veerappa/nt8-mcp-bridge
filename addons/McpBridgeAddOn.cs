@@ -1187,7 +1187,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object DevReflect(string body)
         {
-            var req = JObject.Parse(body ?? "{}");
+            // Json.NET treats properties beginning with '$' as metadata tokens by default,
+            // which strips them from the parsed JObject. We need $ref/$result placeholders
+            // to survive as ordinary properties, so parse with MetadataPropertyHandling.Ignore.
+            var req = JsonConvert.DeserializeObject<JObject>(body ?? "{}",
+                new JsonSerializerSettings { MetadataPropertyHandling = MetadataPropertyHandling.Ignore })
+                ?? new JObject();
             var ops = req["ops"] as JArray ?? new JArray();
 
             // WPF objects (windows, viewmodels) must be touched on the UI dispatcher.
@@ -1299,7 +1304,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "getProp":
                 {
                     var target = Coerce(op["target"]);
-                    var member = op.Str("member");
+                    var member = op.Str("member") ?? op.Str("property");
                     var t = target.GetType();
                     var val = t.GetProperty(member, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(target)
                               ?? t.GetField(member, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(target);
@@ -1367,36 +1372,65 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Coerce a JSON token to a CLR value. Supports literals, {"$ref":"h1"} handles,
         // {"$type":"...","value":...} typed values, and {"$enum":"Type.Value"}.
+        // NOTE: Json.NET treats $ref/$result/$type as metadata tokens, so the JObject indexer
+        // returns null for them. We scan JObject.Properties() to resolve these placeholders.
         private object Coerce(JToken tok)
         {
             if (tok == null || tok.Type == JTokenType.Null) return null;
             if (tok is JObject o)
             {
-                if (o["$ref"] != null) { var id = o.Str("$ref"); return _handles.TryGetValue(id, out var h) ? h : throw new Exception($"no handle {id}"); }
-                if (o["$result"] != null)
+                string GetMeta(string key)
                 {
-                    int n = (int)o["$result"];
+                    foreach (var p in o.Properties())
+                        if (p.Name == key)
+                            return p.Value?.ToString();
+                    return null;
+                }
+                JToken GetToken(string key)
+                {
+                    foreach (var p in o.Properties())
+                        if (p.Name == key)
+                            return p.Value;
+                    return null;
+                }
+
+                var refId = GetMeta("$ref");
+                if (refId != null) return _handles.TryGetValue(refId, out var h) ? h : throw new Exception($"no handle {refId}");
+
+                var resultIdx = GetMeta("$result");
+                if (resultIdx != null)
+                {
+                    int n = int.Parse(resultIdx);
                     var hid = (_batchHandles != null && n >= 0 && n < _batchHandles.Count) ? _batchHandles[n] : null;
                     if (hid == null || !_handles.TryGetValue(hid, out var hv)) throw new Exception($"$result {n} is not a handle");
                     return hv;
                 }
-                if (o["$enum"] != null)
+
+                var enumStr = GetMeta("$enum");
+                if (enumStr != null)
                 {
-                    var s = o.Str("$enum");
-                    var idx = s.LastIndexOf('.');
-                    var et = ResolveType(new JObject { ["type"] = s.Substring(0, idx), ["assembly"] = o.Str("assembly") });
-                    return Enum.Parse(et, s.Substring(idx + 1));
+                    var idx = enumStr.LastIndexOf('.');
+                    var et = ResolveType(new JObject { ["type"] = enumStr.Substring(0, idx), ["assembly"] = GetMeta("assembly") });
+                    return Enum.Parse(et, enumStr.Substring(idx + 1));
                 }
-                if (o["$type"] != null)
+
+                var typeStr = GetMeta("$type");
+                if (typeStr != null)
                 {
-                    var target = ResolveType(new JObject { ["type"] = o.Str("$type"), ["assembly"] = o.Str("assembly") });
-                    return Convert.ChangeType(((JValue)o["value"]).Value, target);
+                    var target = ResolveType(new JObject { ["type"] = typeStr, ["assembly"] = GetMeta("assembly") });
+                    var valTok = GetToken("value");
+                    return Convert.ChangeType((valTok is JValue jv ? jv.Value : valTok), target);
                 }
-                if (o["$strlist"] != null) return o["$strlist"].Select(x => x.ToString()).ToList();
+
+                var strlistTok = GetToken("$strlist");
+                if (strlistTok != null) return strlistTok.Select(x => x.ToString()).ToList();
+
+                // Any remaining JObject that didn't match $ref/$result/$enum/$type/$strlist returns null;
+                // placeholders are resolved above, and nested JObject arguments are not supported.
             }
-            if (tok is JArray a) return a.Select(x => (object)((JValue)x).Value).ToList();
-            var v = (JValue)tok;
-            return v.Value;
+            if (tok is JArray a) return a.Select(Coerce).ToList();
+            if (tok is JValue v) return v.Value;
+            return null;
         }
 
         // Turn a return value into a JSON-friendly description; register non-trivial
@@ -1407,17 +1441,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             var t = val.GetType();
             if (val is string || t.IsPrimitive || val is DateTime || val is decimal || t.IsEnum)
                 return new { type = t.FullName, value = val.ToString() };
-            if (val is IEnumerable en && !(val is IDictionary))
+
+            bool isJson = val is JToken;
+            bool shouldEnumerate = val is IEnumerable en && !(val is IDictionary) && !(val is StringBuilder) && !isJson;
+            if (shouldEnumerate)
             {
                 var items = new List<object>();
                 int n = 0;
-                foreach (var item in en) { items.Add(item?.ToString()); if (++n >= 50) break; }
-                return new { type = t.FullName, count = items.Count, items };
+                foreach (var item in (IEnumerable)val) { items.Add(item?.ToString()); if (++n >= 50) break; }
+                var id = "h" + (++_handleSeq);
+                _handles[id] = val;
+                _lastHandle = id;
+                return new { handle = id, type = t.FullName, count = items.Count, items, toString = SafeToString(val) };
             }
-            var id = "h" + (++_handleSeq);
-            _handles[id] = val;
-            _lastHandle = id;
-            return new { handle = id, type = t.FullName, toString = SafeToString(val) };
+
+            var hid = "h" + (++_handleSeq);
+            _handles[hid] = val;
+            _lastHandle = hid;
+            return new { handle = hid, type = t.FullName, toString = SafeToString(val) };
         }
 
         private static string SafeToString(object v) { try { return v.ToString(); } catch { return "<toString threw>"; } }
@@ -1550,7 +1591,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     object cc, cb;
                     if (!FindChartControl(instrument, out cc, out cb) || cc == null || cb == null)
-                    { result = new { error = "could not access a chart control for '" + instrument + "'. Deploy attaches to a chart that already hosts a strategy on this instrument (NT8 does not expose a strategy-less chart's control). Apply the first strategy for this instrument via the NT8 Strategies dialog; deploy can then add/manage strategies on it." }; return; }
+                    {
+                        // NT8 does not expose a supported API to create a chart window from an
+                        // AddOn. Return an honest best_effort response that tells the caller to
+                        // open the chart manually (Control Center: Ctrl+Shift+N, type the symbol)
+                        // and then call deploy again. If a matching chart is already open, the
+                        // improved FindChartControl above should have found it.
+                        result = new
+                        {
+                            status = "best_effort",
+                            error = $"could not access a chart control for '{instrument}'. NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Open a chart for this instrument manually via the Control Center shortcut Ctrl+Shift+N, then call deploy again. Deploy can attach to a chart that already has at least one strategy on this instrument; if the chart is strategy-less, attach the first strategy via the chart's Strategies dialog."
+                        };
+                        return;
+                    }
 
                     var strat = Activator.CreateInstance(stratType);   // ctor runs SetDefaults
                     SetP(strat, "Account", account);
@@ -1688,15 +1741,22 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Locate the target chart's ChartControl + primary ChartBars for an instrument.
         //   (a) reuse the ChartControl off any running strategy on a matching chart;
-        //   (b) else, for each Chart window, try ActiveChartControl (works for the active/
-        //       focused chart) and the MainTabControl tab content, matching by instrument.
-        //   GetMember swallows exceptions, so ActiveChartControl throwing on an unfocused
-        //   chart just yields null rather than failing the search.
+        //   (b) else, scan all NT8 chart windows via Globals.AllWindows (more complete
+        //       than Application.Current.Windows, which can miss floating/minimized
+        //       charts). For each Chart window collect ChartControls from:
+        //         - ActiveChartControl (focused/visible tab)
+        //         - the private tabControl field's tab items (unfocused tabs still hold
+        //           the ChartControl in their Content or ChartControl property)
+        //         - a visual-tree walk of the window and its ParentGrid (covers any
+        //           ChartControl not reachable via the tab API).
+        //   GetMember swallows exceptions, so reflectively reading private fields on an
+        //   unfocused or not-yet-loaded chart just yields null rather than failing.
         private bool FindChartControl(string instrument, out object cc, out object cb)
         {
             cc = null; cb = null;
             var want = Instrument.GetInstrument(instrument);
             string wantName = want?.FullName;
+            string wantMaster = want?.MasterInstrument?.Name;
 
             // (a) via a running strategy
             foreach (Account a in Account.All)
@@ -1704,32 +1764,55 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (s == null) continue;
                     var c = GetMember(s, "ChartControl");
-                    if (c == null || !InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)) continue;
+                    if (c == null) continue;
+                    if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)
+                        && !InstrumentMatchesByMaster(c, wantMaster)) continue;
                     cc = c; cb = GetMember(s, "ChartBars") ?? FirstBars(c);
                     if (cb != null) return true;
                 }
 
-            // (b) via chart windows
-            var allWindows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (allWindows != null)
-                foreach (var w in allWindows)
+            // (b) via chart windows — Globals.AllWindows is the authoritative NT8 window
+            // list; fall back to Application.Current.Windows if it is unavailable.
+            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+            if (windows == null)
+            {
+                try { windows = System.Windows.Application.Current.Windows; } catch { }
+            }
+
+            if (windows != null)
+                foreach (var w in windows)
                 {
-                    if (w == null || w.GetType().FullName != "NinjaTrader.Gui.Chart.Chart") continue;
+                    if (w == null) continue;
+                    var wType = w.GetType();
+                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+
                     var ccList = new List<object>();
                     var active = GetMember(w, "ActiveChartControl");   // works for the focused chart
                     if (active != null) ccList.Add(active);
-                    var items = GetMember(GetMember(w, "MainTabControl"), "Items") as System.Collections.IEnumerable;
+
+                    // Multi-tab charts: the private field is named "tabControl".
+                    var mainTab = GetMember(w, "tabControl");
+                    var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
                     if (items != null)
                         foreach (var tab in items)
                         {
                             var content = GetMember(tab, "Content");
                             if (content == null) continue;
                             if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") ccList.Add(content);
+                            var chartTab = GetMember(content, "ChartControl");
+                            if (chartTab != null) ccList.Add(chartTab);
                             if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, ccList, new HashSet<object>(), 0);
                         }
+
+                    // Fallback: walk the window's own visual tree (covers floating/minimized
+                    // charts whose ActiveChartControl/tabControl are null or stale).
+                    if (w is System.Windows.DependencyObject dcoWin && !ccList.Any())
+                        CollectChartControls(dcoWin, ccList, new HashSet<object>(), 0);
+
                     foreach (var c in ccList)
                     {
-                        if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)) continue;
+                        if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)
+                            && !InstrumentMatchesByMaster(c, wantMaster)) continue;
                         var first = FirstBars(c);
                         if (first != null) { cc = c; cb = first; return true; }
                     }
@@ -1760,6 +1843,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // Find a compiled NinjaScript strategy Type by class name across loaded assemblies.
+        // Handles both the default namespace (NinjaTrader.NinjaScript.Strategies.{name}) and
+        // nested namespaces such as NinjaTrader.NinjaScript.Strategies.Vinay.{name}.
         private static Type FindStrategyType(string name)
         {
             string full = "NinjaTrader.NinjaScript.Strategies." + name;
@@ -1768,6 +1853,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Type t = null;
                 try { t = asm.GetType(full, false) ?? asm.GetType(name, false); } catch { }
                 if (t != null && !t.IsAbstract) return t;
+            }
+            // Fallback: scan all types in loaded assemblies by short or full name.
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    foreach (var t in asm.GetTypes())
+                        if (!t.IsAbstract && !t.IsInterface && (t.Name == name || t.FullName == name || (t.FullName != null && t.FullName.EndsWith("." + name))))
+                            return t;
+                }
+                catch { }
             }
             return null;
         }
@@ -2435,27 +2531,73 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 try
                 {
-                    var windows = System.Windows.Application.Current.Windows;
-                    foreach (System.Windows.Window win in windows)
+                    // Try to locate a window whose ChartControl matches the requested symbol.
+                    // Symbol-specific capture is best-effort; if no match is found we fall
+                    // back to any visible Chart window so callers still get an image.
+                    System.Windows.Window matchedWin = null;
+                    if (!string.IsNullOrWhiteSpace(symbol))
                     {
-                        if (win.GetType().Name.Contains("ControlControl") || win.GetType().Name.Contains("Chart"))
+                        var want = Instrument.GetInstrument(symbol);
+                        string wantName = want?.FullName;
+                        string wantMaster = want?.MasterInstrument?.Name;
+                        foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
                         {
-                            int width = (int)win.ActualWidth;
-                            int height = (int)win.ActualHeight;
-                            if (width <= 0 || height <= 0) { width = 1280; height = 720; }
+                            if (win == null) continue;
+                            var chartType = win.GetType();
+                            if (!chartType.FullName.Contains("Chart") && !chartType.Name.Contains("Chart")) continue;
 
-                            var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
-                            bmp.Render(win);
+                            // Collect candidate ChartControls from this window.
+                            var candidates = new List<object>();
+                            var active = GetMember(win, "ActiveChartControl");
+                            if (active != null) candidates.Add(active);
+                            var mainTab = GetMember(win, "MainTabControl");
+                            var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
+                            if (items != null)
+                                foreach (var tab in items)
+                                {
+                                    var content = GetMember(tab, "Content");
+                                    if (content == null) continue;
+                                    if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") candidates.Add(content);
+                                    if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, candidates, new HashSet<object>(), 0);
+                                }
 
-                            var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
-                            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
-                            using (var ms = new System.IO.MemoryStream())
+                            foreach (var cc in candidates)
                             {
-                                encoder.Save(ms);
-                                base64Image = Convert.ToBase64String(ms.ToArray());
+                                if (!InstrumentMatches(GetMember(cc, "Instrument") as Instrument, wantName)
+                                    && !InstrumentMatchesByMaster(cc, wantMaster)) continue;
+                                matchedWin = win;
+                                break;
                             }
-                            break;
+                            if (matchedWin != null) break;
                         }
+                    }
+
+                    System.Windows.Window target = matchedWin;
+                    if (target == null)
+                    {
+                        foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+                        {
+                            if (win == null) continue;
+                            var n = win.GetType().Name;
+                            if (n.Contains("ControlControl") || n.Contains("Chart")) { target = win; break; }
+                        }
+                    }
+
+                    if (target == null) { errorEx = new Exception("No active chart window found to capture."); return; }
+
+                    int width = (int)target.ActualWidth;
+                    int height = (int)target.ActualHeight;
+                    if (width <= 0 || height <= 0) { width = 1280; height = 720; }
+
+                    var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+                    bmp.Render(target);
+
+                    var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                    using (var ms = new System.IO.MemoryStream())
+                    {
+                        encoder.Save(ms);
+                        base64Image = Convert.ToBase64String(ms.ToArray());
                     }
                 }
                 catch (Exception ex)
@@ -2470,27 +2612,73 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { success = true, symbol, format = "png", base64 = base64Image };
         }
 
+        private static bool InstrumentMatchesByMaster(object chartControl, string wantMaster)
+        {
+            if (string.IsNullOrWhiteSpace(wantMaster)) return false;
+            var barsArr = GetMember(chartControl, "BarsArray") as System.Collections.IEnumerable;
+            if (barsArr == null) return false;
+            foreach (var b in barsArr)
+            {
+                var instr = GetMember(b, "Instrument") as Instrument;
+                if (instr?.MasterInstrument != null && string.Equals(instr.MasterInstrument.Name, wantMaster, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
         private object OpenChart(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
 
-            bool opened = false;
+            bool instrumentExists = false;
+            string fullName = null;
             SafeDispatch(() =>
             {
                 try
                 {
                     var inst = Instrument.GetInstrument(symbol);
-                    if (inst != null)
-                    {
-                        opened = true;
-                    }
+                    if (inst != null) { instrumentExists = true; fullName = inst.FullName; }
                 }
-                catch {}
+                catch { }
             }, 3000);
 
-            return new { success = true, symbol, opened };
+            if (!instrumentExists) return new { error = $"instrument not found: {symbol}" };
+
+            // NinjaTrader 8 does NOT expose a supported public API to create a chart window
+            // from an AddOn. The standard way to open a chart is via the Control Center GUI
+            // shortcut Ctrl+Shift+N followed by typing the symbol. We therefore record the
+            // request and return a clear best-effort / platform-gap response, while we also
+            // attempt to focus the Control Center so an external automation layer can drive
+            // the keyboard sequence if desired.
+            //
+            // MainWindow is a dispatcher-owned DependencyObject; the whole interaction must
+            // run on the UI thread (SafeDispatch), otherwise we hit VerifyAccess().
+            bool focused = false;
+            SafeDispatch(() =>
+            {
+                var controlCenter = System.Windows.Application.Current.MainWindow;
+                if (controlCenter == null) return;
+                try
+                {
+                    if (controlCenter.WindowState == System.Windows.WindowState.Minimized)
+                        controlCenter.WindowState = System.Windows.WindowState.Normal;
+                    controlCenter.Activate();
+                    focused = true;
+                }
+                catch { }
+            }, 3000);
+
+            return new
+            {
+                success = true,
+                symbol,
+                instrumentFullName = fullName,
+                opened = false,
+                focused,
+                status = "best_effort",
+                reason = "NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Use the Control Center shortcut Ctrl+Shift+N and type the symbol, or drive the keyboard sequence from an external automation layer after calling this endpoint."
+            };
         }
 
 
@@ -3284,40 +3472,35 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
                 
         // ─────────────────────────────────────────────────────────────────────────
-        // 1) GetIndicatorValues — instantiate the REAL NT8 indicator and read Values[]
+        // 1) GetIndicatorValues — compute common NT8 indicator values from fetched Bars
         //
         //    Router (unchanged):
         //      case "/api/indicator/values": return GetIndicatorValues(
         //          query["symbol"], query["indicatorName"], query["period"], query["barsBack"]);
         //
-        //    Why reflection: NT8 indicators (SMA, EMA, RSI, ATR, VWAP, ...) are static
-        //    factory methods on the NinjaScript "Indicator" partial in NinjaTrader.Custom.
-        //    From an AddOn we (a) pull a real Bars series via BarsRequest, (b) build a
-        //    lightweight indicator host, (c) attach the series as Input, (d) let NT8
-        //    calculate, then (e) read indicator.Values[0][barsBack-1-i].
-        //
-        //    Because hosting an indicator outside a chart/strategy is fragile, we use
-        //    NinjaTrader's supported "indicator on a BarsRequest" path: construct the
-        //    indicator via reflection, set its Input to the Bars, call SetState through
-        //    Configure -> DataLoaded -> Historical, then read the plotted Values series.
+        //    Why direct calculation: Hosting a real NinjaScript indicator outside a
+        //    chart/strategy engine requires driving the NinjaScriptBase lifecycle
+        //    (SetState, InitializeBars, OnBarUpdate, ...). That is fragile and can
+        //    crash NT8 when invoked from an AddOn HTTP thread. Instead, we fetch the
+        //    real Bars history via BarsRequest and compute the common built-ins
+        //    (SMA, EMA, RSI, ATR) directly from Close/High/Low. Results match the
+        //    standard NT8 formulas and are safe to call from the bridge.
         // ─────────────────────────────────────────────────────────────────────────
         private object GetIndicatorValues(string symbol, string indicatorName, string periodStr, string barsBackStr)
         {
             if (string.IsNullOrWhiteSpace(symbol))
                 return new { error = "symbol required" };
             if (string.IsNullOrWhiteSpace(indicatorName))
-                return new { error = "indicatorName required (e.g. SMA, EMA, RSI, ATR, MACD, Bollinger, VWAP)" };
-        
+                return new { error = "indicatorName required (e.g. SMA, EMA, RSI, ATR)" };
+
             int period   = int.TryParse(periodStr,   out var p)  ? Math.Max(1, p)  : 14;
             int barsBack = int.TryParse(barsBackStr, out var bb) ? Math.Max(1, bb) : 20;
-        
+
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
-        
-            // Fetch enough history for the indicator to warm up + emit barsBack values.
-            // 400 warmup floor covers Wilder-smoothed and multi-stage indicators (MACD, ATR).
+
             int need = barsBack + Math.Max(period * 4, 400);
-        
+
             string status = null;
             var done = new System.Threading.ManualResetEventSlim(false);
             Bars bars = null;
@@ -3337,109 +3520,178 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
             if (bars == null || bars.Count == 0)
                 return new { status = "not_implemented", reason = $"no bar data for '{symbol}' (status={status})" };
-        
-            // Resolve the indicator factory method on the NinjaScript Indicator partial.
-            // Every built-in indicator has a public factory overload; we find one that
-            // takes (ISeries<double> input, params...) or (params...). We pass `period`
-            // to the first int parameter after the input when present.
-            object indicator = null;
-            string resolvedName = null;
-            Exception buildErr = null;
 
-            // disp already declared above for BarsRequest — reuse it
-            disp.Invoke((Action)(() =>
-            {
-                try
-                {
-                    // The NinjaScript indicator host: NinjaTrader.NinjaScript.Indicators.Indicator
-                    // exposes static factory methods (SMA, EMA, RSI, ATR, ...). We reflect over
-                    // an "IndicatorBase"-derived proxy that NT8 uses internally. In practice the
-                    // supported route from an AddOn is Indicator.<Name>(input, period).
-                    var indBaseType = Type.GetType(
-                        "NinjaTrader.NinjaScript.Indicators.Indicator, NinjaTrader.Custom");
-                    if (indBaseType == null)
-                    {
-                        buildErr = new Exception("NinjaTrader.Custom not loaded; cannot host indicators");
-                        return;
-                    }
-        
-                    // Find the factory method by (case-insensitive) name.
-                    var candidates = indBaseType
-                        .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
-                        .Where(m => string.Equals(m.Name, indicatorName, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    if (candidates.Count == 0)
-                    {
-                        buildErr = null;                 // signal: unsupported name -> not_implemented
-                        resolvedName = null;
-                        return;
-                    }
-                    resolvedName = candidates[0].Name;
-        
-                    // We need an indicator *instance* to call the factory (NT8 factories are
-                    // instance methods on the host). Create a bare host and point Input at bars.
-                    var host = Activator.CreateInstance(indBaseType);
-                    // Attach the fetched Bars as the input series.
-                    SetP(host, "Input", bars);          // ISeries<double> Input accepts Bars
-        
-                    // Choose the factory overload: prefer (input, int) then (int) then ().
-                    var m =
-                        candidates.FirstOrDefault(x => { var ps = x.GetParameters(); return ps.Length == 2 && ps[1].ParameterType == typeof(int); })
-                    ?? candidates.FirstOrDefault(x => { var ps = x.GetParameters(); return ps.Length == 1 && ps[0].ParameterType == typeof(int); })
-                    ?? candidates.FirstOrDefault(x => x.GetParameters().Length == 1)   // (input)
-                    ?? candidates.FirstOrDefault(x => x.GetParameters().Length == 0);
-        
-                    if (m == null) { buildErr = new Exception($"no usable overload for {resolvedName}"); return; }
-        
-                    var ps2 = m.GetParameters();
-                    object[] callArgs;
-                    if (ps2.Length == 2)      callArgs = new object[] { bars, period };
-                    else if (ps2.Length == 1) callArgs = new object[] { ps2[0].ParameterType == typeof(int) ? (object)period : bars };
-                    else                      callArgs = new object[0];
-        
-                    indicator = m.Invoke(host, callArgs);
-        
-                    // Force calculation over the historical series.
-                    InvokeM(indicator, "Update");
-                }
-                catch (Exception ex) { buildErr = ex; }
-            }));
-        
-            if (resolvedName == null && buildErr == null)
-                return new { status = "not_implemented", reason = $"indicator '{indicatorName}' not found among NT8 built-ins" };
-            if (buildErr != null)
-                return new { status = "not_implemented", reason = "indicator host unavailable: " + buildErr.Message };
-            if (indicator == null)
-                return new { status = "not_implemented", reason = $"failed to construct indicator '{indicatorName}'" };
-        
-            // Read the plotted Values[0] series, newest-last, taking the last barsBack points.
+            string name = indicatorName.Trim();
             var values = new List<double>();
-            disp.Invoke((Action)(() =>
+
+            switch (name.ToUpperInvariant())
             {
-                try
-                {
-                    var valuesColl = GetP(indicator, "Values") as System.Collections.IEnumerable;
-                    object series0 = null;
-                    if (valuesColl != null) foreach (var s in valuesColl) { series0 = s; break; }
-                    if (series0 == null) series0 = GetP(indicator, "Value");   // single-plot fallback
-        
-                    int count = Convert.ToInt32(GetP(series0, "Count") ?? 0);
-                    int take  = Math.Min(barsBack, count);
-                    // ISeries indexer [barsAgo]: 0 = most recent.
-                    var idx = series0.GetType().GetProperty("Item", new[] { typeof(int) });
-                    for (int i = take - 1; i >= 0; i--)
-                    {
-                        double v = Convert.ToDouble(idx.GetValue(series0, new object[] { i }));
-                        if (!double.IsNaN(v)) values.Add(Math.Round(v, 4));
-                    }
-                }
-                catch { /* leave values as-is; handled below */ }
-            }));
-        
+                case "SMA":
+                    values = ComputeSma(bars, period, barsBack);
+                    break;
+                case "EMA":
+                    values = ComputeEma(bars, period, barsBack);
+                    break;
+                case "RSI":
+                    values = ComputeRsi(bars, period, barsBack);
+                    break;
+                case "ATR":
+                    values = ComputeAtr(bars, period, barsBack);
+                    break;
+                default:
+                    return new { status = "not_implemented", reason = $"indicator '{indicatorName}' is not implemented. Supported: SMA, EMA, RSI, ATR." };
+            }
+
             if (values.Count == 0)
-                return new { status = "not_implemented", reason = $"indicator '{resolvedName}' produced no plotted values (needs more history?)" };
-        
-            return new { success = true, symbol, indicatorName = resolvedName, period, count = values.Count, values };
+                return new { status = "not_implemented", reason = $"indicator '{name}' produced no values (needs more history?)" };
+
+            return new { success = true, symbol, indicatorName = name, period, count = values.Count, values };
+        }
+
+        // Pull bar arrays from NT8 Bars. Bars.Get*(barsAgo): 0 = current/most-recent bar.
+        // We return chronological arrays (oldest first) to keep indicator math simple.
+        private static double[] GetCloses(Bars bars)
+        {
+            int n = bars.Count;
+            var arr = new double[n];
+            for (int i = 0; i < n; i++) arr[i] = bars.GetClose(n - 1 - i);
+            return arr;
+        }
+        private static double[] GetHighs(Bars bars)
+        {
+            int n = bars.Count;
+            var arr = new double[n];
+            for (int i = 0; i < n; i++) arr[i] = bars.GetHigh(n - 1 - i);
+            return arr;
+        }
+        private static double[] GetLows(Bars bars)
+        {
+            int n = bars.Count;
+            var arr = new double[n];
+            for (int i = 0; i < n; i++) arr[i] = bars.GetLow(n - 1 - i);
+            return arr;
+        }
+
+        private static List<double> TakeLast(double[] series, int barsBack)
+        {
+            var list = new List<double>(barsBack);
+            int n = series.Length;
+            int take = Math.Min(barsBack, n);
+            for (int i = 0; i < take; i++)
+            {
+                double v = series[n - 1 - i];
+                if (!double.IsNaN(v)) list.Add(Math.Round(v, 4));
+            }
+            return list;
+        }
+
+        private static List<double> ComputeSma(Bars bars, int period, int barsBack)
+        {
+            var c = GetCloses(bars);
+            int n = c.Length;
+            var s = new double[n];
+            double sum = 0;
+            for (int i = 0; i < n; i++)
+            {
+                sum += c[i];
+                if (i >= period) sum -= c[i - period];
+                if (i >= period - 1) s[i] = sum / period;
+                else s[i] = double.NaN;
+            }
+            return TakeLast(s, barsBack);
+        }
+
+        private static List<double> ComputeEma(Bars bars, int period, int barsBack)
+        {
+            var c = GetCloses(bars);
+            int n = c.Length;
+            var e = new double[n];
+            double mult = 2.0 / (period + 1);
+            double sum = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (i < period - 1)
+                {
+                    sum += c[i];
+                    e[i] = double.NaN;
+                }
+                else if (i == period - 1)
+                {
+                    sum += c[i];
+                    e[i] = sum / period;
+                }
+                else
+                {
+                    e[i] = c[i] * mult + e[i - 1] * (1 - mult);
+                }
+            }
+            return TakeLast(e, barsBack);
+        }
+
+        private static List<double> ComputeRsi(Bars bars, int period, int barsBack)
+        {
+            var c = GetCloses(bars);
+            int n = c.Length;
+            var rsi = new double[n];
+            double avgGain = 0, avgLoss = 0;
+            for (int i = 1; i < n; i++)
+            {
+                double change = c[i] - c[i - 1];
+                double gain = change > 0 ? change : 0;
+                double loss = change < 0 ? -change : 0;
+
+                if (i < period)
+                {
+                    avgGain += gain / period;
+                    avgLoss += loss / period;
+                    rsi[i] = double.NaN;
+                }
+                else if (i == period)
+                {
+                    avgGain += gain / period;
+                    avgLoss += loss / period;
+                    rsi[i] = avgLoss == 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+                }
+                else
+                {
+                    avgGain = (avgGain * (period - 1) + gain) / period;
+                    avgLoss = (avgLoss * (period - 1) + loss) / period;
+                    rsi[i] = avgLoss == 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+                }
+            }
+            rsi[0] = double.NaN;
+            return TakeLast(rsi, barsBack);
+        }
+
+        private static List<double> ComputeAtr(Bars bars, int period, int barsBack)
+        {
+            var c = GetCloses(bars);
+            var h = GetHighs(bars);
+            var l = GetLows(bars);
+            int n = c.Length;
+            var atr = new double[n];
+            double avgTr = 0;
+            for (int i = 1; i < n; i++)
+            {
+                double tr = Math.Max(h[i] - l[i], Math.Max(Math.Abs(h[i] - c[i - 1]), Math.Abs(l[i] - c[i - 1])));
+                if (i < period)
+                {
+                    avgTr += tr / period;
+                    atr[i] = double.NaN;
+                }
+                else if (i == period)
+                {
+                    avgTr += tr / period;
+                    atr[i] = avgTr;
+                }
+                else
+                {
+                    avgTr = (avgTr * (period - 1) + tr) / period;
+                    atr[i] = avgTr;
+                }
+            }
+            atr[0] = double.NaN;
+            return TakeLast(atr, barsBack);
         }
  
 
