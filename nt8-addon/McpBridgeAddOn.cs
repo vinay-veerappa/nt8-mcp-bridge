@@ -23,6 +23,7 @@ using System.Collections.Generic;
 using System.Collections;
 using System.Threading;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NinjaTrader.Cbi;
@@ -37,6 +38,34 @@ namespace NinjaTrader.NinjaScript.AddOns
     public class McpBridgeAddOn : AddOnBase
     {
         private const string Version = "1.5.0";
+
+        // Win32 capture helpers for chart windows that render on non-WPF threads (Direct2D).
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetWindowDC(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int nWidth, int nHeight);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
 
         private HttpListener _listener;
         private Thread _serverThread;
@@ -432,6 +461,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/inspect":   return InspectStrategy(query["name"]);
                 case "/api/logs":               return GetDiagnosticLogs(query["tab"] ?? "Output", int.TryParse(query["lines"], out var l) ? l : 100);
                 case "/api/chart/capture":      return CaptureChart(query["symbol"]);
+                case "/api/chart/diag":         return ChartDiagnostics();
                 case "/api/chart/snapshot":     return Post(method, () => ChartSnapshot(body));
                 case "/api/chart/trade":        return Post(method, () => TradeChart(body));
                 case "/api/chart/open":         return Post(method, () => OpenChart(body));
@@ -1765,8 +1795,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (s == null) continue;
                     var c = GetMember(s, "ChartControl");
                     if (c == null) continue;
-                    if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)
-                        && !InstrumentMatchesByMaster(c, wantMaster)) continue;
+                    var cInstr = GetMember(c, "Instrument") as Instrument;
+                    if (!InstrumentMatches(cInstr, wantName)
+                        && !(wantMaster != null && InstrumentMatches(cInstr, wantMaster))) continue;
                     cc = c; cb = GetMember(s, "ChartBars") ?? FirstBars(c);
                     if (cb != null) return true;
                 }
@@ -1811,8 +1842,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                     foreach (var c in ccList)
                     {
-                        if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)
-                            && !InstrumentMatchesByMaster(c, wantMaster)) continue;
+                        var cInstr = GetMember(c, "Instrument") as Instrument;
+                        if (!InstrumentMatches(cInstr, wantName)
+                            && !(wantMaster != null && InstrumentMatches(cInstr, wantMaster))) continue;
                         var first = FirstBars(c);
                         if (first != null) { cc = c; cb = first; return true; }
                     }
@@ -1919,7 +1951,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Walk a window's visual tree collecting ChartControl instances (ActiveChartControl
         // is null unless the tab is focused, so we find them structurally instead).
-        private void CollectChartControls(System.Windows.DependencyObject node, List<object> found, HashSet<object> seen, int depth)
+        private static void CollectChartControlsStatic(System.Windows.DependencyObject node, List<object> found, HashSet<object> seen, int depth)
         {
             if (node == null || depth > 400 || seen.Contains(node)) return;
             seen.Add(node);
@@ -1927,7 +1959,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             int n = 0;
             try { n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(node); } catch { }
             for (int i = 0; i < n; i++)
-                CollectChartControls(System.Windows.Media.VisualTreeHelper.GetChild(node, i), found, seen, depth + 1);
+                CollectChartControlsStatic(System.Windows.Media.VisualTreeHelper.GetChild(node, i), found, seen, depth + 1);
+        }
+
+        private void CollectChartControls(System.Windows.DependencyObject node, List<object> found, HashSet<object> seen, int depth)
+        {
+            CollectChartControlsStatic(node, found, seen, depth);
         }
 
         // Reflectively read a static property/field (public or non-public) off a type.
@@ -2522,107 +2559,510 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        private object CaptureChart(string symbol)
+        private object ChartDiagnostics()
         {
-            string base64Image = null;
-            Exception errorEx = null;
+            var diag = new Dictionary<string, object>();
+            var titles = new List<string>();
+            var typeNames = new List<string>();
+            var allWindowsTypes = new List<string>();
+            var memberInfo = new List<string>();
+            var firstChartDetails = new Dictionary<string, object>();
 
             SafeDispatch(() =>
             {
                 try
                 {
-                    // Try to locate a window whose ChartControl matches the requested symbol.
-                    // Symbol-specific capture is best-effort; if no match is found we fall
-                    // back to any visible Chart window so callers still get an image.
-                    System.Windows.Window matchedWin = null;
-                    if (!string.IsNullOrWhiteSpace(symbol))
+                    var app = System.Windows.Application.Current;
+                    diag["application_current_null"] = app == null;
+                    if (app != null)
                     {
-                        var want = Instrument.GetInstrument(symbol);
-                        string wantName = want?.FullName;
-                        string wantMaster = want?.MasterInstrument?.Name;
-                        foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+                        diag["application_windows_count"] = app.Windows.Count;
+                        foreach (System.Windows.Window w in app.Windows)
                         {
-                            if (win == null) continue;
-                            var chartType = win.GetType();
-                            if (!chartType.FullName.Contains("Chart") && !chartType.Name.Contains("Chart")) continue;
-
-                            // Collect candidate ChartControls from this window.
-                            var candidates = new List<object>();
-                            var active = GetMember(win, "ActiveChartControl");
-                            if (active != null) candidates.Add(active);
-                            var mainTab = GetMember(win, "MainTabControl");
-                            var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
-                            if (items != null)
-                                foreach (var tab in items)
-                                {
-                                    var content = GetMember(tab, "Content");
-                                    if (content == null) continue;
-                                    if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") candidates.Add(content);
-                                    if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, candidates, new HashSet<object>(), 0);
-                                }
-
-                            foreach (var cc in candidates)
-                            {
-                                if (!InstrumentMatches(GetMember(cc, "Instrument") as Instrument, wantName)
-                                    && !InstrumentMatchesByMaster(cc, wantMaster)) continue;
-                                matchedWin = win;
-                                break;
-                            }
-                            if (matchedWin != null) break;
+                            if (w == null) continue;
+                            string title = null;
+                            try { title = w.Title; } catch { }
+                            titles.Add($"{w.GetType().FullName}|Title={title}|Visibility={w.Visibility}|State={w.WindowState}|IsActive={w.IsActive}|IsVisible={w.IsVisible}|Actual={w.ActualWidth}x{w.ActualHeight}");
                         }
-                    }
-
-                    System.Windows.Window target = matchedWin;
-                    if (target == null)
-                    {
-                        foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
-                        {
-                            if (win == null) continue;
-                            var n = win.GetType().Name;
-                            if (n.Contains("ControlControl") || n.Contains("Chart")) { target = win; break; }
-                        }
-                    }
-
-                    if (target == null) { errorEx = new Exception("No active chart window found to capture."); return; }
-
-                    int width = (int)target.ActualWidth;
-                    int height = (int)target.ActualHeight;
-                    if (width <= 0 || height <= 0) { width = 1280; height = 720; }
-
-                    var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
-                    bmp.Render(target);
-
-                    var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
-                    encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
-                    using (var ms = new System.IO.MemoryStream())
-                    {
-                        encoder.Save(ms);
-                        base64Image = Convert.ToBase64String(ms.ToArray());
                     }
                 }
-                catch (Exception ex)
+                catch (Exception ex) { diag["application_current_error"] = ex.Message; }
+
+                try
                 {
-                    errorEx = ex;
+                    var all = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                    if (all != null)
+                    {
+                        int n = 0;
+                        foreach (var w in all)
+                        {
+                            n++;
+                            if (w != null)
+                            {
+                                string tname = w.GetType().FullName;
+                                allWindowsTypes.Add(tname);
+                                if (tname.Contains("Chart"))
+                                {
+                                    string title = null;
+                                    try { title = GetMember(w, "Title")?.ToString(); } catch { }
+                                    var active = GetMember(w, "ActiveChartControl");
+                                    var win = w as System.Windows.Window;
+                                    typeNames.Add($"{tname}|Title={title}|ActiveChartControl={active != null}|IsActive={win?.IsActive}|IsVisible={win?.IsVisible}|Actual={win?.ActualWidth}x{win?.ActualHeight}");
+
+                                    if (firstChartDetails.Count == 0)
+                                    {
+                                        var t = w.GetType();
+                                        firstChartDetails["type"] = t.FullName;
+                                        firstChartDetails["base"] = t.BaseType?.FullName;
+                                        var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                                            .Where(p => p.Name.Contains("Chart") || p.Name.Contains("Active") || p.Name.Contains("Control") || p.Name.Contains("Tab"))
+                                            .Select(p => $"{p.Name} ({p.PropertyType.Name})").ToList();
+                                        var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                                            .Where(f => f.Name.Contains("chart") || f.Name.Contains("tab") || f.Name.Contains("control"))
+                                            .Select(f => $"{f.Name} ({f.FieldType.Name})").ToList();
+                                        firstChartDetails["props"] = props;
+                                        firstChartDetails["fields"] = fields;
+                                        try { firstChartDetails["activeChartControl_type"] = active?.GetType().FullName; } catch { }
+                                    }
+                                }
+                            }
+                        }
+                        diag["allwindows_count"] = n;
+                    }
+                    else diag["allwindows_count"] = -1;
                 }
+                catch (Exception ex) { diag["allwindows_error"] = ex.Message; }
+
+                try
+                {
+                    var dispatcher = System.Windows.Application.Current?.Dispatcher;
+                    diag["dispatcher_null"] = dispatcher == null;
+                    if (dispatcher != null) diag["dispatcher_checkaccess"] = dispatcher.CheckAccess();
+                }
+                catch (Exception ex) { diag["dispatcher_error"] = ex.Message; }
             }, 5000);
 
-            if (errorEx != null) return new { error = errorEx.Message };
-            if (string.IsNullOrEmpty(base64Image)) return new { error = "No active chart window found to capture." };
+            diag["application_window_titles"] = titles;
+            diag["allwindows_chart_types"] = typeNames;
+            diag["allwindows_types"] = allWindowsTypes;
+            diag["first_chart_details"] = firstChartDetails;
+            return new { success = true, diag };
+        }
+
+        private object CaptureChart(string symbol)
+        {
+            string base64Image = null;
+            Exception errorEx = null;
+
+            System.Windows.Window targetWindow = null;
+
+            // Discover the target window on the UI thread but do not render yet.
+            SafeDispatch(() =>
+            {
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(symbol))
+                        targetWindow = FindChartWindow(symbol);
+                    if (targetWindow == null)
+                        targetWindow = FindAnyChartWindow();
+                }
+                catch (Exception ex) { errorEx = ex; }
+            }, 5000);
+
+            if (errorEx != null) return new { error = errorEx.Message, stack = errorEx.StackTrace };
+            if (targetWindow == null) return new { error = "No active chart control found to capture." };
+
+            // Activate and render on the window's own dispatcher to satisfy WPF thread-affinity.
+            var dispatcher = targetWindow.Dispatcher;
+            if (dispatcher == null) dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+            {
+                try { (base64Image, errorEx) = RenderChartWindow(targetWindow, symbol); }
+                catch (Exception ex) { errorEx = ex; }
+            }
+            else
+            {
+                var t = dispatcher.InvokeAsync(() => RenderChartWindow(targetWindow, symbol));
+                if (!t.Task.Wait(5000))
+                    return new { error = "Dispatcher action timed out after 5000ms" };
+                (base64Image, errorEx) = t.Task.Result;
+            }
+
+            if (errorEx != null) return new { error = errorEx.Message, stack = errorEx.StackTrace };
+            if (string.IsNullOrEmpty(base64Image)) return new { error = "No active chart control found to capture." };
 
             return new { success = true, symbol, format = "png", base64 = base64Image };
         }
 
-        private static bool InstrumentMatchesByMaster(object chartControl, string wantMaster)
+        private (string, Exception) RenderChartWindow(System.Windows.Window targetWindow, string symbol)
         {
-            if (string.IsNullOrWhiteSpace(wantMaster)) return false;
-            var barsArr = GetMember(chartControl, "BarsArray") as System.Collections.IEnumerable;
-            if (barsArr == null) return false;
-            foreach (var b in barsArr)
+            try
             {
-                var instr = GetMember(b, "Instrument") as Instrument;
-                if (instr?.MasterInstrument != null && string.Equals(instr.MasterInstrument.Name, wantMaster, StringComparison.OrdinalIgnoreCase)) return true;
+                ActivateChartWindow(targetWindow);
+                System.Threading.Thread.Sleep(50);
+
+                // Re-discover an arranged ChartControl for the active tab.
+                var chartControl = FindChartControlInWindow(targetWindow, symbol);
+                var fe = chartControl as System.Windows.FrameworkElement;
+
+                // Primary path: Win32 PrintWindow on the chart's HWND. This works for
+                // Direct2D/WPF interop and does not require the calling thread to own the
+                // visual tree.
+                var hwndSource = System.Windows.Interop.HwndSource.FromHwnd(
+                    new System.Windows.Interop.WindowInteropHelper(targetWindow).Handle);
+                if (hwndSource != null)
+                {
+                    var hwnd = hwndSource.Handle;
+                    var win32Bmp = CaptureWindowHwnd(hwnd);
+                    if (!string.IsNullOrEmpty(win32Bmp)) return (win32Bmp, null);
+                }
+
+                // Fallback 1: NT8's built-in screenshot (works when called on the correct
+                // thread and may include panel styling).
+                var chartWindow = targetWindow as NinjaTrader.Gui.Chart.Chart;
+                if (chartWindow != null)
+                {
+                    try
+                    {
+                        var bmp = chartWindow.GetScreenshot(NinjaTrader.NinjaScript.ShareScreenshotType.Chart, fe ?? targetWindow);
+                        if (bmp != null)
+                        {
+                            var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                            encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                            using (var ms = new System.IO.MemoryStream())
+                            {
+                                encoder.Save(ms);
+                                return (Convert.ToBase64String(ms.ToArray()), null);
+                            }
+                        }
+                    }
+                    catch (InvalidOperationException) { }
+                }
+
+                // Fallback 2: WPF RenderTargetBitmap (works for pure WPF visuals).
+                if (fe == null || fe.ActualWidth <= 0 || fe.ActualHeight <= 0)
+                    fe = targetWindow;
+
+                int width = (int)(fe.ActualWidth > 0 ? fe.ActualWidth : 1280);
+                int height = (int)(fe.ActualHeight > 0 ? fe.ActualHeight : 720);
+                if (width <= 0 || height <= 0) { width = 1280; height = 720; }
+
+                var fallbackBmp = new System.Windows.Media.Imaging.RenderTargetBitmap(width, height, 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+                fallbackBmp.Render(fe);
+
+                var fallbackEncoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                fallbackEncoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(fallbackBmp));
+                using (var ms = new System.IO.MemoryStream())
+                {
+                    fallbackEncoder.Save(ms);
+                    return (Convert.ToBase64String(ms.ToArray()), null);
+                }
             }
-            return false;
+            catch (Exception ex)
+            {
+                return (null, ex);
+            }
+        }
+
+        // Capture a WPF/Win32 window by HWND using PrintWindow. Works for Direct2D
+        // surfaces and does not require the caller to be on the UI thread that owns the
+        // visual tree. Returns base64 PNG or null on failure.
+        private static string CaptureWindowHwnd(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return null;
+            const int DESKTOPHORZRES = 118;
+            const int HORZRES = 8;
+
+            IntPtr hdcWindow = IntPtr.Zero;
+            IntPtr hdcMem = IntPtr.Zero;
+            IntPtr hBitmap = IntPtr.Zero;
+            IntPtr hOld = IntPtr.Zero;
+            try
+            {
+                var rect = new System.Windows.Rect();
+                if (!NativeGetWindowRect(hWnd, out rect)) return null;
+                int width = (int)rect.Width;
+                int height = (int)rect.Height;
+                if (width <= 0 || height <= 0) return null;
+
+                hdcWindow = GetWindowDC(hWnd);
+                if (hdcWindow == IntPtr.Zero) return null;
+
+                hdcMem = CreateCompatibleDC(hdcWindow);
+                if (hdcMem == IntPtr.Zero) return null;
+
+                int scale = 1;
+                try
+                {
+                    int logical = GetDeviceCaps(hdcWindow, HORZRES);
+                    int physical = GetDeviceCaps(hdcWindow, DESKTOPHORZRES);
+                    if (logical > 0) scale = physical / logical;
+                    if (scale < 1) scale = 1;
+                }
+                catch { }
+
+                hBitmap = CreateCompatibleBitmap(hdcWindow, width * scale, height * scale);
+                if (hBitmap == IntPtr.Zero) return null;
+
+                hOld = SelectObject(hdcMem, hBitmap);
+                bool ok = PrintWindow(hWnd, hdcMem, 3); // PW_RENDERFULLCONTENT
+                if (!ok) ok = PrintWindow(hWnd, hdcMem, 2); // PW_CLIENTONLY
+                if (!ok) ok = PrintWindow(hWnd, hdcMem, 0);
+                if (!ok) return null;
+
+                if (scale > 1)
+                {
+                    // Create a correctly-sized final bitmap and scale down.
+                    var finalDc = CreateCompatibleDC(hdcWindow);
+                    var finalBmp = CreateCompatibleBitmap(hdcWindow, width, height);
+                    var finalOld = SelectObject(finalDc, finalBmp);
+                    NativeStretchBlt(finalDc, 0, 0, width, height, hdcMem, 0, 0, width * scale, height * scale, 0x00CC0020);
+                    SelectObject(finalDc, finalOld);
+                    DeleteDC(finalDc);
+                    DeleteObject(hBitmap);
+                    hBitmap = finalBmp;
+                }
+
+                var bmpSource = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
+                    hBitmap, IntPtr.Zero, System.Windows.Int32Rect.Empty,
+                    System.Windows.Media.Imaging.BitmapSizeOptions.FromEmptyOptions());
+
+                var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmpSource));
+                using (var ms = new System.IO.MemoryStream())
+                {
+                    encoder.Save(ms);
+                    return Convert.ToBase64String(ms.ToArray());
+                }
+            }
+            catch { return null; }
+            finally
+            {
+                if (hOld != IntPtr.Zero) SelectObject(hdcMem, hOld);
+                if (hBitmap != IntPtr.Zero) DeleteObject(hBitmap);
+                if (hdcMem != IntPtr.Zero) DeleteDC(hdcMem);
+                if (hdcWindow != IntPtr.Zero) ReleaseDC(hWnd, hdcWindow);
+            }
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool NativeGetWindowRect(IntPtr hWnd, out System.Windows.Rect lpRect);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool NativeStretchBlt(IntPtr hdcDest, int nXOriginDest, int nYOriginDest, int nWidthDest, int nHeightDest,
+            IntPtr hdcSrc, int nXOriginSrc, int nYOriginSrc, int nWidthSrc, int nHeightSrc, uint dwRop);
+
+        // Return the first open chart window we can find.
+        private System.Windows.Window FindAnyChartWindow()
+        {
+            foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+            {
+                if (win == null) continue;
+                var n = win.GetType().Name;
+                if (n.Contains("Chart") || n.Contains("ControlControl")) return win;
+            }
+
+            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+            if (windows != null)
+                foreach (var w in windows)
+                {
+                    if (w == null) continue;
+                    var wType = w.GetType();
+                    if (wType.FullName.Contains("Chart") || wType.Name.Contains("Chart"))
+                    {
+                        var win = w as System.Windows.Window;
+                        if (win != null) return win;
+                    }
+                }
+            return null;
+        }
+
+        // Find a chart window whose instrument matches the requested symbol.
+        private System.Windows.Window FindChartWindow(string symbol)
+        {
+            var want = Instrument.GetInstrument(symbol);
+            string wantName = want?.FullName;
+            string wantMaster = want?.MasterInstrument?.Name;
+            if (string.IsNullOrEmpty(wantName) && string.IsNullOrEmpty(wantMaster)) return null;
+
+            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+            if (windows == null)
+            {
+                try { windows = System.Windows.Application.Current.Windows; } catch { }
+            }
+            if (windows == null) return null;
+
+            foreach (var w in windows)
+            {
+                if (w == null) continue;
+                var wType = w.GetType();
+                if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                var win = w as System.Windows.Window;
+                if (win == null) continue;
+
+                var controls = new List<object>();
+                CollectChartControlsFromWindow(w, controls);
+                foreach (var c in controls)
+                {
+                    var cInstr = GetMember(c, "Instrument") as Instrument;
+                    if (InstrumentMatches(cInstr, wantName)
+                        || (wantMaster != null && InstrumentMatches(cInstr, wantMaster)))
+                        return win;
+                }
+            }
+            return null;
+        }
+
+        private void ActivateChartWindow(System.Windows.Window win)
+        {
+            if (win == null) return;
+            try
+            {
+                if (win.WindowState == System.Windows.WindowState.Minimized)
+                    win.WindowState = System.Windows.WindowState.Normal;
+                win.Activate();
+                win.Focus();
+            }
+            catch { }
+
+            // For tabbed charts, ensure the matching tab is selected. The private field is
+            // named "tabControl" on NinjaTrader.Gui.Chart.Chart.
+            try
+            {
+                var tabControl = GetMember(win, "tabControl");
+                var items = GetMember(tabControl, "Items") as System.Collections.IEnumerable;
+                var selected = GetMember(tabControl, "SelectedItem");
+                if (items != null && selected != null)
+                {
+                    // Already has a selected item; focus it if it has a selectable property.
+                    var selMethod = tabControl.GetType().GetMethod("set_SelectedItem",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (selMethod != null) selMethod.Invoke(tabControl, new[] { selected });
+                }
+            }
+            catch { }
+
+            // Give the window a chance to render.
+            try
+            {
+                win.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+            }
+            catch { }
+        }
+
+        private object FindChartControlInWindow(System.Windows.Window win, string symbol)
+        {
+            var controls = new List<object>();
+            CollectChartControlsFromWindow(win, controls);
+
+            // Prefer an actually-arranged control (non-zero ActualWidth).
+            foreach (var c in controls)
+            {
+                var fe = c as System.Windows.FrameworkElement;
+                if (fe != null && fe.ActualWidth > 0 && fe.ActualHeight > 0)
+                    return c;
+            }
+
+            // If symbol provided, prefer the matching instrument.
+            if (!string.IsNullOrWhiteSpace(symbol))
+            {
+                var want = Instrument.GetInstrument(symbol);
+                string wantName = want?.FullName;
+                string wantMaster = want?.MasterInstrument?.Name;
+                foreach (var c in controls)
+                {
+                    var cInstr = GetMember(c, "Instrument") as Instrument;
+                    if (InstrumentMatches(cInstr, wantName)
+                        || (wantMaster != null && InstrumentMatches(cInstr, wantMaster)))
+                        return c;
+                }
+            }
+
+            return controls.FirstOrDefault();
+        }
+
+        private void CollectChartControlsFromWindow(object win, List<object> controls)
+        {
+            if (win == null) return;
+            var active = GetMember(win, "ActiveChartControl");
+            if (active != null) controls.Add(active);
+
+            var mainTab = GetMember(win, "tabControl");
+            var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
+            if (items != null)
+                foreach (var tab in items)
+                {
+                    var content = GetMember(tab, "Content");
+                    if (content == null) continue;
+                    if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") controls.Add(content);
+                    var chartTab = GetMember(content, "ChartControl");
+                    if (chartTab != null) controls.Add(chartTab);
+                    if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, controls, new HashSet<object>(), 0);
+                }
+
+            if (win is System.Windows.DependencyObject dcoWin)
+                CollectChartControls(dcoWin, controls, new HashSet<object>(), 0);
+        }
+
+        // Return any ChartControl reachable from an open chart window.
+        // Tries focused/active tab first, then unfocused tabs, then a full visual-tree walk.
+        private object FindAnyChartControl()
+        {
+            // Try Application.Current.Windows first (common case).
+            foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+            {
+                if (win == null) continue;
+                var n = win.GetType().Name;
+                if (!n.Contains("Chart") && !n.Contains("ControlControl")) continue;
+
+                var active = GetMember(win, "ActiveChartControl");
+                if (active != null) return active;
+
+                var tabControl = GetMember(win, "tabControl");
+                var items = GetMember(tabControl, "Items") as System.Collections.IEnumerable;
+                if (items != null)
+                    foreach (var tab in items)
+                    {
+                        var content = GetMember(tab, "Content");
+                        if (content != null)
+                        {
+                            if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") return content;
+                            var chartTab = GetMember(content, "ChartControl");
+                            if (chartTab != null) return chartTab;
+                        }
+                        if (content is System.Windows.DependencyObject dco)
+                        {
+                            var found = new List<object>();
+                            CollectChartControls(dco, found, new HashSet<object>(), 0);
+                            if (found.Count > 0) return found[0];
+                        }
+                    }
+
+                if (win is System.Windows.DependencyObject dcoWin)
+                {
+                    var found = new List<object>();
+                    CollectChartControls(dcoWin, found, new HashSet<object>(), 0);
+                    if (found.Count > 0) return found[0];
+                }
+            }
+
+            // Fall back to Globals.AllWindows (covers floating/minimized charts).
+            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+            if (windows != null)
+                foreach (var w in windows)
+                {
+                    if (w == null) continue;
+                    var wType = w.GetType();
+                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                    if (w is System.Windows.DependencyObject dco)
+                    {
+                        var found = new List<object>();
+                        CollectChartControls(dco, found, new HashSet<object>(), 0);
+                        if (found.Count > 0) return found[0];
+                    }
+                }
+            return null;
         }
 
         private object OpenChart(string body)
