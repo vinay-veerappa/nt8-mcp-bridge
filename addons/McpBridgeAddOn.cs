@@ -1296,6 +1296,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private object RunOps(JArray ops)
         {
             var results = new List<object>();
+            // Clear the handle registry at the start of each batch so handles
+            // from a previous dev/reflect call don't accumulate (memory leak).
+            lock (_handles) { _handles.Clear(); }
             _batchHandles = new List<string>();
             foreach (var opTok in ops)
             {
@@ -2444,7 +2447,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             int cancelledOrdersCount = 0;
             bool positionClosed = false;
 
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
+            dispatcher.Invoke(() =>
             {
                 foreach (Account account in Account.All)
                 {
@@ -2452,10 +2457,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                         continue;
 
                     string rootSymbol = symbol.Equals("ALL", StringComparison.OrdinalIgnoreCase) ? "" : symbol.Split(' ')[0];
+                    bool filterBySymbol = !string.IsNullOrEmpty(rootSymbol);
 
-                    // 1. Cancel working orders
+                    // 1. Cancel working orders for the requested symbol only
                     var toCancel = account.Orders
-                        .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                        .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled
+                                    && (!filterBySymbol || (o.Instrument != null && o.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase))))
                         .ToList();
                     if (toCancel.Count > 0)
                     {
@@ -2463,33 +2470,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                         cancelledOrdersCount += toCancel.Count;
                     }
 
-                    // 2. Flatten active positions
+                    // 2. Flatten active positions for the requested symbol only
                     foreach (Position pos in account.Positions)
                     {
-                        if (pos.Instrument != null && pos.MarketPosition != MarketPosition.Flat)
+                        if (pos.Instrument == null || pos.MarketPosition == MarketPosition.Flat) continue;
+                        if (filterBySymbol && !pos.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase)) continue;
+                        try
                         {
-                            try
-                            {
-                                account.Flatten(new[] { pos.Instrument });
-                                positionClosed = true;
-                            }
-                            catch
-                            {
-                                var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
-                                var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
-                                account.Submit(new[] { closeOrder });
-                                positionClosed = true;
-                            }
+                            account.Flatten(new[] { pos.Instrument });
+                            positionClosed = true;
+                        }
+                        catch
+                        {
+                            var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                            var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
+                            account.Submit(new[] { closeOrder });
+                            positionClosed = true;
                         }
                     }
-
-                    if (account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { account.Flatten(account.Positions.Select(p => p.Instrument).ToList()); } catch {}
-                    }
-
-
-
                 }
             });
 
@@ -3188,63 +3186,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         // Return any ChartControl reachable from an open chart window.
         // Tries focused/active tab first, then unfocused tabs, then a full visual-tree walk.
-        private object FindAnyChartControl()
-        {
-            // Try Application.Current.Windows first (common case).
-            foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
-            {
-                if (win == null) continue;
-                var n = win.GetType().Name;
-                if (!n.Contains("Chart") && !n.Contains("ControlControl")) continue;
-
-                var active = GetMember(win, "ActiveChartControl");
-                if (active != null) return active;
-
-                var tabControl = GetMember(win, "tabControl");
-                var items = GetMember(tabControl, "Items") as System.Collections.IEnumerable;
-                if (items != null)
-                    foreach (var tab in items)
-                    {
-                        var content = GetMember(tab, "Content");
-                        if (content != null)
-                        {
-                            if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") return content;
-                            var chartTab = GetMember(content, "ChartControl");
-                            if (chartTab != null) return chartTab;
-                        }
-                        if (content is System.Windows.DependencyObject dco)
-                        {
-                            var found = new List<object>();
-                            CollectChartControls(dco, found, new HashSet<object>(), 0);
-                            if (found.Count > 0) return found[0];
-                        }
-                    }
-
-                if (win is System.Windows.DependencyObject dcoWin)
-                {
-                    var found = new List<object>();
-                    CollectChartControls(dcoWin, found, new HashSet<object>(), 0);
-                    if (found.Count > 0) return found[0];
-                }
-            }
-
-            // Fall back to Globals.AllWindows (covers floating/minimized charts).
-            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (windows != null)
-                foreach (var w in windows)
-                {
-                    if (w == null) continue;
-                    var wType = w.GetType();
-                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
-                    if (w is System.Windows.DependencyObject dco)
-                    {
-                        var found = new List<object>();
-                        CollectChartControls(dco, found, new HashSet<object>(), 0);
-                        if (found.Count > 0) return found[0];
-                    }
-                }
-            return null;
-        }
+        // FindAnyChartControl removed — it was dead code that accessed chart
+        // windows directly from the HTTP listener thread (no dispatcher marshaling),
+        // which throws cross-thread exceptions. Use FindChartControl instead, which
+        // correctly marshals to each window's own dispatcher.
 
         private object OpenChart(string body)
         {
@@ -3390,7 +3335,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                             var strategies = acc.Strategies?.ToList() ?? new List<NinjaTrader.NinjaScript.StrategyBase>();
                             foreach (NinjaTrader.NinjaScript.StrategyBase str in strategies)
                             {
-                                try { str.SetState(State.Terminated); }
+                                try
+                                {
+                                    // Strategy.OnStateChange may touch ChartControl
+                                    // during cleanup — marshal to the chart's own
+                                    // dispatcher to avoid cross-thread exceptions.
+                                    var strCc = GetMember(str, "ChartControl");
+                                    var strDisp = (strCc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                                    if (strDisp != null && !strDisp.CheckAccess())
+                                        strDisp.Invoke(() => str.SetState(State.Terminated));
+                                    else
+                                        str.SetState(State.Terminated);
+                                }
                                 catch (Exception sex) { errors.Add($"[{acc.Name}] Strategy terminate failed: {sex.Message}"); }
                             }
                         }
@@ -3979,24 +3935,44 @@ namespace NinjaTrader.NinjaScript.AddOns
             object cc, cb;
             if (!FindChartControl(symbol, out cc, out cb) || cc == null)
             {
+                // List available charts by enumerating windows on the app dispatcher
+                // and marshaling each window's inspection to its own dispatcher.
                 var available = new List<string>();
                 try
                 {
-                    var windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-                    if (windows != null)
-                        foreach (var w in windows)
+                    var appDisp = System.Windows.Application.Current?.Dispatcher;
+                    if (appDisp != null)
+                    {
+                        var chartWins = new List<System.Windows.Window>();
+                        appDisp.Invoke((Action)(() =>
                         {
-                            if (w == null) continue;
-                            var wType = w.GetType();
-                            if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
-                            var controls = new List<object>();
-                            CollectChartControlsFromWindow(w, controls);
-                            foreach (var c in controls)
+                            var windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                            if (windows == null) { try { windows = System.Windows.Application.Current.Windows; } catch {} }
+                            if (windows != null)
+                                foreach (var w in windows)
+                                {
+                                    if (w == null) continue;
+                                    var wType = w.GetType();
+                                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                                    chartWins.Add(w as System.Windows.Window);
+                                }
+                        }));
+                        foreach (var win in chartWins)
+                        {
+                            var winDisp = (win as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                            if (winDisp == null) continue;
+                            winDisp.Invoke((Action)(() =>
                             {
-                                var ci = GetMember(c, "Instrument") as Instrument;
-                                if (ci != null) available.Add(ci.FullName);
-                            }
+                                var controls = new List<object>();
+                                CollectChartControlsFromWindow(win, controls);
+                                foreach (var c in controls)
+                                {
+                                    var ci = GetMember(c, "Instrument") as Instrument;
+                                    if (ci != null) available.Add(ci.FullName);
+                                }
+                            }));
                         }
+                    }
                 }
                 catch { }
                 return new { status = "not_implemented", reason = $"no open chart found for '{symbol}'; open a chart first (nt_open_chart)", availableCharts = available };
@@ -4053,11 +4029,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                         var rect = new Rectangle();
                         rect.Tag = tag;
                         SetRectangleAnchors(rect, chartBars, price1, price2, tStart, tEnd);
-                        try { SetP(rect, "OutlineStroke", stroke.Clone()); } catch { }
+                        try { var outlineStroke = stroke.Clone() as System.Windows.Media.Brush; if (outlineStroke != null) outlineStroke.Freeze(); SetP(rect, "OutlineStroke", outlineStroke ?? stroke.Clone()); } catch { }
                         try
                         {
                             var areaBrush = brush.Clone();
                             areaBrush.Opacity = 0.10;
+                            areaBrush.Freeze();
                             SetP(rect, "AreaBrush", areaBrush);
                         }
                         catch { }
@@ -4196,9 +4173,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 using (var request = new BarsRequest(instrument, need) { BarsPeriod = barsPeriod })
                 {
                     request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
+                    // Must wait INSIDE the using block — the async callback reads
+                    // req.Bars after the provider returns data. Disposing the
+                    // request before the callback fires returns empty/stale bars.
+                    if (!done.Wait(TimeSpan.FromSeconds(30)))
+                        status = "timeout";
                 }
             }));
-            if (!done.Wait(TimeSpan.FromSeconds(30)))
+            if (status == "timeout")
                 return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
             if (bars == null || bars.Count == 0)
                 return new { status = "not_implemented", reason = $"no bar data for '{symbol}' (status={status})" };
