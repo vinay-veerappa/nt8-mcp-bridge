@@ -494,7 +494,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/schedule/task":      return Post(method, () => ScheduleTask(body));
                 case "/api/trades/journal":     return Post(method, () => TradeJournal(body));
                 case "/api/alert/create":       return Post(method, () => CreateAlert(body));
-                case "/api/riskguard/config":   return Post(method, () => RiskGuardConfig(body));
+                case "/api/riskguard/config":   return method == "GET" ? RiskGuardConfig(null) : Post(method, () => RiskGuardConfig(body));
                 case "/api/compliance/report":  return GetComplianceReport(query["account"]);
                 case "/api/orchestrator/multi-account": return Post(method, () => MultiAccountOrchestrator(body));
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
@@ -4891,7 +4891,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, taskId, cronExpression = cron, status = "persisted", totalScheduled = _scheduledTasks.Count, note = "Task persisted to disk. No scheduler engine is running — tasks will not auto-execute. Use an external scheduler to invoke the command endpoint at the specified cron intervals." };
+
+            // Ensure the scheduler timer is running (starts on first task registration).
+            EnsureScheduler();
+
+            return new { success = true, taskId, cronExpression = cron, status = "scheduled", totalScheduled = _scheduledTasks.Count, note = "Task registered with the in-process scheduler. Fires the 'command' endpoint at the specified interval. Scheduler restarts on NT8 recompile." };
         }
 
         private object TradeJournal(string body)
@@ -4962,27 +4966,89 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, alertId, symbol, status = "recorded", totalAlerts = _alerts.Count, note = "Alert recorded to disk. NT8 does not expose a public AddOn API to register alerts in the Alert Manager. This is a persistence store, not an active price-level alert." };
+
+            // Register a price-level monitor that fires AlertCallback when the condition is met.
+            // NT8's AlertCallback fires into the Alerts Log window (Control Center → New → Alerts Log).
+            double priceLevel = req["price"] != null ? (double)req["price"] : 0;
+            string condition = req.Str("condition") ?? "cross_above";
+            string message = req.Str("message") ?? $"{symbol} {condition} {priceLevel}";
+
+            if (priceLevel > 0)
+            {
+                try
+                {
+                    var inst = Instrument.GetInstrument(symbol);
+                    if (inst != null)
+                    {
+                        _alertMonitors[alertId] = new AlertMonitor
+                        {
+                            Instrument = inst,
+                            Level = priceLevel,
+                            Condition = condition,
+                            AlertId = alertId,
+                            Message = message,
+                            Triggered = false
+                        };
+                        return new { success = true, alertId, symbol, status = "active_with_monitor", totalAlerts = _alerts.Count, note = "Alert registered with price-level monitor. Fires NT8 AlertCallback into the Alerts Log when condition is met." };
+                    }
+                }
+                catch { }
+            }
+
+            return new { success = true, alertId, symbol, status = "recorded", totalAlerts = _alerts.Count, note = "Alert persisted. Price-level monitor could not be registered (instrument not found or no price specified). Alert is a log entry only." };
         }
+
+        // Alert price-level monitor
+        private class AlertMonitor
+        {
+            public Instrument Instrument;
+            public double Level;
+            public string Condition; // "cross_above" or "cross_below"
+            public string AlertId;
+            public string Message;
+            public bool Triggered;
+            public double LastPrice;
+        }
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, AlertMonitor> _alertMonitors =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, AlertMonitor>(StringComparer.OrdinalIgnoreCase);
 
         private object RiskGuardConfig(string body)
         {
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            string key = "global";
-            lock (_riskGuardConfig)
+            // GET (no body or empty body): return the current live config
+            if (string.IsNullOrWhiteSpace(body))
             {
-                _riskGuardConfig[key] = req;
-                try
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn not loaded" };
+                return new { success = true, config = RiskGuardAddOn.Instance.Config };
+            }
+
+            var req = JObject.Parse(body);
+
+            if (RiskGuardAddOn.Instance == null)
+            {
+                // Fallback: persist to riskguard_config.json (no live engine to apply to)
+                string key = "global";
+                lock (_riskGuardConfig)
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile));
-                    File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig));
+                    _riskGuardConfig[key] = req;
+                    try { Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile)); File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig)); } catch {}
                 }
-                catch {}
-                // NOTE: RiskGuardAddOn reads its config from RiskGuard/config.json, not
-                // riskguard_config.json. This endpoint persists the config for API
-                // visibility, but does NOT apply it to the live RiskGuard engine.
-                // To apply: call /api/riskguard/reload after updating, or restart NT8.
-                return new { success = true, status = "persisted", config = req, note = "Config persisted to riskguard_config.json. This file is NOT the live RiskGuard config (which is RiskGuard/config.json). To apply changes, call /api/riskguard/reload or restart NT8 after manually merging into config.json." };
+                return new { success = true, status = "persisted_only", config = req, note = "RiskGuardAddOn not loaded. Config persisted to riskguard_config.json but NOT applied to a live engine." };
+            }
+
+            // Deserialize the JObject into a typed RiskConfig and apply via SaveAndReloadConfig.
+            // This writes to RiskGuard/config.json (the correct file) AND reloads the live engine.
+            try
+            {
+                var cfg = req.ToObject<RiskConfig>();
+                if (cfg == null)
+                    return new { error = "Could not deserialize body to RiskConfig." };
+                RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
+                return new { success = true, status = "applied", config = req, note = "Written to RiskGuard/config.json and reloaded into the live RiskGuard engine via SaveAndReloadConfig." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = "Failed to apply config: " + ex.Message };
             }
         }
 
@@ -5098,6 +5164,161 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
             catch { }
+        }
+
+        // ── Scheduler + Alert Monitor ──────────────────────────────────────────
+        private System.Threading.Timer _schedulerTimer;
+        private static readonly object _schedLock = new object();
+
+        private void EnsureScheduler()
+        {
+            if (_schedulerTimer != null) return;
+            lock (_schedLock)
+            {
+                if (_schedulerTimer != null) return;
+                // Tick every 30s — cron resolution to the minute is sufficient.
+                _schedulerTimer = new System.Threading.Timer(SchedulerTick, null, 30000, 30000);
+                Log("Scheduler started (30s tick)");
+            }
+        }
+
+        private void SchedulerTick(object _)
+        {
+            try { CheckScheduledTasks(); } catch { }
+            try { CheckAlertMonitors(); } catch { }
+        }
+
+        private void CheckScheduledTasks()
+        {
+            if (_scheduledTasks.Count == 0) return;
+            DateTime now = DateTime.Now;
+            List<KeyValuePair<string, JObject>> due;
+            lock (_scheduledTasks)
+            {
+                due = _scheduledTasks.Where(kv => IsTaskDue(kv.Value, now)).ToList();
+            }
+            foreach (var kv in due)
+            {
+                var task = kv.Value;
+                var command = task.Str("command");
+                if (string.IsNullOrEmpty(command)) continue;
+                // Fire-and-forget loopback HTTP call to the command endpoint.
+                try
+                {
+                    var url = "http://localhost:7890/" + command.TrimStart('/');
+                    var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                    req.Method = "POST";
+                    req.ContentType = "application/json";
+                    req.Headers["Authorization"] = "Bearer " + ServerToken;
+                    req.Timeout = 30000;
+                    var args = task["args"]?.ToString() ?? "{}";
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(args);
+                    req.ContentLength = bytes.Length;
+                    using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                    using (var resp = req.GetResponse()) { }
+                    // Update lastRun
+                    task["lastRun"] = now.ToString("o");
+                }
+                catch (Exception ex)
+                {
+                    task["lastError"] = ex.Message;
+                }
+            }
+        }
+
+        // Simple interval-based scheduling: supports "interval" (seconds) or "cronExpression" (basic 5-field).
+        // For cron, we evaluate minute/hour/day-of-month/month/day-of-week with * and */n support.
+        private static bool IsTaskDue(JObject task, DateTime now)
+        {
+            // Interval-based (simpler, more reliable)
+            int intervalSec;
+            if (task["interval"] != null && int.TryParse(task["interval"].ToString(), out intervalSec) && intervalSec > 0)
+            {
+                DateTime lastRun;
+                if (!DateTime.TryParse(task["lastRun"]?.ToString(), out lastRun))
+                    return true; // never run → due now
+                return (now - lastRun).TotalSeconds >= intervalSec;
+            }
+
+            // Cron-based (basic 5-field: minute hour dom month dow)
+            var cron = task.Str("cronExpression");
+            if (string.IsNullOrEmpty(cron)) return false;
+            var parts = cron.Split(' ');
+            if (parts.Length < 5) return false;
+            DateTime lastRun2;
+            DateTime.TryParse(task["lastRun"]?.ToString(), out lastRun2);
+            // Check if current minute matches and hasn't been run this minute
+            if (lastRun2 > now.AddMinutes(-1)) return false;
+            return CronFieldMatches(parts[0], now.Minute, 0, 59)
+                && CronFieldMatches(parts[1], now.Hour, 0, 23)
+                && CronFieldMatches(parts[2], now.Day, 1, 31)
+                && CronFieldMatches(parts[3], now.Month, 1, 12)
+                && CronFieldMatches(parts[4], (int)now.DayOfWeek, 0, 6);
+        }
+
+        private static bool CronFieldMatches(string field, int value, int min, int max)
+        {
+            if (field == "*") return true;
+            if (field.StartsWith("*/"))
+            {
+                int step;
+                if (int.TryParse(field.Substring(2), out step) && step > 0)
+                    return (value - min) % step == 0;
+                return false;
+            }
+            int v;
+            if (int.TryParse(field, out v)) return v == value;
+            // Comma-separated list
+            foreach (var part in field.Split(','))
+            {
+                if (int.TryParse(part, out v) && v == value) return true;
+            }
+            return false;
+        }
+
+        private void CheckAlertMonitors()
+        {
+            if (_alertMonitors.Count == 0) return;
+            foreach (var kv in _alertMonitors.ToList())
+            {
+                var m = kv.Value;
+                if (m.Triggered) continue;
+                try
+                {
+                    // Get last price from the instrument's market data
+                    double lastPrice = 0;
+                    var md = m.Instrument?.MarketData;
+                    if (md != null && md.Last != null)
+                        lastPrice = md.Last.Price;
+                    if (lastPrice <= 0) continue;
+
+                    bool trigger = false;
+                    if (m.Condition == "cross_above" && m.LastPrice > 0 && m.LastPrice < m.Level && lastPrice >= m.Level)
+                        trigger = true;
+                    else if (m.Condition == "cross_below" && m.LastPrice > 0 && m.LastPrice > m.Level && lastPrice <= m.Level)
+                        trigger = true;
+
+                    m.LastPrice = lastPrice;
+
+                    if (trigger)
+                    {
+                        m.Triggered = true;
+                        // Fire NT8 AlertCallback into the Alerts Log
+                        try
+                        {
+                            NinjaTrader.NinjaScript.Alert.AlertCallback(
+                                m.Instrument, this, m.AlertId, NinjaTrader.Core.Globals.Now,
+                                NinjaTrader.NinjaScript.Priority.High, m.Message,
+                                NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert1.wav",
+                                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Yellow),
+                                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Black),
+                                0);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
         }
 
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
