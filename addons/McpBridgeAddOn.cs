@@ -1692,27 +1692,30 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (stratType == null) return new { error = "strategy type not found (compiled?): " + stratName };
 
             object result = null; Exception err = null;
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
-            disp.Invoke((Action)(() =>
+
+            // FindChartControl already marshals to each chart window's own dispatcher
+            // internally and returns the live ChartControl.  We must then use that
+            // ChartControl's OWN dispatcher (not the app dispatcher) for any calls on
+            // it, because each NT8 chart lives on its own thread (18/19, not thread 1).
+            object ccFound, cbFound;
+            if (!FindChartControl(instrument, out ccFound, out cbFound) || ccFound == null || cbFound == null)
+            {
+                return new
+                {
+                    status = "best_effort",
+                    error = $"could not access a chart control for '{instrument}'. NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Open a chart for this instrument manually via the Control Center shortcut Ctrl+Shift+N, then call deploy again. Deploy can attach to a chart that already has at least one strategy on this instrument; if the chart is strategy-less, attach the first strategy via the chart's Strategies dialog."
+                };
+            }
+
+            var chartDisp = (ccFound as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+            if (chartDisp == null) return new { error = "no chart dispatcher available" };
+
+            chartDisp.Invoke((Action)(() =>
             {
                 try
                 {
-                    object cc, cb;
-                    if (!FindChartControl(instrument, out cc, out cb) || cc == null || cb == null)
-                    {
-                        // NT8 does not expose a supported API to create a chart window from an
-                        // AddOn. Return an honest best_effort response that tells the caller to
-                        // open the chart manually (Control Center: Ctrl+Shift+N, type the symbol)
-                        // and then call deploy again. If a matching chart is already open, the
-                        // improved FindChartControl above should have found it.
-                        result = new
-                        {
-                            status = "best_effort",
-                            error = $"could not access a chart control for '{instrument}'. NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Open a chart for this instrument manually via the Control Center shortcut Ctrl+Shift+N, then call deploy again. Deploy can attach to a chart that already has at least one strategy on this instrument; if the chart is strategy-less, attach the first strategy via the chart's Strategies dialog."
-                        };
-                        return;
-                    }
+                    var cc = ccFound;
+                    var cb = cbFound;
 
                     var strat = Activator.CreateInstance(stratType);   // ctor runs SetDefaults
                     SetP(strat, "Account", account);
@@ -1751,58 +1754,67 @@ namespace NinjaTrader.NinjaScript.AddOns
             string accountName = req.Str("account");
             bool flatten = req["flatten"] == null || (bool)req["flatten"];
             var stopped = new List<object>(); Exception err = null;
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
-            disp.Invoke((Action)(() =>
+
+            // Strategy clones hold a reference to their ChartControl, which lives on
+            // the chart window's own dispatcher thread (18/19), not the app dispatcher
+            // (thread 1).  We must marshal chart-control access to the correct thread.
+            // First, collect matching clones and their accounts from Account.All
+            // (which is safe to read from any thread).
+            var clonesToStop = new List<object[]>();
+            foreach (Account a in Account.All)
             {
-                try
+                if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
+                foreach (var s in a.Strategies)
+                    if (s != null && (string.IsNullOrEmpty(stratName) || s.GetType().Name == stratName))
+                        clonesToStop.Add(new object[] { s, a });
+            }
+
+            foreach (var entry in clonesToStop)
+            {
+                var clone = entry[0];
+                var acct = (Account)entry[1];
+                var cc = GetMember(clone, "ChartControl");
+                if (cc == null) continue;
+                var chartDisp = (cc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (chartDisp == null) continue;
+                chartDisp.Invoke((Action)(() =>
                 {
-                    foreach (Account a in Account.All)
+                    try
                     {
-                        if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
-                        // snapshot running clones first (we mutate the collection)
-                        var clones = new List<object>();
-                        foreach (var s in a.Strategies)
-                            if (s != null && (string.IsNullOrEmpty(stratName) || s.GetType().Name == stratName)) clones.Add(s);
-                        foreach (var clone in clones)
+                        // the chart holds the TEMPLATE (same Id as the running clone)
+                        object template = null;
+                        var col = GetMember(cc, "Strategies") as System.Collections.IEnumerable;
+                        var cloneId = GetMember(clone, "Id");
+                        if (col != null)
+                            foreach (var tmpl in col)
+                                if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
+                        if (template == null) template = clone;
+                        var posObj = GetMember(clone, "Position");
+                        var posBefore = GetMember(posObj, "MarketPosition")?.ToString();
+                        int posQty = 0; try { posQty = Convert.ToInt32(GetMember(posObj, "Quantity")); } catch { }
+                        var instr = GetMember(clone, "Instrument") as Instrument;
+                        try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
+                        try { SetP(template, "IsEnabled", false); } catch { }
+                        try { InvokeM(col, "Remove", template); } catch { }
+                        // Auto-flatten THIS strategy's own position with an offsetting market
+                        // order (strategy-sized, so it won't zero another strategy's net).
+                        string flattenResult = "none";
+                        if (flatten && instr != null && posQty > 0 && (posBefore == "Long" || posBefore == "Short"))
                         {
-                            var cc = GetMember(clone, "ChartControl");
-                            if (cc == null) continue;
-                            // the chart holds the TEMPLATE (same Id as the running clone)
-                            object template = null;
-                            var col = GetMember(cc, "Strategies") as System.Collections.IEnumerable;
-                            var cloneId = GetMember(clone, "Id");
-                            if (col != null)
-                                foreach (var tmpl in col)
-                                    if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
-                            if (template == null) template = clone;
-                            var posObj = GetMember(clone, "Position");
-                            var posBefore = GetMember(posObj, "MarketPosition")?.ToString();
-                            int posQty = 0; try { posQty = Convert.ToInt32(GetMember(posObj, "Quantity")); } catch { }
-                            var instr = GetMember(clone, "Instrument") as Instrument;
-                            try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
-                            try { SetP(template, "IsEnabled", false); } catch { }
-                            try { InvokeM(col, "Remove", template); } catch { }
-                            // Auto-flatten THIS strategy's own position with an offsetting market
-                            // order (strategy-sized, so it won't zero another strategy's net).
-                            string flattenResult = "none";
-                            if (flatten && instr != null && posQty > 0 && (posBefore == "Long" || posBefore == "Short"))
+                            try
                             {
-                                try
-                                {
-                                    var act = posBefore == "Long" ? OrderAction.Sell : OrderAction.Buy;
-                                    var o = a.CreateOrder(instr, act, OrderType.Market, TimeInForce.Day, posQty, 0, 0, string.Empty, "McpFlatten", null);
-                                    a.Submit(new[] { o });
-                                    flattenResult = act + " " + posQty + " market";
-                                }
-                                catch (Exception fex) { flattenResult = "FAILED: " + fex.Message; }
+                                var act = posBefore == "Long" ? OrderAction.Sell : OrderAction.Buy;
+                                var o = acct.CreateOrder(instr, act, OrderType.Market, TimeInForce.Day, posQty, 0, 0, string.Empty, "McpFlatten", null);
+                                acct.Submit(new[] { o });
+                                flattenResult = act + " " + posQty + " market";
                             }
-                            stopped.Add(new { strategy = clone.GetType().Name, account = a.Name, positionAtStop = posBefore, flatten = flattenResult });
+                            catch (Exception fex) { flattenResult = "FAILED: " + fex.Message; }
                         }
+                        stopped.Add(new { strategy = clone.GetType().Name, account = acct.Name, positionAtStop = posBefore, flatten = flattenResult });
                     }
-                }
-                catch (Exception ex) { err = ex; }
-            }));
+                    catch (Exception ex) { err = ex; }
+                }));
+            }
             if (err != null) return new { error = "stop failed: " + err.Message, stack = err.StackTrace };
             return new { stoppedCount = stopped.Count, stopped,
                          note = "disabled + removed from chart; open positions auto-flattened via an offsetting market order when flatten=true (default)" };
@@ -3036,9 +3048,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (string.IsNullOrEmpty(wantName) && string.IsNullOrEmpty(wantMaster)) return null;
 
             System.Windows.Window found = null;
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher == null) return null;
-            dispatcher.Invoke((Action)(() =>
+            var appDispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (appDispatcher == null) return null;
+
+            // (1) Enumerate chart windows on the app dispatcher (thread 1) —
+            // Globals.AllWindows and Application.Current.Windows are safe to read
+            // from the app dispatcher.
+            var chartWindows = new List<System.Windows.Window>();
+            appDispatcher.Invoke((Action)(() =>
             {
                 try
                 {
@@ -3048,28 +3065,45 @@ namespace NinjaTrader.NinjaScript.AddOns
                         try { windows = System.Windows.Application.Current.Windows; } catch { }
                     }
                     if (windows == null) return;
-
                     foreach (var w in windows)
                     {
                         if (w == null) continue;
                         var wType = w.GetType();
                         if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
                         var win = w as System.Windows.Window;
-                        if (win == null) continue;
+                        if (win != null) chartWindows.Add(win);
+                    }
+                }
+                catch { }
+            }));
 
+            // (2) Inspect each chart window on its OWN dispatcher (thread 18/19)
+            // — accessing ChartControl.Instrument from thread 1 throws the
+            // cross-thread exception.
+            foreach (var win in chartWindows)
+            {
+                if (win == null) continue;
+                var winDispatcher = (win as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (winDispatcher == null) continue;
+                bool matched = false;
+                winDispatcher.Invoke((Action)(() =>
+                {
+                    try
+                    {
                         var controls = new List<object>();
-                        CollectChartControlsFromWindow(w, controls);
+                        CollectChartControlsFromWindow(win, controls);
                         foreach (var c in controls)
                         {
                             var cInstr = GetMember(c, "Instrument") as Instrument;
                             if (InstrumentMatches(cInstr, wantName)
                                 || (wantMaster != null && InstrumentMatches(cInstr, wantMaster)))
-                            { found = win; return; }
+                            { found = win; matched = true; return; }
                         }
                     }
-                }
-                catch { }
-            }), System.Windows.Threading.DispatcherPriority.Background, TimeSpan.FromSeconds(5));
+                    catch { }
+                }));
+                if (matched) break;
+            }
             return found;
         }
 
