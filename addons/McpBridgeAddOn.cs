@@ -244,6 +244,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
                 PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
+                // Load persisted stores for schedule, alerts, riskguard config, and trade journal
+                LoadJsonStore(ScheduledTasksFile, _scheduledTasks);
+                LoadJsonStore(AlertsFile, _alerts);
+                LoadJsonStore(RiskGuardConfigFile, _riskGuardConfig);
+                LoadJsonStore(TradeJournalFile, _tradeJournal);
 #if !TESTING
                 foreach (Account acc in Account.All)
                 {
@@ -2740,22 +2745,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                 foreach (var prop in strategyType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
                 {
                     if (!prop.CanRead || !prop.CanWrite) continue;
-                    if (prop.DeclaringType != null && prop.DeclaringType != strategyType && prop.DeclaringType.Name.Contains("StrategyBase")) continue;
+                    // Include inherited StrategyBase properties — these ARE the user-settable inputs
+                    // (Qty, StopLoss, TakeProfit, AllowLong, etc.) that /api/strategy/param sets.
 
                     string desc = "";
                     var descAttr = prop.GetCustomAttributes(typeof(System.ComponentModel.DescriptionAttribute), true).FirstOrDefault() as System.ComponentModel.DescriptionAttribute;
                     if (descAttr != null) desc = descAttr.Description;
+
+                    // Check if this property is a NinjaScript input (decorated with NinjaScriptProperty)
+                    bool isInput = prop.IsDefined(typeof(NinjaTrader.NinjaScript.NinjaScriptPropertyAttribute), true);
 
                     props.Add(new
                     {
                         name = prop.Name,
                         type = prop.PropertyType.Name,
                         description = desc,
-                        canWrite = prop.CanWrite
+                        canWrite = prop.CanWrite,
+                        isInput = isInput
                     });
                 }
 
-                return new { success = true, strategy = strategyType.FullName, properties = props };
+                // Also enumerate fields decorated with NinjaScriptProperty (some inputs are fields)
+                var inputs = new List<object>();
+                foreach (var field in strategyType.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    bool isInput = field.IsDefined(typeof(NinjaTrader.NinjaScript.NinjaScriptPropertyAttribute), true);
+                    if (isInput)
+                        inputs.Add(new { name = field.Name, type = field.FieldType.Name });
+                }
+
+                return new { success = true, strategy = strategyType.FullName, properties = props, inputs = inputs };
             }
             catch (Exception ex)
             {
@@ -3732,8 +3751,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         time = exec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
                         macroTag,
                         latencyMs,
+                        commission = exec.Commission,
                         mae = (double?)null,
-                        mfe = (double?)null
+                        mfe = (double?)null,
+                        note = "MAE/MFE require Trade objects from a backtest SystemPerformance.AllTrades; account-level Executions do not carry them."
                     });
                 }
             }
@@ -4787,6 +4808,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
 
+            // Only sma_crossover is implemented. Other rules are not supported.
+            if (!entryRule.Equals("sma_crossover", StringComparison.OrdinalIgnoreCase))
+                return new { error = $"entryRule '{entryRule}' is not supported. Only 'sma_crossover' is implemented." };
+
             var barsResult = GetBars(symbol, "Minute", 5, 500);
             var barsJObj = JObject.FromObject(barsResult);
             var barsArr = barsJObj["bars"] as JArray;
@@ -4866,7 +4891,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, taskId, cronExpression = cron, status = "scheduled", totalScheduled = _scheduledTasks.Count };
+            return new { success = true, taskId, cronExpression = cron, status = "persisted", totalScheduled = _scheduledTasks.Count, note = "Task persisted to disk. No scheduler engine is running — tasks will not auto-execute. Use an external scheduler to invoke the command endpoint at the specified cron intervals." };
         }
 
         private object TradeJournal(string body)
@@ -4874,6 +4899,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "list";
             var id = req.Str("id") ?? Guid.NewGuid().ToString("N");
+
+            // Always load from disk first to ensure we have the latest persisted state
+            try
+            {
+                if (File.Exists(TradeJournalFile))
+                {
+                    var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(TradeJournalFile));
+                    if (loaded != null) foreach (var kv in loaded) _tradeJournal[kv.Key] = kv.Value;
+                }
+            }
+            catch { }
 
             lock (_tradeJournal)
             {
@@ -4887,14 +4923,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     catch {}
                 }
-                else if (File.Exists(TradeJournalFile) && !_tradeJournal.ContainsKey(id))
+                else if (action.Equals("delete", StringComparison.OrdinalIgnoreCase) || action.Equals("remove", StringComparison.OrdinalIgnoreCase))
                 {
-                    try
-                    {
-                        var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(TradeJournalFile));
-                        if (loaded != null) foreach (var kv in loaded) _tradeJournal[kv.Key] = kv.Value;
-                    }
-                    catch {}
+                    if (string.IsNullOrEmpty(req.Str("id")))
+                        return new { error = "id required for delete action" };
+                    _tradeJournal.Remove(req.Str("id"));
+                    try { File.WriteAllText(TradeJournalFile, JsonConvert.SerializeObject(_tradeJournal)); } catch {}
+                    return new { success = true, action, count = _tradeJournal.Count };
+                }
+                else if (action.Equals("update", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrEmpty(req.Str("id")))
+                        return new { error = "id required for update action" };
+                    _tradeJournal[req.Str("id")] = req;
+                    try { File.WriteAllText(TradeJournalFile, JsonConvert.SerializeObject(_tradeJournal)); } catch {}
+                    return new { success = true, action, count = _tradeJournal.Count };
                 }
                 return new { success = true, action, count = _tradeJournal.Count, entries = _tradeJournal.Values.ToList() };
             }
@@ -4919,7 +4962,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, alertId, symbol, status = "active", totalAlerts = _alerts.Count };
+            return new { success = true, alertId, symbol, status = "recorded", totalAlerts = _alerts.Count, note = "Alert recorded to disk. NT8 does not expose a public AddOn API to register alerts in the Alert Manager. This is a persistence store, not an active price-level alert." };
         }
 
         private object RiskGuardConfig(string body)
@@ -4935,7 +4978,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig));
                 }
                 catch {}
-                return new { success = true, status = "updated", config = req };
+                // NOTE: RiskGuardAddOn reads its config from RiskGuard/config.json, not
+                // riskguard_config.json. This endpoint persists the config for API
+                // visibility, but does NOT apply it to the live RiskGuard engine.
+                // To apply: call /api/riskguard/reload after updating, or restart NT8.
+                return new { success = true, status = "persisted", config = req, note = "Config persisted to riskguard_config.json. This file is NOT the live RiskGuard config (which is RiskGuard/config.json). To apply changes, call /api/riskguard/reload or restart NT8 after manually merging into config.json." };
             }
         }
 
@@ -4945,10 +4992,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             int totalTrades = 0;
             int maxPositionExposure = 0;
             string accName = accountName ?? "Sim101";
+            double dailyLossLimit = -2500.0; // default fallback
 
+            // Try to get the real prop-firm daily loss limit from PropFirmProtectionSuite
+            try
+            {
+                var propConfig = PropFirmProtectionSuite.Instance?.Config;
+                if (propConfig != null)
+                {
+                    // PropFirmProtectionConfig may have a DailyLossLimit field
+                    var dll = GetMember(propConfig, "DailyLossLimit");
+                    if (dll != null) dailyLossLimit = -Math.Abs(Convert.ToDouble(dll));
+                }
+            }
+            catch { }
+
+            bool accountFound = false;
             foreach (Account acc in Account.All)
             {
                 if (!string.IsNullOrEmpty(accountName) && !acc.Name.Equals(accountName, StringComparison.OrdinalIgnoreCase)) continue;
+                accountFound = true;
                 dailyPnL += AcctGet(acc, AccountItem.RealizedProfitLoss) + AcctGet(acc, AccountItem.UnrealizedProfitLoss);
                 totalTrades += acc.Executions.Count;
                 foreach (Position pos in acc.Positions)
@@ -4957,7 +5020,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            string status = (dailyPnL >= -2500.0) ? "COMPLIANT" : "VIOLATION_DAILY_LOSS_EXCEEDED";
+            if (!accountFound) return new { error = $"account '{accName}' not found" };
+
+            string status = (dailyPnL >= dailyLossLimit) ? "COMPLIANT" : "VIOLATION_DAILY_LOSS_EXCEEDED";
 
             return new
             {
@@ -4967,6 +5032,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyPnL,
                 totalTrades,
                 maxPositionExposure,
+                dailyLossLimit = dailyLossLimit,
                 complianceStatus = status
             };
         }
@@ -4977,12 +5043,62 @@ namespace NinjaTrader.NinjaScript.Strategies
             var action = req.Str("action") ?? "sync_hedge";
             var accList = req["accounts"] as JArray;
             var targetAccounts = accList != null ? accList.Select(a => a.ToString()).ToList() : Account.All.Select(a => a.Name).ToList();
-            return new { success = true, action, targetAccounts, status = "executed" };
+            var orders = req["orders"] as JArray;
+            if (orders == null || orders.Count == 0)
+                return new { error = "orders array required, e.g. [{symbol,action,quantity,orderType}, ...]" };
+
+            var results = new List<object>();
+            foreach (string accName in targetAccounts)
+            {
+                Account account = Account.All.FirstOrDefault(a => a.Name.Equals(accName, StringComparison.OrdinalIgnoreCase));
+                if (account == null) { results.Add(new { account = accName, status = "error", error = "account not found" }); continue; }
+
+                foreach (var ord in orders)
+                {
+                    var symbol = ord["symbol"]?.ToString();
+                    var actionStr = ord["action"]?.ToString() ?? "buy";
+                    var quantity = ord["quantity"] != null ? (int)ord["quantity"] : 1;
+                    var orderTypeStr = ord["orderType"]?.ToString() ?? "Market";
+                    if (string.IsNullOrEmpty(symbol)) { results.Add(new { account = accName, status = "error", error = "symbol required" }); continue; }
+
+                    var instrument = Instrument.GetInstrument(symbol);
+                    if (instrument == null) { results.Add(new { account = accName, status = "error", error = "instrument not found: " + symbol }); continue; }
+
+                    var orderAction = actionStr.Equals("sell", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.Buy;
+                    var orderType = orderTypeStr.Equals("Limit", StringComparison.OrdinalIgnoreCase) ? OrderType.Limit : OrderType.Market;
+                    double limitPrice = ord["limitPrice"] != null ? (double)ord["limitPrice"] : 0;
+                    double stopPrice = ord["stopPrice"] != null ? (double)ord["stopPrice"] : 0;
+
+                    try
+                    {
+                        var order = account.CreateOrder(instrument, orderAction, orderType, TimeInForce.Day, quantity, limitPrice, stopPrice, string.Empty, "McpOrchestrator", null);
+                        account.Submit(new[] { order });
+                        results.Add(new { account = accName, symbol, action = actionStr, quantity, orderId = order.Id.ToString(), status = "submitted" });
+                    }
+                    catch (Exception ex) { results.Add(new { account = accName, symbol, status = "error", error = ex.Message }); }
+                }
+            }
+            return new { success = true, action, targetAccounts, status = "executed", results };
         }
 
         // - Helpers -
 
 
+
+        // Generic JSON store loader for persistent dictionaries.
+        private static void LoadJsonStore(string path, Dictionary<string, JObject> store)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(path));
+                    if (loaded != null)
+                        lock (store) { store.Clear(); foreach (var kv in loaded) store[kv.Key] = kv.Value; }
+                }
+            }
+            catch { }
+        }
 
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
         {
