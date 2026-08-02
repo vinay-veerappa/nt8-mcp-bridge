@@ -3942,9 +3942,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             int width = req["width"] != null ? (int)req["width"] : 2;
             string dashStyle = req.Str("dashStyle") ?? "Solid";
 
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
-
             object cc, cb;
             if (!FindChartControl(symbol, out cc, out cb) || cc == null)
             {
@@ -3974,7 +3971,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             string resultStatus = null;
             Exception drawErr = null;
 
-            disp.Invoke((Action)(() =>
+            // Use the ChartControl's OWN dispatcher (each NT8 chart lives on its own
+            // thread), NOT the app dispatcher.  Using the app dispatcher causes
+            // "calling thread cannot access this object" because ChartControl was
+            // created on thread 18/19, not thread 1.
+            var chartDisp = (cc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+            if (chartDisp == null) return new { status = "not_implemented", reason = "no chart dispatcher available" };
+
+            chartDisp.Invoke((Action)(() =>
             {
                 try
                 {
