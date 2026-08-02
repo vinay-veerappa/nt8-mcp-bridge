@@ -332,7 +332,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try
                 {
                     var context = _listener.GetContext();
-                    ProcessRequest(context);
+                    // Dispatch each request to the ThreadPool so a blocking handler
+                    // (e.g. 180s backtest, 30s BarsRequest) does not stall all other
+                    // endpoints. The previous single-threaded loop serialized every
+                    // request — one slow call made the entire API unresponsive.
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ => ProcessRequest(context));
                 }
                 catch (HttpListenerException) { break; }
                 catch (Exception ex) { Log($"Error: {ex.Message}", LogLevel.Error); }
@@ -682,11 +686,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         // -
 
         private object _saWindow; // reused across backtests
+        private static readonly object _saLock = new object(); // serialize backtests (shared SA window)
 
         private const string SaNs = "NinjaTrader.Gui.NinjaScript.StrategyAnalyzer.";
 
         private object Backtest(string body)
         {
+            // Backtests share a single Strategy Analyzer window (_saWindow).
+            // With concurrent request dispatch, two backtests running simultaneously
+            // would conflict. Lock here so only one backtest runs at a time; other
+            // request types (health, quote, orders, etc.) remain fully concurrent.
+            lock (_saLock)
+            {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             string strategy = req.Str("strategy");
             string symbol = req.Str("symbol");
@@ -798,6 +809,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
             disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades); }));
             return report;
+            } // end lock(_saLock)
         }
 
         // DEV: walk the SA window's logical tree and report every DateTime-valued property,
@@ -1281,7 +1293,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             var ops = req["ops"] as JArray ?? new JArray();
 
             // WPF objects (windows, viewmodels) must be touched on the UI dispatcher.
-            // Pass "ui": true to run the whole op batch on it.
+            // Pass "ui": true to run the whole op batch on the app dispatcher (for
+            // Control Center / SA window objects that live on thread 1).
+            // Pass "dispatcher": "auto" to resolve the target object's own dispatcher
+            // per-op (for chart-owned objects that live on thread 18/19).
             if (req.Bool("ui", false))
             {
                 var disp = System.Windows.Application.Current?.Dispatcher;
