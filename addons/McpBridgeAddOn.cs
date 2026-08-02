@@ -2227,10 +2227,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
             }
 
-            // Reject order if account is locked out by RiskGuard
-            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+            // Reject order if account is locked out by RiskGuard or by EmergencyFlatten lockout.
+            if (IsAccountLocked(account.Name))
             {
-                return new { error = $"Order blocked: Account {account.Name} is locked out by Risk Guard." };
+                return new { error = $"Order blocked: Account {account.Name} is locked out." };
             }
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
@@ -2293,6 +2293,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
                 return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
+            if (IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
@@ -2324,6 +2326,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
 
             // Submit all valid orders safely
+            List<string> rejectedOrders = new List<string>();
             try
             {
                 var validOrders = new[] { entryOrder, stopOrder, targetOrder }
@@ -2333,6 +2336,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     account.Submit(validOrders);
                 }
+                // Check for rejected exit orders (NT8 may reject OCO children if no
+                // position exists yet). Report the rejection so callers know the
+                // bracket may not be live.
+                foreach (var o in new[] { stopOrder, targetOrder })
+                {
+                    if (o != null && (o.OrderState == OrderState.Rejected || o.OrderState == OrderState.Cancelled))
+                        rejectedOrders.Add(o.Name + " state=" + o.OrderState);
+                }
             }
             catch (Exception ex)
             {
@@ -2341,11 +2352,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             return new
             {
-                status = "submitted",
+                status = rejectedOrders.Count > 0 ? "partial_submit" : "submitted",
                 ocoId = ocoId,
                 entry = new { id = entryOrder.Id.ToString(), name = entryOrder.Name },
-                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice },
-                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice }
+                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice, state = stopOrder.OrderState.ToString() },
+                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice, state = targetOrder.OrderState.ToString() },
+                rejectedExitOrders = rejectedOrders.Count > 0 ? rejectedOrders : null,
+                note = rejectedOrders.Count > 0 ? "Some exit orders were rejected (NT8 may reject OCO children without an open position). Verify position before relying on the bracket." : null
             };
         }
 
@@ -3033,7 +3046,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         }
                 }
                 catch { }
-            }), System.Windows.Threading.DispatcherPriority.Background, TimeSpan.FromSeconds(5));
+            }));
             return found;
         }
 
@@ -3280,6 +3293,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lockoutExpiry =
             new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        // Check both RiskGuard and the local EmergencyFlatten lockout.
+        private bool IsAccountLocked(string accountName)
+        {
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(accountName))
+                return true;
+            DateTime expiry;
+            if (_lockoutExpiry.TryGetValue(accountName, out expiry) && DateTime.UtcNow < expiry)
+                return true;
+            return false;
+        }
 
         private object EmergencyFlatten(string body)
         {
@@ -3723,24 +3747,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (pnlList.Count == 0)
             {
-                foreach (Account acc in Account.All)
-                {
-                    var tradesList = acc.Executions.ToList();
-                    for (int k = 0; k < tradesList.Count; k++)
-                    {
-                        var e = tradesList[k];
-                        if (e.Quantity > 0 && e.Order != null && e.Order.AverageFillPrice > 0)
-                        {
-                            double realized = e.Quantity * (e.Order.OrderAction == OrderAction.Sell || e.Order.OrderAction == OrderAction.SellShort ? 1 : -1) * 10;
-                            if (realized != 0) pnlList.Add(realized);
-                        }
-                    }
-                }
-            }
-
-            if (pnlList.Count == 0)
-            {
-                return new { success = false, error = "No trade execution history found on active accounts or payload array to perform Monte Carlo simulation." };
+                // Previously this code synthesized a placeholder P&L (qty * direction * 10)
+                // from raw executions, which produced statistically meaningless results.
+                // Computing real realized P&L from execution pairs requires position tracking
+                // that the AddOn does not have. Return an honest error instead.
+                return new { success = false, error = "No 'trades' array supplied in the request body. The fallback that synthesizes P&L from raw account executions has been removed because it produced garbage data. Supply a 'trades' array with 'pnl' / 'netProfit' / 'realizedPnl' fields, e.g. [{\"pnl\": 120.50}, {\"pnl\": -85.00}]." };
             }
 
             blockSize = Math.Min(blockSize, pnlList.Count);
@@ -3886,17 +3897,36 @@ namespace NinjaTrader.NinjaScript.AddOns
             int stopLossTicks = req["stopLossTicks"] != null ? (int)req["stopLossTicks"] : 0;
             int takeProfitTicks = req["takeProfitTicks"] != null ? (int)req["takeProfitTicks"] : 0;
 
+            if (stopLossTicks == 0 || takeProfitTicks == 0)
+                return new { error = "stopLossTicks and takeProfitTicks are required for ATM bracket orders" };
+
+            // Submit the entry market order first.
             var primaryResult = PlaceOrder(body);
             var resultObj = JObject.FromObject(primaryResult);
             if (resultObj["error"] != null) return resultObj;
 
-            if (stopLossTicks > 0 || takeProfitTicks > 0)
+            // After the entry fills, attach a stop + target bracket via OCO.
+            // NT8 does not support attaching an ATM strategy bracket from an AddOn
+            // without a chart context. We submit the OCO exit orders directly.
+            string orderId = resultObj["orderId"]?.ToString();
+            string entryName = resultObj["name"]?.ToString() ?? "AtmEntry";
+
+            // Build and submit the OCO bracket.
+            var ocoReq = new Dictionary<string, object>
             {
-                resultObj["isAtmBracket"] = true;
-                resultObj["stopLossTicks"] = stopLossTicks;
-                resultObj["takeProfitTicks"] = takeProfitTicks;
-                resultObj["bracketState"] = "Attached_OCO_Pending";
-            }
+                {"symbol", symbol},
+                {"action", action},
+                {"quantity", req["quantity"] != null ? (int)req["quantity"] : 1},
+                {"account", req.Str("account") ?? ""},
+            };
+            // We cannot set stop/target prices from ticks alone without the fill price.
+            // Return the entry result with a note that the bracket must be attached
+            // manually or via /api/order/oco with explicit prices.
+            resultObj["isAtmBracket"] = false;
+            resultObj["bracketState"] = "EntryOnly_BracketRequiresPrices";
+            resultObj["note"] = "ATM entry submitted. Use /api/order/oco with stopPrice and targetPrice to attach the bracket after the entry fills.";
+            resultObj["stopLossTicks"] = stopLossTicks;
+            resultObj["takeProfitTicks"] = takeProfitTicks;
             return resultObj;
         }
 
@@ -4439,13 +4469,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 using (var writer = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
                 {
-                    var initMsg = JsonConvert.SerializeObject(new { @event = "heartbeat", status = "connected", serverVersion = Version, timestamp = DateTime.UtcNow });
-
-                    writer.WriteLine("data: " + initMsg + "\n");
-                    writer.Flush();
+                    // Send periodic heartbeats until the client disconnects.
+                    while (_running)
+                    {
+                        var heartbeat = JsonConvert.SerializeObject(new { @event = "heartbeat", status = "connected", serverVersion = Version, timestamp = DateTime.UtcNow });
+                        writer.WriteLine("data: " + heartbeat + "\n");
+                        writer.Flush();
+                        System.Threading.Thread.Sleep(15000); // 15s heartbeat interval
+                    }
                 }
             }
-            catch {}
+            catch { }
         }
 
         private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");
