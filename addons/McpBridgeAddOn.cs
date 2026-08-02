@@ -3670,9 +3670,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     RiskGuardAddOn.Instance.UnlockAccount(acctName);
                 }
+                // Also clear the local EmergencyFlatten lockout
+                DateTime dummy;
+                _lockoutExpiry.TryRemove(acctName, out dummy);
                 return new { success = true, action, account = acctName, isLockedOut = false };
             }
-            return new { success = true, action, account = acctName };
+            // Query lockout status
+            bool locked = IsAccountLocked(acctName);
+            return new { success = true, action, account = acctName, isLockedOut = locked };
         }
 
         private object ExtractTrades(string accountFilter, string format, string fromStr, string toStr, string limitStr)
