@@ -452,6 +452,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/order":              return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOrder(b)));
                 case "/api/order/oco":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOcoOrder(b)));
                 case "/api/order/atm":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceAtmOrder(b)));
+                case "/api/order/atm/status":   return GetAtmBracketStatus(query["bracketId"]);
                 case "/api/order/cancel":       return Post(method, () => ExecuteIdempotencyFromReq(body, b => CancelOrder(b)));
                 case "/api/order/change":       return Post(method, () => ExecuteIdempotencyFromReq(body, b => ChangeOrder(b)));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
@@ -3930,45 +3931,127 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object PlaceAtmOrder(string body)
         {
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            JObject req;
+            try { req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body); }
+            catch (Exception ex) { return new { error = "Invalid JSON body: " + ex.Message }; }
+
             var symbol = req.Str("symbol");
             var action = req.Str("action");
-            if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action)) return new { error = "symbol and action required" };
+            if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action))
+                return new { error = "symbol and action required" };
 
-            int stopLossTicks = req["stopLossTicks"] != null ? (int)req["stopLossTicks"] : 0;
-            int takeProfitTicks = req["takeProfitTicks"] != null ? (int)req["takeProfitTicks"] : 0;
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null)
+                return new { error = "instrument not found: " + symbol };
 
-            if (stopLossTicks == 0 || takeProfitTicks == 0)
-                return new { error = "stopLossTicks and takeProfitTicks are required for ATM bracket orders" };
+            // Validate this is a tradable contract, not a master instrument
+            if (instrument.MasterInstrument != null && instrument.FullName.Equals(instrument.MasterInstrument.Name, StringComparison.OrdinalIgnoreCase))
+                return new { error = "symbol '" + symbol + "' resolves to a master instrument, not a tradable contract. Use full futures format (e.g. NQ 09-26)." };
 
-            // Submit the entry market order first.
-            var primaryResult = PlaceOrder(body);
-            var resultObj = JObject.FromObject(primaryResult);
-            if (resultObj["error"] != null) return resultObj;
+            string reqAccount = req.Str("account");
+            Account account = null;
+            if (!string.IsNullOrEmpty(reqAccount))
+                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
+            if (account == null)
+                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
+                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
+                          ?? Account.All.FirstOrDefault();
+            if (account == null) return new { error = "no account available" };
 
-            // After the entry fills, attach a stop + target bracket via OCO.
-            // NT8 does not support attaching an ATM strategy bracket from an AddOn
-            // without a chart context. We submit the OCO exit orders directly.
-            string orderId = resultObj["orderId"]?.ToString();
-            string entryName = resultObj["name"]?.ToString() ?? "AtmEntry";
+            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase);
+            bool confirmLive = req.Bool("confirmLive");
+            if (!isSim && !confirmLive)
+                return new { error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" };
 
-            // Build and submit the OCO bracket.
-            var ocoReq = new Dictionary<string, object>
+            if (IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
+
+            int quantity = req["quantity"]?.Value<int>() ?? 1;
+            double tickSize = instrument.MasterInstrument.TickSize;
+            double pointValue = instrument.MasterInstrument.PointValue;
+
+            double currentPrice = 0;
+            var md = instrument.MarketData;
+            if (md != null && md.Last != null)
+                currentPrice = md.Last.Price;
+            if (currentPrice <= 0 && md != null && md.Ask != null)
+                currentPrice = md.Ask.Price;
+            if (currentPrice <= 0 && md != null && md.Bid != null)
+                currentPrice = md.Bid.Price;
+            if (currentPrice <= 0)
+                return new { error = "could not get current price for " + symbol };
+
+            var config = new AtmStrategyConfig();
+            string strategyName = req.Str("strategyName") ?? "";
+            if (!string.IsNullOrEmpty(strategyName))
             {
-                {"symbol", symbol},
-                {"action", action},
-                {"quantity", req["quantity"] != null ? (int)req["quantity"] : 1},
-                {"account", req.Str("account") ?? ""},
+                try { config.Type = (AtmStrategyType)Enum.Parse(typeof(AtmStrategyType), strategyName, true); }
+                catch { return new { error = "unknown strategy: " + strategyName + ". Valid: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal" }; }
+            }
+            else
+            {
+                var profile = DynamicAtmManager.GetProfile(instrument.MasterInstrument.Name);
+                config.Type = profile != null ? profile.DefaultStrategy : AtmStrategyType.FixedTicks;
+            }
+
+            if (req["stopTicks"] != null) config.StopTicks = req["stopTicks"].Value<int>();
+            if (req["targetTicks"] != null) config.TargetTicks = req["targetTicks"].Value<int>();
+            if (req["stopLossTicks"] != null) config.StopTicks = req["stopLossTicks"].Value<int>();
+            if (req["takeProfitTicks"] != null) config.TargetTicks = req["takeProfitTicks"].Value<int>();
+            if (req["atrMultiplierSL"] != null) config.AtrMultiplierSL = req["atrMultiplierSL"].Value<double>();
+            if (req["atrMultiplierTP"] != null) config.AtrMultiplierTP = req["atrMultiplierTP"].Value<double>();
+            if (req["atrPeriod"] != null) config.AtrPeriod = req["atrPeriod"].Value<int>();
+            if (req["swingLookbackBars"] != null) config.SwingLookbackBars = req["swingLookbackBars"].Value<int>();
+            if (req["swingBufferTicks"] != null) config.SwingBufferTicks = req["swingBufferTicks"].Value<int>();
+            if (req["breakevenTriggerTicks"] != null) config.BreakevenTriggerTicks = req["breakevenTriggerTicks"].Value<int>();
+            if (req["breakevenOffsetTicks"] != null) config.BreakevenOffsetTicks = req["breakevenOffsetTicks"].Value<int>();
+            if (req["partialProfitPct"] != null) config.PartialProfitPct = req["partialProfitPct"].Value<double>();
+            if (req["trailMultiplier"] != null) config.TrailMultiplier = req["trailMultiplier"].Value<double>();
+            if (req["riskPerTrade"] != null) config.RiskPerTrade = req["riskPerTrade"].Value<double>();
+            if (req["kellyFraction"] != null) config.KellyFraction = req["kellyFraction"].Value<double>();
+            if (req["winRate"] != null) config.WinRate = req["winRate"].Value<double>();
+            if (req["avgRR"] != null) config.AvgRR = req["avgRR"].Value<double>();
+
+            var result = DynamicAtmManager.Instance.PlaceBracket(
+                account, instrument, action, quantity, config, currentPrice, tickSize, pointValue);
+
+            // Normalize to camelCase so the wire contract matches every other
+            // endpoint (BracketResult is a PascalCase POCO).
+            return new
+            {
+                status = result.Status,
+                bracketId = result.BracketId,
+                ocoId = result.OcoId,
+                entryOrderId = result.EntryOrderId,
+                stopOrderId = result.StopOrderId,
+                targetOrderId = result.TargetOrderId,
+                stopPrice = result.StopPrice,
+                targetPrice = result.TargetPrice,
+                calculatedQuantity = result.CalculatedQuantity,
+                strategyName = result.StrategyName,
+                note = result.Note,
+                error = result.Error
             };
-            // We cannot set stop/target prices from ticks alone without the fill price.
-            // Return the entry result with a note that the bracket must be attached
-            // manually or via /api/order/oco with explicit prices.
-            resultObj["isAtmBracket"] = false;
-            resultObj["bracketState"] = "EntryOnly_BracketRequiresPrices";
-            resultObj["note"] = "ATM entry submitted. Use /api/order/oco with stopPrice and targetPrice to attach the bracket after the entry fills.";
-            resultObj["stopLossTicks"] = stopLossTicks;
-            resultObj["takeProfitTicks"] = takeProfitTicks;
-            return resultObj;
+        }
+
+        private object GetAtmBracketStatus(string bracketId)
+        {
+            if (string.IsNullOrEmpty(bracketId))
+            {
+                var active = DynamicAtmManager.Instance.GetActiveBrackets();
+                return new { count = active.Count, brackets = active.Select(b => new
+                {
+                    bracketId = b.BracketId,
+                    symbol = b.Symbol,
+                    account = b.AccountName,
+                    isLong = b.IsLong,
+                    strategy = b.Config?.Type.ToString() ?? "Unknown",
+                    ageSeconds = (DateTime.UtcNow - b.CreatedAt).TotalSeconds,
+                    breakevenTriggered = b.BreakevenTriggered,
+                    partialProfitTaken = b.PartialProfitTaken
+                }).ToList() };
+            }
+            return DynamicAtmManager.Instance.GetBracketStatus(bracketId);
         }
 
         // ─────────────────────────────────────────────────────────────────────────
