@@ -29,7 +29,9 @@ using Newtonsoft.Json.Linq;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.Core;
 #endregion
 
@@ -37,7 +39,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 {
     public class McpBridgeAddOn : AddOnBase
     {
-        private const string Version = "1.5.0";
+        private const string Version = "1.5.2-chart-discovery";
 
         // Win32 capture helpers for chart windows that render on non-WPF threads (Direct2D).
         [DllImport("user32.dll", SetLastError = true)]
@@ -193,7 +195,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var expired = _idempotencyCache.Where(kv => kv.Value.Timestamp < cutoff).Select(kv => kv.Key).ToList();
                 foreach (var k in expired) _idempotencyCache.Remove(k);
 
-                if (_idempotencyCache.TryGetValue(idempotencyKey, out var record))
+                IdempotencyRecord record;
+                if (_idempotencyCache.TryGetValue(idempotencyKey, out record))
                 {
                     Log($"[IDEMPOTENCY] Cache hit for key={idempotencyKey}");
                     return record.Result;
@@ -241,6 +244,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
                 PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
+                // Load persisted stores for schedule, alerts, riskguard config, and trade journal
+                LoadJsonStore(ScheduledTasksFile, _scheduledTasks);
+                LoadJsonStore(AlertsFile, _alerts);
+                LoadJsonStore(RiskGuardConfigFile, _riskGuardConfig);
+                LoadJsonStore(TradeJournalFile, _tradeJournal);
 #if !TESTING
                 foreach (Account acc in Account.All)
                 {
@@ -329,7 +337,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try
                 {
                     var context = _listener.GetContext();
-                    ProcessRequest(context);
+                    // Dispatch each request to the ThreadPool so a blocking handler
+                    // (e.g. 180s backtest, 30s BarsRequest) does not stall all other
+                    // endpoints. The previous single-threaded loop serialized every
+                    // request — one slow call made the entire API unresponsive.
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ => ProcessRequest(context));
                 }
                 catch (HttpListenerException) { break; }
                 catch (Exception ex) { Log($"Error: {ex.Message}", LogLevel.Error); }
@@ -440,6 +452,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/order":              return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOrder(b)));
                 case "/api/order/oco":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOcoOrder(b)));
                 case "/api/order/atm":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceAtmOrder(b)));
+                case "/api/order/atm/status":   return GetAtmBracketStatus(query["bracketId"]);
                 case "/api/order/cancel":       return Post(method, () => ExecuteIdempotencyFromReq(body, b => CancelOrder(b)));
                 case "/api/order/change":       return Post(method, () => ExecuteIdempotencyFromReq(body, b => ChangeOrder(b)));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
@@ -459,9 +472,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
                 case "/api/strategy/param":     return Post(method, () => SetStrategyParam(body));
                 case "/api/strategy/inspect":   return InspectStrategy(query["name"]);
-                case "/api/logs":               return GetDiagnosticLogs(query["tab"] ?? "Output", int.TryParse(query["lines"], out var l) ? l : 100);
+                int l;
+                case "/api/logs":               return GetDiagnosticLogs(query["tab"] ?? "Output", int.TryParse(query["lines"], out l) ? l : 100);
                 case "/api/chart/capture":      return CaptureChart(query["symbol"]);
                 case "/api/chart/diag":         return ChartDiagnostics();
+                case "/api/chart/list":         return ListCharts();
                 case "/api/chart/snapshot":     return Post(method, () => ChartSnapshot(body));
                 case "/api/chart/trade":        return Post(method, () => TradeChart(body));
                 case "/api/chart/open":         return Post(method, () => OpenChart(body));
@@ -480,7 +495,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/schedule/task":      return Post(method, () => ScheduleTask(body));
                 case "/api/trades/journal":     return Post(method, () => TradeJournal(body));
                 case "/api/alert/create":       return Post(method, () => CreateAlert(body));
-                case "/api/riskguard/config":   return Post(method, () => RiskGuardConfig(body));
+                case "/api/riskguard/config":   return method == "GET" ? RiskGuardConfig(null) : Post(method, () => RiskGuardConfig(body));
                 case "/api/compliance/report":  return GetComplianceReport(query["account"]);
                 case "/api/orchestrator/multi-account": return Post(method, () => MultiAccountOrchestrator(body));
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
@@ -677,11 +692,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         // -
 
         private object _saWindow; // reused across backtests
+        private static readonly object _saLock = new object(); // serialize backtests (shared SA window)
 
         private const string SaNs = "NinjaTrader.Gui.NinjaScript.StrategyAnalyzer.";
 
         private object Backtest(string body)
         {
+            // Backtests share a single Strategy Analyzer window (_saWindow).
+            // With concurrent request dispatch, two backtests running simultaneously
+            // would conflict. Lock here so only one backtest runs at a time; other
+            // request types (health, quote, orders, etc.) remain fully concurrent.
+            lock (_saLock)
+            {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             string strategy = req.Str("strategy");
             string symbol = req.Str("symbol");
@@ -793,6 +815,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
             disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades); }));
             return report;
+            } // end lock(_saLock)
         }
 
         // DEV: walk the SA window's logical tree and report every DateTime-valued property,
@@ -1088,7 +1111,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     {
                         if (et < firstEntry) firstEntry = et;
                         var ekey = et.Ticks + "|" + SafeToString(GetP(entryExec, "MarketPosition"));
-                        entryPnl[ekey] = (entryPnl.TryGetValue(ekey, out var pv) ? pv : 0) + pcd;
+                        double pv;
+                        entryPnl[ekey] = (entryPnl.TryGetValue(ekey, out pv) ? pv : 0) + pcd;
                     }
                     if (GetP(exitExec, "Time") is DateTime xt && xt > lastExit) lastExit = xt;
                     // Exit-reason tally: the exit order's signal name ("bank","runner","flat","time",
@@ -1097,7 +1121,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (string.IsNullOrWhiteSpace(xname) || xname == "<toString threw>")
                         xname = SafeToString(GetP(GetP(exitExec, "Order"), "Name"));
                     if (!string.IsNullOrWhiteSpace(xname))
-                        exitReasons[xname] = (exitReasons.TryGetValue(xname, out var xc) ? xc : 0) + 1;
+                    {
+                        int xc;
+                        exitReasons[xname] = (exitReasons.TryGetValue(xname, out xc) ? xc : 0) + 1;
+                    }
                     if (trades.Count >= maxTrades) continue;   // still count the rest
                     trades.Add(new
                     {
@@ -1175,25 +1202,71 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             if (o == null) return null;
             var t = o.GetType();
-            return t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(o)
-                   ?? t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(o);
+            var p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (p != null && p.GetIndexParameters().Length == 0)
+            {
+                try { return p.GetValue(o); }
+                catch { /* indexer or access threw */ }
+            }
+            var f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (f != null)
+            {
+                try { return f.GetValue(o); } catch { }
+            }
+            return null;
         }
         private static void SetP(object o, string name, object val)
         {
             var pi = o.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (pi != null)
+            if (pi != null && pi.GetIndexParameters().Length == 0)
             {
-                if (val != null && !pi.PropertyType.IsInstanceOfType(val))
-                    try { val = pi.PropertyType.IsEnum ? Enum.ToObject(pi.PropertyType, Convert.ToInt64(val)) : Convert.ChangeType(val, pi.PropertyType); } catch { }
-                pi.SetValue(o, val);
+                try
+                {
+                    if (val != null && !pi.PropertyType.IsInstanceOfType(val))
+                        try { val = pi.PropertyType.IsEnum ? Enum.ToObject(pi.PropertyType, Convert.ToInt64(val)) : Convert.ChangeType(val, pi.PropertyType); } catch { }
+                    pi.SetValue(o, val);
+                    return;
+                }
+                catch { /* indexer or access threw */ }
             }
-            else o.GetType().GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.SetValue(o, val);
+            var fi = o.GetType().GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (fi != null)
+            {
+                try { fi.SetValue(o, val); } catch { }
+            }
         }
         private static object InvokeM(object o, string name, params object[] args)
         {
-            var m = o.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                     .FirstOrDefault(x => x.Name == name && x.GetParameters().Length == (args?.Length ?? 0));
-            return m?.Invoke(o, args);
+            var methods = o.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                           .Where(x => x.Name == name && x.GetParameters().Length == (args?.Length ?? 0)).ToList();
+            if (methods.Count == 0)
+                throw new Exception($"method not found: {o.GetType().FullName}.{name}/{args?.Length ?? 0}");
+            var best = methods.Count == 1 ? methods[0] : FindBestOverload(methods, args);
+            if (best == null)
+                throw new Exception($"no compatible overload for {o.GetType().FullName}.{name}/{args?.Length ?? 0}");
+            return best.Invoke(o, args);
+        }
+
+        private static MethodInfo FindBestOverload(List<MethodInfo> methods, object[] args)
+        {
+            MethodInfo best = null; int bestScore = -1;
+            foreach (var m in methods)
+            {
+                var ps = m.GetParameters(); int score = 0; bool ok = true;
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    var a = args[i]; var p = ps[i].ParameterType;
+                    if (a == null) { if (p.IsValueType) { ok = false; break; } continue; }
+                    if (p.IsInstanceOfType(a)) score += 2;
+                    else if (a is IConvertible && (p.IsPrimitive || p.IsEnum))
+                    {
+                        try { Convert.ChangeType(a, p); score += 1; } catch { ok = false; break; }
+                    }
+                    else { ok = false; break; }
+                }
+                if (ok && score > bestScore) { bestScore = score; best = m; }
+            }
+            return best;
         }
 
         // -
@@ -1226,7 +1299,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             var ops = req["ops"] as JArray ?? new JArray();
 
             // WPF objects (windows, viewmodels) must be touched on the UI dispatcher.
-            // Pass "ui": true to run the whole op batch on it.
+            // Pass "ui": true to run the whole op batch on the app dispatcher (for
+            // Control Center / SA window objects that live on thread 1).
+            // Pass "dispatcher": "auto" to resolve the target object's own dispatcher
+            // per-op (for chart-owned objects that live on thread 18/19).
             if (req.Bool("ui", false))
             {
                 var disp = System.Windows.Application.Current?.Dispatcher;
@@ -1241,6 +1317,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private object RunOps(JArray ops)
         {
             var results = new List<object>();
+            // Clear the handle registry at the start of each batch so handles
+            // from a previous dev/reflect call don't accumulate (memory leak).
+            lock (_handles) { _handles.Clear(); }
             _batchHandles = new List<string>();
             foreach (var opTok in ops)
             {
@@ -1391,6 +1470,27 @@ namespace NinjaTrader.NinjaScript.AddOns
             var flags = BindingFlags.Public | BindingFlags.NonPublic | (isStatic ? BindingFlags.Static : BindingFlags.Instance);
             var candidates = t.GetMethods(flags).Where(m => m.Name == name && m.GetParameters().Length == (args?.Length ?? 0)).ToList();
             if (candidates.Count == 0) throw new Exception($"method not found: {t.FullName}.{name}/{args?.Length ?? 0}");
+            if (candidates.Count > 1 && args != null)
+            {
+                MethodInfo best = null; int bestScore = -1;
+                foreach (var c in candidates)
+                {
+                    var ps = c.GetParameters(); int score = 0; bool ok = true;
+                    for (int i = 0; i < ps.Length; i++)
+                    {
+                        var a = args[i]; var p = ps[i].ParameterType;
+                        if (a == null) { if (p.IsValueType) { ok = false; break; } continue; }
+                        if (p.IsInstanceOfType(a)) score += 2;
+                        else if (a is IConvertible && (p.IsPrimitive || p.IsEnum))
+                        {
+                            try { Convert.ChangeType(a, p); score += 1; } catch { ok = false; break; }
+                        }
+                        else { ok = false; break; }
+                    }
+                    if (ok && score > bestScore) { bestScore = score; best = c; }
+                }
+                if (best != null) return best;
+            }
             return candidates[0];
         }
 
@@ -1424,19 +1524,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return null;
                 }
 
-                var refId = GetMeta("$ref");
-                if (refId != null) return _handles.TryGetValue(refId, out var h) ? h : throw new Exception($"no handle {refId}");
+                // Support both Json.NET $-style metadata and Python-safe aliases.
+                var refId = GetMeta("$ref") ?? GetMeta("ref");
+                object h;
+                if (refId != null) return _handles.TryGetValue(refId, out h) ? h : throw new Exception($"no handle {refId}");
 
-                var resultIdx = GetMeta("$result");
+                var resultIdx = GetMeta("$result") ?? GetMeta("result");
                 if (resultIdx != null)
                 {
                     int n = int.Parse(resultIdx);
                     var hid = (_batchHandles != null && n >= 0 && n < _batchHandles.Count) ? _batchHandles[n] : null;
-                    if (hid == null || !_handles.TryGetValue(hid, out var hv)) throw new Exception($"$result {n} is not a handle");
+                    object hv;
+                    if (hid == null || !_handles.TryGetValue(hid, out hv)) throw new Exception($"$result {n} is not a handle");
                     return hv;
                 }
 
-                var enumStr = GetMeta("$enum");
+                var enumStr = GetMeta("$enum") ?? GetMeta("enum");
                 if (enumStr != null)
                 {
                     var idx = enumStr.LastIndexOf('.');
@@ -1444,7 +1547,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return Enum.Parse(et, enumStr.Substring(idx + 1));
                 }
 
-                var typeStr = GetMeta("$type");
+                var typeStr = GetMeta("$type") ?? GetMeta("type");
                 if (typeStr != null)
                 {
                     var target = ResolveType(new JObject { ["type"] = typeStr, ["assembly"] = GetMeta("assembly") });
@@ -1452,7 +1555,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return Convert.ChangeType((valTok is JValue jv ? jv.Value : valTok), target);
                 }
 
-                var strlistTok = GetToken("$strlist");
+                var strlistTok = GetToken("$strlist") ?? GetToken("strlist");
                 if (strlistTok != null) return strlistTok.Select(x => x.ToString()).ToList();
 
                 // Any remaining JObject that didn't match $ref/$result/$enum/$type/$strlist returns null;
@@ -1613,27 +1716,30 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (stratType == null) return new { error = "strategy type not found (compiled?): " + stratName };
 
             object result = null; Exception err = null;
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
-            disp.Invoke((Action)(() =>
+
+            // FindChartControl already marshals to each chart window's own dispatcher
+            // internally and returns the live ChartControl.  We must then use that
+            // ChartControl's OWN dispatcher (not the app dispatcher) for any calls on
+            // it, because each NT8 chart lives on its own thread (18/19, not thread 1).
+            object ccFound, cbFound;
+            if (!FindChartControl(instrument, out ccFound, out cbFound) || ccFound == null || cbFound == null)
+            {
+                return new
+                {
+                    status = "best_effort",
+                    error = $"could not access a chart control for '{instrument}'. NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Open a chart for this instrument manually via the Control Center shortcut Ctrl+Shift+N, then call deploy again. Deploy can attach to a chart that already has at least one strategy on this instrument; if the chart is strategy-less, attach the first strategy via the chart's Strategies dialog."
+                };
+            }
+
+            var chartDisp = (ccFound as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+            if (chartDisp == null) return new { error = "no chart dispatcher available" };
+
+            chartDisp.Invoke((Action)(() =>
             {
                 try
                 {
-                    object cc, cb;
-                    if (!FindChartControl(instrument, out cc, out cb) || cc == null || cb == null)
-                    {
-                        // NT8 does not expose a supported API to create a chart window from an
-                        // AddOn. Return an honest best_effort response that tells the caller to
-                        // open the chart manually (Control Center: Ctrl+Shift+N, type the symbol)
-                        // and then call deploy again. If a matching chart is already open, the
-                        // improved FindChartControl above should have found it.
-                        result = new
-                        {
-                            status = "best_effort",
-                            error = $"could not access a chart control for '{instrument}'. NinjaTrader 8 does not expose a public API to open a chart from an AddOn. Open a chart for this instrument manually via the Control Center shortcut Ctrl+Shift+N, then call deploy again. Deploy can attach to a chart that already has at least one strategy on this instrument; if the chart is strategy-less, attach the first strategy via the chart's Strategies dialog."
-                        };
-                        return;
-                    }
+                    var cc = ccFound;
+                    var cb = cbFound;
 
                     var strat = Activator.CreateInstance(stratType);   // ctor runs SetDefaults
                     SetP(strat, "Account", account);
@@ -1672,58 +1778,67 @@ namespace NinjaTrader.NinjaScript.AddOns
             string accountName = req.Str("account");
             bool flatten = req["flatten"] == null || (bool)req["flatten"];
             var stopped = new List<object>(); Exception err = null;
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
-            disp.Invoke((Action)(() =>
+
+            // Strategy clones hold a reference to their ChartControl, which lives on
+            // the chart window's own dispatcher thread (18/19), not the app dispatcher
+            // (thread 1).  We must marshal chart-control access to the correct thread.
+            // First, collect matching clones and their accounts from Account.All
+            // (which is safe to read from any thread).
+            var clonesToStop = new List<object[]>();
+            foreach (Account a in Account.All)
             {
-                try
+                if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
+                foreach (var s in a.Strategies)
+                    if (s != null && (string.IsNullOrEmpty(stratName) || s.GetType().Name == stratName))
+                        clonesToStop.Add(new object[] { s, a });
+            }
+
+            foreach (var entry in clonesToStop)
+            {
+                var clone = entry[0];
+                var acct = (Account)entry[1];
+                var cc = GetMember(clone, "ChartControl");
+                if (cc == null) continue;
+                var chartDisp = (cc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (chartDisp == null) continue;
+                chartDisp.Invoke((Action)(() =>
                 {
-                    foreach (Account a in Account.All)
+                    try
                     {
-                        if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
-                        // snapshot running clones first (we mutate the collection)
-                        var clones = new List<object>();
-                        foreach (var s in a.Strategies)
-                            if (s != null && (string.IsNullOrEmpty(stratName) || s.GetType().Name == stratName)) clones.Add(s);
-                        foreach (var clone in clones)
+                        // the chart holds the TEMPLATE (same Id as the running clone)
+                        object template = null;
+                        var col = GetMember(cc, "Strategies") as System.Collections.IEnumerable;
+                        var cloneId = GetMember(clone, "Id");
+                        if (col != null)
+                            foreach (var tmpl in col)
+                                if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
+                        if (template == null) template = clone;
+                        var posObj = GetMember(clone, "Position");
+                        var posBefore = GetMember(posObj, "MarketPosition")?.ToString();
+                        int posQty = 0; try { posQty = Convert.ToInt32(GetMember(posObj, "Quantity")); } catch { }
+                        var instr = GetMember(clone, "Instrument") as Instrument;
+                        try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
+                        try { SetP(template, "IsEnabled", false); } catch { }
+                        try { InvokeM(col, "Remove", template); } catch { }
+                        // Auto-flatten THIS strategy's own position with an offsetting market
+                        // order (strategy-sized, so it won't zero another strategy's net).
+                        string flattenResult = "none";
+                        if (flatten && instr != null && posQty > 0 && (posBefore == "Long" || posBefore == "Short"))
                         {
-                            var cc = GetMember(clone, "ChartControl");
-                            if (cc == null) continue;
-                            // the chart holds the TEMPLATE (same Id as the running clone)
-                            object template = null;
-                            var col = GetMember(cc, "Strategies") as System.Collections.IEnumerable;
-                            var cloneId = GetMember(clone, "Id");
-                            if (col != null)
-                                foreach (var tmpl in col)
-                                    if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
-                            if (template == null) template = clone;
-                            var posObj = GetMember(clone, "Position");
-                            var posBefore = GetMember(posObj, "MarketPosition")?.ToString();
-                            int posQty = 0; try { posQty = Convert.ToInt32(GetMember(posObj, "Quantity")); } catch { }
-                            var instr = GetMember(clone, "Instrument") as Instrument;
-                            try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
-                            try { SetP(template, "IsEnabled", false); } catch { }
-                            try { InvokeM(col, "Remove", template); } catch { }
-                            // Auto-flatten THIS strategy's own position with an offsetting market
-                            // order (strategy-sized, so it won't zero another strategy's net).
-                            string flattenResult = "none";
-                            if (flatten && instr != null && posQty > 0 && (posBefore == "Long" || posBefore == "Short"))
+                            try
                             {
-                                try
-                                {
-                                    var act = posBefore == "Long" ? OrderAction.Sell : OrderAction.Buy;
-                                    var o = a.CreateOrder(instr, act, OrderType.Market, TimeInForce.Day, posQty, 0, 0, string.Empty, "McpFlatten", null);
-                                    a.Submit(new[] { o });
-                                    flattenResult = act + " " + posQty + " market";
-                                }
-                                catch (Exception fex) { flattenResult = "FAILED: " + fex.Message; }
+                                var act = posBefore == "Long" ? OrderAction.Sell : OrderAction.Buy;
+                                var o = acct.CreateOrder(instr, act, OrderType.Market, TimeInForce.Day, posQty, 0, 0, string.Empty, "McpFlatten", null);
+                                acct.Submit(new[] { o });
+                                flattenResult = act + " " + posQty + " market";
                             }
-                            stopped.Add(new { strategy = clone.GetType().Name, account = a.Name, positionAtStop = posBefore, flatten = flattenResult });
+                            catch (Exception fex) { flattenResult = "FAILED: " + fex.Message; }
                         }
+                        stopped.Add(new { strategy = clone.GetType().Name, account = acct.Name, positionAtStop = posBefore, flatten = flattenResult });
                     }
-                }
-                catch (Exception ex) { err = ex; }
-            }));
+                    catch (Exception ex) { err = ex; }
+                }));
+            }
             if (err != null) return new { error = "stop failed: " + err.Message, stack = err.StackTrace };
             return new { stoppedCount = stopped.Count, stopped,
                          note = "disabled + removed from chart; open positions auto-flattened via an offsetting market order when flatten=true (default)" };
@@ -1788,7 +1903,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string wantName = want?.FullName;
             string wantMaster = want?.MasterInstrument?.Name;
 
-            // (a) via a running strategy
+            // (a) via a running strategy (safe to read from any thread).
             foreach (Account a in Account.All)
                 foreach (var s in a.Strategies)
                 {
@@ -1802,53 +1917,67 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (cb != null) return true;
                 }
 
-            // (b) via chart windows — Globals.AllWindows is the authoritative NT8 window
-            // list; fall back to Application.Current.Windows if it is unavailable.
-            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (windows == null)
+            // (b) via chart windows.  Each Chart window lives on its own WPF dispatcher,
+            // so we enumerate Globals.AllWindows on the main dispatcher, then marshal
+            // per-window inspection to that window's own dispatcher.
+            var appDispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (appDispatcher == null) return false;
+
+            var chartWindows = new List<System.Windows.Window>();
+            // No-timeout Invoke((Action)) -- the 3-arg overload with a TimeSpan returns
+            // without running the delegate if thread 1 is momentarily busy, and Background
+            // priority is below input/normal so it can be starved by chart rendering.
+            appDispatcher.Invoke((Action)(() =>
             {
-                try { windows = System.Windows.Application.Current.Windows; } catch { }
-            }
-
-            if (windows != null)
-                foreach (var w in windows)
+                try
                 {
-                    if (w == null) continue;
-                    var wType = w.GetType();
-                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
-
-                    var ccList = new List<object>();
-                    var active = GetMember(w, "ActiveChartControl");   // works for the focused chart
-                    if (active != null) ccList.Add(active);
-
-                    // Multi-tab charts: the private field is named "tabControl".
-                    var mainTab = GetMember(w, "tabControl");
-                    var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
-                    if (items != null)
-                        foreach (var tab in items)
-                        {
-                            var content = GetMember(tab, "Content");
-                            if (content == null) continue;
-                            if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") ccList.Add(content);
-                            var chartTab = GetMember(content, "ChartControl");
-                            if (chartTab != null) ccList.Add(chartTab);
-                            if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, ccList, new HashSet<object>(), 0);
-                        }
-
-                    // Fallback: walk the window's own visual tree (covers floating/minimized
-                    // charts whose ActiveChartControl/tabControl are null or stale).
-                    if (w is System.Windows.DependencyObject dcoWin && !ccList.Any())
-                        CollectChartControls(dcoWin, ccList, new HashSet<object>(), 0);
-
-                    foreach (var c in ccList)
+                    System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                    if (windows == null)
                     {
-                        var cInstr = GetMember(c, "Instrument") as Instrument;
-                        if (!InstrumentMatches(cInstr, wantName)
-                            && !(wantMaster != null && InstrumentMatches(cInstr, wantMaster))) continue;
-                        var first = FirstBars(c);
-                        if (first != null) { cc = c; cb = first; return true; }
+                        try { windows = System.Windows.Application.Current.Windows; } catch { }
+                    }
+                    if (windows == null) return;
+                    foreach (var w in windows)
+                    {
+                        if (w == null) continue;
+                        var wType = w.GetType();
+                        if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                        chartWindows.Add(w as System.Windows.Window);
                     }
                 }
+                catch { }
+            }));
+
+            object foundCc = null, foundCb = null;
+            foreach (var win in chartWindows)
+            {
+                if (win == null) continue;
+                var winDispatcher = (win as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (winDispatcher == null) continue;
+
+                bool matched = false;
+                // Marshal to the chart window's OWN dispatcher (NT8 gives each chart its own
+                // thread) and use the no-timeout overload so a busy chart thread doesn't fail
+                // the lookup.
+                winDispatcher.Invoke((Action)(() =>
+                {
+                    try
+                    {
+                        var controls = new List<object>();
+                        CollectChartControlsFromWindow(win, controls);
+                        foreach (var c in controls)
+                        {
+                            var cInstr = GetMember(c, "Instrument") as Instrument;
+                            if (!InstrumentMatches(cInstr, wantName)
+                                && !(wantMaster != null && InstrumentMatches(cInstr, wantMaster))) continue;
+                            var first = FirstBars(c);
+                            if (first != null) { foundCc = c; foundCb = first; matched = true; return; }
+                        }
+                    }
+                    catch { }
+                }));
+                if (matched) { cc = foundCc; cb = foundCb; return true; }
+            }
             return false;
         }
 
@@ -1872,6 +2001,120 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return string.Equals(chartInstr.MasterInstrument?.Name, wantMaster, StringComparison.OrdinalIgnoreCase);
             }
             catch { return false; }
+        }
+
+        // Enumerate all open chart windows and their instruments.  Each chart window
+        // owns its own WPF dispatcher, so we inspect each window on its own thread.
+        // Returns a list of { windowType, title, instrumentFullName, instrumentMaster,
+        // isActive, isVisible, actualSize, dispatcherThreadId, error }.
+        private List<object> ListOpenCharts()
+        {
+            var result = new List<object>();
+            var appDispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (appDispatcher == null) return result;
+
+            var chartWindows = new List<object>();
+            bool enumRan = false; string enumError = null;
+            Action enumAction = () =>
+            {
+                enumRan = true;
+                try
+                {
+                    System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                    if (windows == null)
+                    {
+                        try { windows = System.Windows.Application.Current.Windows; } catch { }
+                    }
+                    if (windows == null) { enumError = "AllWindows is null"; return; }
+                    foreach (var w in windows)
+                    {
+                        if (w == null) continue;
+                        var wType = w.GetType();
+                        if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                        chartWindows.Add(w);
+                    }
+                }
+                catch (Exception ex) { enumError = ex.Message; }
+            };
+            // If we're already on the UI thread, run inline (Invoke would deadlock).
+            // Use the no-timeout Invoke((Action)) overload: NT8's main UI dispatcher (thread 1)
+            // is responsive (dev/reflect ui:true completes in <50ms) but the 3-arg overload
+            // with a TimeSpan timeout returns without running the delegate if thread 1 is
+            // momentarily busy, producing a false "timed out" / 0-chart-windows result.
+            // Additionally, each Chart window lives on its OWN dispatcher thread (NT8 spawns
+            // a dedicated thread per chart window), so per-window property reads must be
+            // marshaled to that window's Dispatcher -- not Application.Current.Dispatcher.
+            var enumSw = System.Diagnostics.Stopwatch.StartNew();
+            if (appDispatcher.CheckAccess()) enumAction();
+            else appDispatcher.Invoke((Action)(enumAction));
+            enumSw.Stop();
+            if (!enumRan) enumError = "appDispatcher.Invoke did not run the delegate after " + enumSw.ElapsedMilliseconds + "ms";
+            if (chartWindows.Count == 0)
+                result.Add(new { windowType = "enumeration", error = enumError ?? ("enumRan=" + enumRan + " but 0 chart windows found"), chartWindowCount = chartWindows.Count, appDispatcherThread = appDispatcher.Thread?.ManagedThreadId });
+
+            foreach (var w in chartWindows)
+            {
+                var wType = w.GetType();
+                string title = null; string instrFull = null; string instrMaster = null; string error = null;
+                bool? isActive = null, isVisible = null; double? actualW = null, actualH = null; int? dispatcherThreadId = null;
+                bool invokeRan = false;
+
+                var winDispatcher = (w as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (winDispatcher != null)
+                {
+                    dispatcherThreadId = winDispatcher.Thread?.ManagedThreadId;
+                    Action winAction = () =>
+                    {
+                        invokeRan = true;
+                        try
+                        {
+                            title = GetMember(w, "Title")?.ToString();
+                            var win = w as System.Windows.Window;
+                            isActive = win?.IsActive;
+                            isVisible = win?.IsVisible;
+                            actualW = win?.ActualWidth;
+                            actualH = win?.ActualHeight;
+                            var controls = new List<object>();
+                            CollectChartControlsFromWindow(w, controls);
+                            foreach (var c in controls)
+                            {
+                                var ci = GetMember(c, "Instrument") as Instrument;
+                                if (ci != null)
+                                {
+                                    instrFull = ci.FullName;
+                                    instrMaster = ci.MasterInstrument?.Name;
+                                    break;
+                                }
+                            }
+                        }
+                        catch (Exception ex) { error = ex.Message + " | " + ex.InnerException?.Message; }
+                    };
+                    var winSw = System.Diagnostics.Stopwatch.StartNew();
+                    if (winDispatcher.CheckAccess()) winAction();
+                    else winDispatcher.Invoke((Action)(winAction));
+                    winSw.Stop();
+                    if (!invokeRan) error = "winDispatcher.Invoke did not run the delegate after " + winSw.ElapsedMilliseconds + "ms";
+                }
+                else
+                {
+                    error = "no dispatcher";
+                }
+
+                result.Add(new
+                {
+                    windowType = wType.FullName,
+                    title,
+                    instrumentFullName = instrFull,
+                    instrumentMaster = instrMaster,
+                    isActive,
+                    isVisible,
+                    actualSize = (actualW.HasValue && actualH.HasValue) ? actualW + "x" + actualH : null,
+                    dispatcherThreadId,
+                    invokeRan,
+                    error
+                });
+            }
+            return result;
         }
 
         // Find a compiled NinjaScript strategy Type by class name across loaded assemblies.
@@ -2005,10 +2248,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
             }
 
-            // Reject order if account is locked out by RiskGuard
-            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+            // Reject order if account is locked out by RiskGuard or by EmergencyFlatten lockout.
+            if (IsAccountLocked(account.Name))
             {
-                return new { error = $"Order blocked: Account {account.Name} is locked out by Risk Guard." };
+                return new { error = $"Order blocked: Account {account.Name} is locked out." };
             }
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
@@ -2071,6 +2314,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
                 return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
+            if (IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
@@ -2102,6 +2347,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
 
             // Submit all valid orders safely
+            List<string> rejectedOrders = new List<string>();
             try
             {
                 var validOrders = new[] { entryOrder, stopOrder, targetOrder }
@@ -2111,6 +2357,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     account.Submit(validOrders);
                 }
+                // Check for rejected exit orders (NT8 may reject OCO children if no
+                // position exists yet). Report the rejection so callers know the
+                // bracket may not be live.
+                foreach (var o in new[] { stopOrder, targetOrder })
+                {
+                    if (o != null && (o.OrderState == OrderState.Rejected || o.OrderState == OrderState.Cancelled))
+                        rejectedOrders.Add(o.Name + " state=" + o.OrderState);
+                }
             }
             catch (Exception ex)
             {
@@ -2119,11 +2373,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             return new
             {
-                status = "submitted",
+                status = rejectedOrders.Count > 0 ? "partial_submit" : "submitted",
                 ocoId = ocoId,
                 entry = new { id = entryOrder.Id.ToString(), name = entryOrder.Name },
-                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice },
-                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice }
+                stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice, state = stopOrder.OrderState.ToString() },
+                target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice, state = targetOrder.OrderState.ToString() },
+                rejectedExitOrders = rejectedOrders.Count > 0 ? rejectedOrders : null,
+                note = rejectedOrders.Count > 0 ? "Some exit orders were rejected (NT8 may reject OCO children without an open position). Verify position before relying on the bracket." : null
             };
         }
 
@@ -2225,7 +2481,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             int cancelledOrdersCount = 0;
             bool positionClosed = false;
 
-            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
+            dispatcher.Invoke(() =>
             {
                 foreach (Account account in Account.All)
                 {
@@ -2233,10 +2491,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                         continue;
 
                     string rootSymbol = symbol.Equals("ALL", StringComparison.OrdinalIgnoreCase) ? "" : symbol.Split(' ')[0];
+                    bool filterBySymbol = !string.IsNullOrEmpty(rootSymbol);
 
-                    // 1. Cancel working orders
+                    // 1. Cancel working orders for the requested symbol only
                     var toCancel = account.Orders
-                        .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled)
+                        .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled
+                                    && (!filterBySymbol || (o.Instrument != null && o.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase))))
                         .ToList();
                     if (toCancel.Count > 0)
                     {
@@ -2244,33 +2504,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                         cancelledOrdersCount += toCancel.Count;
                     }
 
-                    // 2. Flatten active positions
+                    // 2. Flatten active positions for the requested symbol only
                     foreach (Position pos in account.Positions)
                     {
-                        if (pos.Instrument != null && pos.MarketPosition != MarketPosition.Flat)
+                        if (pos.Instrument == null || pos.MarketPosition == MarketPosition.Flat) continue;
+                        if (filterBySymbol && !pos.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase)) continue;
+                        try
                         {
-                            try
-                            {
-                                account.Flatten(new[] { pos.Instrument });
-                                positionClosed = true;
-                            }
-                            catch
-                            {
-                                var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
-                                var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
-                                account.Submit(new[] { closeOrder });
-                                positionClosed = true;
-                            }
+                            account.Flatten(new[] { pos.Instrument });
+                            positionClosed = true;
+                        }
+                        catch
+                        {
+                            var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                            var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
+                            account.Submit(new[] { closeOrder });
+                            positionClosed = true;
                         }
                     }
-
-                    if (account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { account.Flatten(account.Positions.Select(p => p.Instrument).ToList()); } catch {}
-                    }
-
-
-
                 }
             });
 
@@ -2367,8 +2618,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             int periodValue = req["periodValue"] != null ? (int)req["periodValue"] : 1;
             int timeoutSec = req["timeoutSec"] != null ? (int)req["timeoutSec"] : 180;
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
-            if (!DateTime.TryParse(req.Str("from"), out var from)) return new { error = "from (YYYY-MM-DD) required" };
-            if (!DateTime.TryParse(req.Str("to"), out var to)) to = DateTime.Now;
+            DateTime from;
+            if (!DateTime.TryParse(req.Str("from"), out from)) return new { error = "from (YYYY-MM-DD) required" };
+            DateTime to;
+            if (!DateTime.TryParse(req.Str("to"), out to)) to = DateTime.Now;
 
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
@@ -2493,22 +2746,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                 foreach (var prop in strategyType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
                 {
                     if (!prop.CanRead || !prop.CanWrite) continue;
-                    if (prop.DeclaringType != null && prop.DeclaringType != strategyType && prop.DeclaringType.Name.Contains("StrategyBase")) continue;
+                    // Include inherited StrategyBase properties — these ARE the user-settable inputs
+                    // (Qty, StopLoss, TakeProfit, AllowLong, etc.) that /api/strategy/param sets.
 
                     string desc = "";
                     var descAttr = prop.GetCustomAttributes(typeof(System.ComponentModel.DescriptionAttribute), true).FirstOrDefault() as System.ComponentModel.DescriptionAttribute;
                     if (descAttr != null) desc = descAttr.Description;
+
+                    // Check if this property is a NinjaScript input (decorated with NinjaScriptProperty)
+                    bool isInput = prop.IsDefined(typeof(NinjaTrader.NinjaScript.NinjaScriptPropertyAttribute), true);
 
                     props.Add(new
                     {
                         name = prop.Name,
                         type = prop.PropertyType.Name,
                         description = desc,
-                        canWrite = prop.CanWrite
+                        canWrite = prop.CanWrite,
+                        isInput = isInput
                     });
                 }
 
-                return new { success = true, strategy = strategyType.FullName, properties = props };
+                // Also enumerate fields decorated with NinjaScriptProperty (some inputs are fields)
+                var inputs = new List<object>();
+                foreach (var field in strategyType.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    bool isInput = field.IsDefined(typeof(NinjaTrader.NinjaScript.NinjaScriptPropertyAttribute), true);
+                    if (isInput)
+                        inputs.Add(new { name = field.Name, type = field.FieldType.Name });
+                }
+
+                return new { success = true, strategy = strategyType.FullName, properties = props, inputs = inputs };
             }
             catch (Exception ex)
             {
@@ -2559,93 +2826,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        private object ListCharts()
+        {
+            var charts = ListOpenCharts();
+            return new { success = true, count = charts.Count, charts };
+        }
+
         private object ChartDiagnostics()
         {
             var diag = new Dictionary<string, object>();
-            var titles = new List<string>();
-            var typeNames = new List<string>();
-            var allWindowsTypes = new List<string>();
-            var memberInfo = new List<string>();
-            var firstChartDetails = new Dictionary<string, object>();
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            diag["dispatcher_null"] = dispatcher == null;
+            diag["dispatcher_checkaccess"] = dispatcher?.CheckAccess();
 
-            SafeDispatch(() =>
-            {
-                try
-                {
-                    var app = System.Windows.Application.Current;
-                    diag["application_current_null"] = app == null;
-                    if (app != null)
-                    {
-                        diag["application_windows_count"] = app.Windows.Count;
-                        foreach (System.Windows.Window w in app.Windows)
-                        {
-                            if (w == null) continue;
-                            string title = null;
-                            try { title = w.Title; } catch { }
-                            titles.Add($"{w.GetType().FullName}|Title={title}|Visibility={w.Visibility}|State={w.WindowState}|IsActive={w.IsActive}|IsVisible={w.IsVisible}|Actual={w.ActualWidth}x{w.ActualHeight}");
-                        }
-                    }
-                }
-                catch (Exception ex) { diag["application_current_error"] = ex.Message; }
+            var charts = ListOpenCharts();
+            diag["openCharts"] = charts;
+            diag["openChartCount"] = charts.Count;
 
-                try
-                {
-                    var all = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-                    if (all != null)
-                    {
-                        int n = 0;
-                        foreach (var w in all)
-                        {
-                            n++;
-                            if (w != null)
-                            {
-                                string tname = w.GetType().FullName;
-                                allWindowsTypes.Add(tname);
-                                if (tname.Contains("Chart"))
-                                {
-                                    string title = null;
-                                    try { title = GetMember(w, "Title")?.ToString(); } catch { }
-                                    var active = GetMember(w, "ActiveChartControl");
-                                    var win = w as System.Windows.Window;
-                                    typeNames.Add($"{tname}|Title={title}|ActiveChartControl={active != null}|IsActive={win?.IsActive}|IsVisible={win?.IsVisible}|Actual={win?.ActualWidth}x{win?.ActualHeight}");
-
-                                    if (firstChartDetails.Count == 0)
-                                    {
-                                        var t = w.GetType();
-                                        firstChartDetails["type"] = t.FullName;
-                                        firstChartDetails["base"] = t.BaseType?.FullName;
-                                        var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
-                                            .Where(p => p.Name.Contains("Chart") || p.Name.Contains("Active") || p.Name.Contains("Control") || p.Name.Contains("Tab"))
-                                            .Select(p => $"{p.Name} ({p.PropertyType.Name})").ToList();
-                                        var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                                            .Where(f => f.Name.Contains("chart") || f.Name.Contains("tab") || f.Name.Contains("control"))
-                                            .Select(f => $"{f.Name} ({f.FieldType.Name})").ToList();
-                                        firstChartDetails["props"] = props;
-                                        firstChartDetails["fields"] = fields;
-                                        try { firstChartDetails["activeChartControl_type"] = active?.GetType().FullName; } catch { }
-                                    }
-                                }
-                            }
-                        }
-                        diag["allwindows_count"] = n;
-                    }
-                    else diag["allwindows_count"] = -1;
-                }
-                catch (Exception ex) { diag["allwindows_error"] = ex.Message; }
-
-                try
-                {
-                    var dispatcher = System.Windows.Application.Current?.Dispatcher;
-                    diag["dispatcher_null"] = dispatcher == null;
-                    if (dispatcher != null) diag["dispatcher_checkaccess"] = dispatcher.CheckAccess();
-                }
-                catch (Exception ex) { diag["dispatcher_error"] = ex.Message; }
-            }, 5000);
-
-            diag["application_window_titles"] = titles;
-            diag["allwindows_chart_types"] = typeNames;
-            diag["allwindows_types"] = allWindowsTypes;
-            diag["first_chart_details"] = firstChartDetails;
             return new { success = true, diag };
         }
 
@@ -2853,32 +3050,42 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static extern bool NativeStretchBlt(IntPtr hdcDest, int nXOriginDest, int nYOriginDest, int nWidthDest, int nHeightDest,
             IntPtr hdcSrc, int nXOriginSrc, int nYOriginSrc, int nWidthSrc, int nHeightSrc, uint dwRop);
 
-        // Return the first open chart window we can find.
+        // Return the first open chart window we can find. Must run on the WPF dispatcher.
         private System.Windows.Window FindAnyChartWindow()
         {
-            foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
+            System.Windows.Window found = null;
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null) return null;
+            dispatcher.Invoke((Action)(() =>
             {
-                if (win == null) continue;
-                var n = win.GetType().Name;
-                if (n.Contains("Chart") || n.Contains("ControlControl")) return win;
-            }
-
-            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (windows != null)
-                foreach (var w in windows)
+                try
                 {
-                    if (w == null) continue;
-                    var wType = w.GetType();
-                    if (wType.FullName.Contains("Chart") || wType.Name.Contains("Chart"))
+                    foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
                     {
-                        var win = w as System.Windows.Window;
-                        if (win != null) return win;
+                        if (win == null) continue;
+                        var n = win.GetType().Name;
+                        if (n.Contains("Chart") || n.Contains("ControlControl")) { found = win; return; }
                     }
+
+                    System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                    if (windows != null)
+                        foreach (var w in windows)
+                        {
+                            if (w == null) continue;
+                            var wType = w.GetType();
+                            if (wType.FullName.Contains("Chart") || wType.Name.Contains("Chart"))
+                            {
+                                var win = w as System.Windows.Window;
+                                if (win != null) { found = win; return; }
+                            }
+                        }
                 }
-            return null;
+                catch { }
+            }));
+            return found;
         }
 
-        // Find a chart window whose instrument matches the requested symbol.
+        // Find a chart window whose instrument matches the requested symbol. Must run on the WPF dispatcher.
         private System.Windows.Window FindChartWindow(string symbol)
         {
             var want = Instrument.GetInstrument(symbol);
@@ -2886,32 +3093,64 @@ namespace NinjaTrader.NinjaScript.AddOns
             string wantMaster = want?.MasterInstrument?.Name;
             if (string.IsNullOrEmpty(wantName) && string.IsNullOrEmpty(wantMaster)) return null;
 
-            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (windows == null)
-            {
-                try { windows = System.Windows.Application.Current.Windows; } catch { }
-            }
-            if (windows == null) return null;
+            System.Windows.Window found = null;
+            var appDispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (appDispatcher == null) return null;
 
-            foreach (var w in windows)
+            // (1) Enumerate chart windows on the app dispatcher (thread 1) —
+            // Globals.AllWindows and Application.Current.Windows are safe to read
+            // from the app dispatcher.
+            var chartWindows = new List<System.Windows.Window>();
+            appDispatcher.Invoke((Action)(() =>
             {
-                if (w == null) continue;
-                var wType = w.GetType();
-                if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
-                var win = w as System.Windows.Window;
-                if (win == null) continue;
-
-                var controls = new List<object>();
-                CollectChartControlsFromWindow(w, controls);
-                foreach (var c in controls)
+                try
                 {
-                    var cInstr = GetMember(c, "Instrument") as Instrument;
-                    if (InstrumentMatches(cInstr, wantName)
-                        || (wantMaster != null && InstrumentMatches(cInstr, wantMaster)))
-                        return win;
+                    System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                    if (windows == null)
+                    {
+                        try { windows = System.Windows.Application.Current.Windows; } catch { }
+                    }
+                    if (windows == null) return;
+                    foreach (var w in windows)
+                    {
+                        if (w == null) continue;
+                        var wType = w.GetType();
+                        if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                        var win = w as System.Windows.Window;
+                        if (win != null) chartWindows.Add(win);
+                    }
                 }
+                catch { }
+            }));
+
+            // (2) Inspect each chart window on its OWN dispatcher (thread 18/19)
+            // — accessing ChartControl.Instrument from thread 1 throws the
+            // cross-thread exception.
+            foreach (var win in chartWindows)
+            {
+                if (win == null) continue;
+                var winDispatcher = (win as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                if (winDispatcher == null) continue;
+                bool matched = false;
+                winDispatcher.Invoke((Action)(() =>
+                {
+                    try
+                    {
+                        var controls = new List<object>();
+                        CollectChartControlsFromWindow(win, controls);
+                        foreach (var c in controls)
+                        {
+                            var cInstr = GetMember(c, "Instrument") as Instrument;
+                            if (InstrumentMatches(cInstr, wantName)
+                                || (wantMaster != null && InstrumentMatches(cInstr, wantMaster)))
+                            { found = win; matched = true; return; }
+                        }
+                    }
+                    catch { }
+                }));
+                if (matched) break;
             }
-            return null;
+            return found;
         }
 
         private void ActivateChartWindow(System.Windows.Window win)
@@ -2985,85 +3224,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void CollectChartControlsFromWindow(object win, List<object> controls)
         {
             if (win == null) return;
-            var active = GetMember(win, "ActiveChartControl");
-            if (active != null) controls.Add(active);
-
-            var mainTab = GetMember(win, "tabControl");
-            var items = GetMember(mainTab, "Items") as System.Collections.IEnumerable;
-            if (items != null)
-                foreach (var tab in items)
-                {
-                    var content = GetMember(tab, "Content");
-                    if (content == null) continue;
-                    if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") controls.Add(content);
-                    var chartTab = GetMember(content, "ChartControl");
-                    if (chartTab != null) controls.Add(chartTab);
-                    if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, controls, new HashSet<object>(), 0);
-                }
-
+            // ActiveChartControl and tabControl are DispatcherObject properties that
+            // throw cross-thread exceptions even inside winDispatcher.Invoke when the
+            // window lives on a different thread than the caller.  Skip them and rely
+            // on the visual-tree walk below, which uses VisualTreeHelper (safe cross-thread).
             if (win is System.Windows.DependencyObject dcoWin)
                 CollectChartControls(dcoWin, controls, new HashSet<object>(), 0);
         }
 
         // Return any ChartControl reachable from an open chart window.
         // Tries focused/active tab first, then unfocused tabs, then a full visual-tree walk.
-        private object FindAnyChartControl()
-        {
-            // Try Application.Current.Windows first (common case).
-            foreach (System.Windows.Window win in System.Windows.Application.Current.Windows)
-            {
-                if (win == null) continue;
-                var n = win.GetType().Name;
-                if (!n.Contains("Chart") && !n.Contains("ControlControl")) continue;
-
-                var active = GetMember(win, "ActiveChartControl");
-                if (active != null) return active;
-
-                var tabControl = GetMember(win, "tabControl");
-                var items = GetMember(tabControl, "Items") as System.Collections.IEnumerable;
-                if (items != null)
-                    foreach (var tab in items)
-                    {
-                        var content = GetMember(tab, "Content");
-                        if (content != null)
-                        {
-                            if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") return content;
-                            var chartTab = GetMember(content, "ChartControl");
-                            if (chartTab != null) return chartTab;
-                        }
-                        if (content is System.Windows.DependencyObject dco)
-                        {
-                            var found = new List<object>();
-                            CollectChartControls(dco, found, new HashSet<object>(), 0);
-                            if (found.Count > 0) return found[0];
-                        }
-                    }
-
-                if (win is System.Windows.DependencyObject dcoWin)
-                {
-                    var found = new List<object>();
-                    CollectChartControls(dcoWin, found, new HashSet<object>(), 0);
-                    if (found.Count > 0) return found[0];
-                }
-            }
-
-            // Fall back to Globals.AllWindows (covers floating/minimized charts).
-            System.Collections.IEnumerable windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
-            if (windows != null)
-                foreach (var w in windows)
-                {
-                    if (w == null) continue;
-                    var wType = w.GetType();
-                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
-                    if (w is System.Windows.DependencyObject dco)
-                    {
-                        var found = new List<object>();
-                        CollectChartControls(dco, found, new HashSet<object>(), 0);
-                        if (found.Count > 0) return found[0];
-                    }
-                }
-            return null;
-        }
+        // FindAnyChartControl removed — it was dead code that accessed chart
+        // windows directly from the HTTP listener thread (no dispatcher marshaling),
+        // which throws cross-thread exceptions. Use FindChartControl instead, which
+        // correctly marshals to each window's own dispatcher.
 
         private object OpenChart(string body)
         {
@@ -3124,7 +3298,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object GetFillEvents(string countStr)
         {
-            int count = int.TryParse(countStr, out var c) ? c : 50;
+            int c;
+            int count = int.TryParse(countStr, out c) ? c : 50;
             var fills = new List<object>();
 
             foreach (Account account in Account.All)
@@ -3153,6 +3328,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _lockoutExpiry =
             new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        // Check both RiskGuard and the local EmergencyFlatten lockout.
+        private bool IsAccountLocked(string accountName)
+        {
+            if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(accountName))
+                return true;
+            DateTime expiry;
+            if (_lockoutExpiry.TryGetValue(accountName, out expiry) && DateTime.UtcNow < expiry)
+                return true;
+            return false;
+        }
 
         private object EmergencyFlatten(string body)
         {
@@ -3208,7 +3394,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                             var strategies = acc.Strategies?.ToList() ?? new List<NinjaTrader.NinjaScript.StrategyBase>();
                             foreach (NinjaTrader.NinjaScript.StrategyBase str in strategies)
                             {
-                                try { str.SetState(State.Terminated); }
+                                try
+                                {
+                                    // Strategy.OnStateChange may touch ChartControl
+                                    // during cleanup — marshal to the chart's own
+                                    // dispatcher to avoid cross-thread exceptions.
+                                    var strCc = GetMember(str, "ChartControl");
+                                    var strDisp = (strCc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                                    if (strDisp != null && !strDisp.CheckAccess())
+                                        strDisp.Invoke(() => str.SetState(State.Terminated));
+                                    else
+                                        str.SetState(State.Terminated);
+                                }
                                 catch (Exception sex) { errors.Add($"[{acc.Name}] Strategy terminate failed: {sex.Message}"); }
                             }
                         }
@@ -3508,14 +3705,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     RiskGuardAddOn.Instance.UnlockAccount(acctName);
                 }
+                // Also clear the local EmergencyFlatten lockout
+                DateTime dummy;
+                _lockoutExpiry.TryRemove(acctName, out dummy);
                 return new { success = true, action, account = acctName, isLockedOut = false };
             }
-            return new { success = true, action, account = acctName };
+            // Query lockout status
+            bool locked = IsAccountLocked(acctName);
+            return new { success = true, action, account = acctName, isLockedOut = locked };
         }
 
         private object ExtractTrades(string accountFilter, string format, string fromStr, string toStr, string limitStr)
         {
-            int limit = int.TryParse(limitStr, out var l) ? l : 100;
+            int l;
+            int limit = int.TryParse(limitStr, out l) ? l : 100;
             DateTime fromDt = DateTime.MinValue, toDt = DateTime.MaxValue;
             if (!string.IsNullOrEmpty(fromStr)) DateTime.TryParse(fromStr, out fromDt);
             if (!string.IsNullOrEmpty(toStr)) DateTime.TryParse(toStr, out toDt);
@@ -3549,8 +3752,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         time = exec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
                         macroTag,
                         latencyMs,
+                        commission = exec.Commission,
                         mae = (double?)null,
-                        mfe = (double?)null
+                        mfe = (double?)null,
+                        note = "MAE/MFE require Trade objects from a backtest SystemPerformance.AllTrades; account-level Executions do not carry them."
                     });
                 }
             }
@@ -3584,24 +3789,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (pnlList.Count == 0)
             {
-                foreach (Account acc in Account.All)
-                {
-                    var tradesList = acc.Executions.ToList();
-                    for (int k = 0; k < tradesList.Count; k++)
-                    {
-                        var e = tradesList[k];
-                        if (e.Quantity > 0 && e.Order != null && e.Order.AverageFillPrice > 0)
-                        {
-                            double realized = e.Quantity * (e.Order.OrderAction == OrderAction.Sell || e.Order.OrderAction == OrderAction.SellShort ? 1 : -1) * 10;
-                            if (realized != 0) pnlList.Add(realized);
-                        }
-                    }
-                }
-            }
-
-            if (pnlList.Count == 0)
-            {
-                return new { success = false, error = "No trade execution history found on active accounts or payload array to perform Monte Carlo simulation." };
+                // Previously this code synthesized a placeholder P&L (qty * direction * 10)
+                // from raw executions, which produced statistically meaningless results.
+                // Computing real realized P&L from execution pairs requires position tracking
+                // that the AddOn does not have. Return an honest error instead.
+                return new { success = false, error = "No 'trades' array supplied in the request body. The fallback that synthesizes P&L from raw account executions has been removed because it produced garbage data. Supply a 'trades' array with 'pnl' / 'netProfit' / 'realizedPnl' fields, e.g. [{\"pnl\": 120.50}, {\"pnl\": -85.00}]." };
             }
 
             blockSize = Math.Min(blockSize, pnlList.Count);
@@ -3739,176 +3931,355 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object PlaceAtmOrder(string body)
         {
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            JObject req;
+            try { req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body); }
+            catch (Exception ex) { return new { error = "Invalid JSON body: " + ex.Message }; }
+
             var symbol = req.Str("symbol");
             var action = req.Str("action");
-            if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action)) return new { error = "symbol and action required" };
+            if (string.IsNullOrEmpty(symbol) || string.IsNullOrEmpty(action))
+                return new { error = "symbol and action required" };
 
-            int stopLossTicks = req["stopLossTicks"] != null ? (int)req["stopLossTicks"] : 0;
-            int takeProfitTicks = req["takeProfitTicks"] != null ? (int)req["takeProfitTicks"] : 0;
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null)
+                return new { error = "instrument not found: " + symbol };
 
-            var primaryResult = PlaceOrder(body);
-            var resultObj = JObject.FromObject(primaryResult);
-            if (resultObj["error"] != null) return resultObj;
+            // Validate this is a tradable contract, not a master instrument
+            if (instrument.MasterInstrument != null && instrument.FullName.Equals(instrument.MasterInstrument.Name, StringComparison.OrdinalIgnoreCase))
+                return new { error = "symbol '" + symbol + "' resolves to a master instrument, not a tradable contract. Use full futures format (e.g. NQ 09-26)." };
 
-            if (stopLossTicks > 0 || takeProfitTicks > 0)
+            string reqAccount = req.Str("account");
+            Account account = null;
+            if (!string.IsNullOrEmpty(reqAccount))
+                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
+            if (account == null)
+                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
+                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
+                          ?? Account.All.FirstOrDefault();
+            if (account == null) return new { error = "no account available" };
+
+            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase);
+            bool confirmLive = req.Bool("confirmLive");
+            if (!isSim && !confirmLive)
+                return new { error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" };
+
+            if (IsAccountLocked(account.Name))
+                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
+
+            int quantity = req["quantity"]?.Value<int>() ?? 1;
+            double tickSize = instrument.MasterInstrument.TickSize;
+            double pointValue = instrument.MasterInstrument.PointValue;
+
+            double currentPrice = 0;
+            var md = instrument.MarketData;
+            if (md != null && md.Last != null)
+                currentPrice = md.Last.Price;
+            if (currentPrice <= 0 && md != null && md.Ask != null)
+                currentPrice = md.Ask.Price;
+            if (currentPrice <= 0 && md != null && md.Bid != null)
+                currentPrice = md.Bid.Price;
+            if (currentPrice <= 0)
+                return new { error = "could not get current price for " + symbol };
+
+            var config = new AtmStrategyConfig();
+            string strategyName = req.Str("strategyName") ?? "";
+            if (!string.IsNullOrEmpty(strategyName))
             {
-                resultObj["isAtmBracket"] = true;
-                resultObj["stopLossTicks"] = stopLossTicks;
-                resultObj["takeProfitTicks"] = takeProfitTicks;
-                resultObj["bracketState"] = "Attached_OCO_Pending";
+                try { config.Type = (AtmStrategyType)Enum.Parse(typeof(AtmStrategyType), strategyName, true); }
+                catch { return new { error = "unknown strategy: " + strategyName + ". Valid: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal" }; }
             }
-            return resultObj;
+            else
+            {
+                var profile = DynamicAtmManager.GetProfile(instrument.MasterInstrument.Name);
+                config.Type = profile != null ? profile.DefaultStrategy : AtmStrategyType.FixedTicks;
+            }
+
+            if (req["stopTicks"] != null) config.StopTicks = req["stopTicks"].Value<int>();
+            if (req["targetTicks"] != null) config.TargetTicks = req["targetTicks"].Value<int>();
+            if (req["stopLossTicks"] != null) config.StopTicks = req["stopLossTicks"].Value<int>();
+            if (req["takeProfitTicks"] != null) config.TargetTicks = req["takeProfitTicks"].Value<int>();
+            if (req["atrMultiplierSL"] != null) config.AtrMultiplierSL = req["atrMultiplierSL"].Value<double>();
+            if (req["atrMultiplierTP"] != null) config.AtrMultiplierTP = req["atrMultiplierTP"].Value<double>();
+            if (req["atrPeriod"] != null) config.AtrPeriod = req["atrPeriod"].Value<int>();
+            if (req["swingLookbackBars"] != null) config.SwingLookbackBars = req["swingLookbackBars"].Value<int>();
+            if (req["swingBufferTicks"] != null) config.SwingBufferTicks = req["swingBufferTicks"].Value<int>();
+            if (req["breakevenTriggerTicks"] != null) config.BreakevenTriggerTicks = req["breakevenTriggerTicks"].Value<int>();
+            if (req["breakevenOffsetTicks"] != null) config.BreakevenOffsetTicks = req["breakevenOffsetTicks"].Value<int>();
+            if (req["partialProfitPct"] != null) config.PartialProfitPct = req["partialProfitPct"].Value<double>();
+            if (req["trailMultiplier"] != null) config.TrailMultiplier = req["trailMultiplier"].Value<double>();
+            if (req["riskPerTrade"] != null) config.RiskPerTrade = req["riskPerTrade"].Value<double>();
+            if (req["kellyFraction"] != null) config.KellyFraction = req["kellyFraction"].Value<double>();
+            if (req["winRate"] != null) config.WinRate = req["winRate"].Value<double>();
+            if (req["avgRR"] != null) config.AvgRR = req["avgRR"].Value<double>();
+
+            var result = DynamicAtmManager.Instance.PlaceBracket(
+                account, instrument, action, quantity, config, currentPrice, tickSize, pointValue);
+
+            // Normalize to camelCase so the wire contract matches every other
+            // endpoint (BracketResult is a PascalCase POCO).
+            return new
+            {
+                status = result.Status,
+                bracketId = result.BracketId,
+                ocoId = result.OcoId,
+                entryOrderId = result.EntryOrderId,
+                stopOrderId = result.StopOrderId,
+                targetOrderId = result.TargetOrderId,
+                stopPrice = result.StopPrice,
+                targetPrice = result.TargetPrice,
+                calculatedQuantity = result.CalculatedQuantity,
+                strategyName = result.StrategyName,
+                note = result.Note,
+                error = result.Error
+            };
+        }
+
+        private object GetAtmBracketStatus(string bracketId)
+        {
+            if (string.IsNullOrEmpty(bracketId))
+            {
+                var active = DynamicAtmManager.Instance.GetActiveBrackets();
+                return new { count = active.Count, brackets = active.Select(b => new
+                {
+                    bracketId = b.BracketId,
+                    symbol = b.Symbol,
+                    account = b.AccountName,
+                    isLong = b.IsLong,
+                    strategy = b.Config?.Type.ToString() ?? "Unknown",
+                    ageSeconds = (DateTime.UtcNow - b.CreatedAt).TotalSeconds,
+                    breakevenTriggered = b.BreakevenTriggered,
+                    partialProfitTaken = b.PartialProfitTaken
+                }).ToList() };
+            }
+            return DynamicAtmManager.Instance.GetBracketStatus(bracketId);
         }
 
         // ─────────────────────────────────────────────────────────────────────────
-        // 3) DrawChartLevel — draw a REAL horizontal line / ray / rectangle on the chart
+        // 3) DrawChartLevel — draw a REAL NinjaTrader.NinjaScript.DrawingTools object
+        //    onto the chart for the requested symbol.
         //
         //    Router (unchanged):
         //      case "/api/chart/draw": return Post(method, () => DrawChartLevel(body));
         //
-        //    Reuses FindChartControl(instrument, out cc, out cb) — the same helper the
-        //    deploy path uses — to get the live ChartControl for the symbol, then adds a
-        //    NinjaTrader.Gui.Chart drawing object to the chart's ChartObjects collection
-        //    on the UI thread. If no chart for that instrument is open, returns
-        //    not_implemented (there is nothing to draw on).
+        //    Uses FindChartControl(instrument, out cc, out cb) to get the live ChartControl,
+        //    then adds a NinjaTrader.NinjaScript.DrawingTools object to ChartObjects on the
+        //    UI dispatcher. If no chart for that instrument is open, returns not_implemented.
         //
-        //    Supported shapeType: "HorizontalLine" (default), "Ray", "Rectangle".
-        //    price1 required; price2 used by Rectangle (and as the 2nd anchor of a Ray).
+        //    Supported shapeType: "HorizontalLine" (default), "Ray", "VerticalLine", "Line",
+        //    "Rectangle".  price1 required; price2 used by Rectangle and Ray.
         // ─────────────────────────────────────────────────────────────────────────
         private object DrawChartLevel(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var symbol = req.Str("symbol");
             if (string.IsNullOrWhiteSpace(symbol)) return new { error = "symbol required" };
-        
+
             var tag = req.Str("tag") ?? ("mcp_draw_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             if (req["price1"] == null) return new { error = "price1 required" };
             double price1 = (double)req["price1"];
             double price2 = req["price2"] != null ? (double)req["price2"] : price1;
+            DateTime? time1 = req["time1"] != null ? (DateTime)req["time1"] : (DateTime?)null;
+            DateTime? time2 = req["time2"] != null ? (DateTime)req["time2"] : (DateTime?)null;
+
             string shapeType = (req.Str("shapeType") ?? "HorizontalLine").Trim();
-            string colorStr = req.Str("color") ?? "#FF0000";
-        
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { status = "not_implemented", reason = "no WPF dispatcher (NT8 UI down)" };
-        
+            string colorStr  = req.Str("color") ?? "#FF0000";
+            int width = req["width"] != null ? (int)req["width"] : 2;
+            string dashStyle = req.Str("dashStyle") ?? "Solid";
+
             object cc, cb;
             if (!FindChartControl(symbol, out cc, out cb) || cc == null)
-                return new { status = "not_implemented", reason = $"no open chart found for '{symbol}'; open a chart first (nt_open_chart)" };
-        
+            {
+                // List available charts by enumerating windows on the app dispatcher
+                // and marshaling each window's inspection to its own dispatcher.
+                var available = new List<string>();
+                try
+                {
+                    var appDisp = System.Windows.Application.Current?.Dispatcher;
+                    if (appDisp != null)
+                    {
+                        var chartWins = new List<System.Windows.Window>();
+                        appDisp.Invoke((Action)(() =>
+                        {
+                            var windows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+                            if (windows == null) { try { windows = System.Windows.Application.Current.Windows; } catch {} }
+                            if (windows != null)
+                                foreach (var w in windows)
+                                {
+                                    if (w == null) continue;
+                                    var wType = w.GetType();
+                                    if (!wType.FullName.Contains("Chart") && !wType.Name.Contains("Chart")) continue;
+                                    chartWins.Add(w as System.Windows.Window);
+                                }
+                        }));
+                        foreach (var win in chartWins)
+                        {
+                            var winDisp = (win as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+                            if (winDisp == null) continue;
+                            winDisp.Invoke((Action)(() =>
+                            {
+                                var controls = new List<object>();
+                                CollectChartControlsFromWindow(win, controls);
+                                foreach (var c in controls)
+                                {
+                                    var ci = GetMember(c, "Instrument") as Instrument;
+                                    if (ci != null) available.Add(ci.FullName);
+                                }
+                            }));
+                        }
+                    }
+                }
+                catch { }
+                return new { status = "not_implemented", reason = $"no open chart found for '{symbol}'; open a chart first (nt_open_chart)", availableCharts = available };
+            }
+
             string resultStatus = null;
             Exception drawErr = null;
-        
-            disp.Invoke((Action)(() =>
+
+            // Use the ChartControl's OWN dispatcher (each NT8 chart lives on its own
+            // thread), NOT the app dispatcher.  Using the app dispatcher causes
+            // "calling thread cannot access this object" because ChartControl was
+            // created on thread 18/19, not thread 1.
+            var chartDisp = (cc as System.Windows.Threading.DispatcherObject)?.Dispatcher;
+            if (chartDisp == null) return new { status = "not_implemented", reason = "no chart dispatcher available" };
+
+            chartDisp.Invoke((Action)(() =>
             {
                 try
                 {
-                    // Map the requested shape to a NinjaTrader.Gui.Chart drawing tool type.
-                    string typeName;
-                    switch (shapeType.ToLowerInvariant())
-                    {
-                        case "ray":            typeName = "NinjaTrader.Gui.Chart.Ray"; break;
-                        case "rectangle":      typeName = "NinjaTrader.Gui.Chart.Rectangle"; break;
-                        case "line":
-                        case "horizontalline":
-                        default:               typeName = "NinjaTrader.Gui.Chart.HorizontalLine"; break;
-                    }
-                    var drawType = Type.GetType(typeName + ", NinjaTrader.Gui");
-                    if (drawType == null) { drawErr = new Exception($"drawing type unavailable: {typeName}"); return; }
-        
+                    var chartControl = (ChartControl)cc;
+                    var chartBars    = (ChartBars)cb;
+                    var bars         = chartBars.Bars;
+
+                    // Resolve default times from the live series.
+                    DateTime tLast  = bars.Count > 0 ? bars.GetTime(bars.Count - 1) : DateTime.Now;
+                    DateTime tPrev  = bars.Count > 1 ? bars.GetTime(bars.Count - 2) : tLast.AddMinutes(-1);
+                    DateTime tStart = time1 ?? tPrev;
+                    DateTime tEnd   = time2 ?? tLast;
+
                     // Remove any prior object with the same tag (idempotent redraw).
-                    var chartObjects = GetP(cc, "ChartObjects") as System.Collections.IList;
-                    if (chartObjects != null)
+                    var chartObjects = chartControl.ChartObjects;
+                    for (int i = chartObjects.Count - 1; i >= 0; i--)
                     {
-                        for (int i = chartObjects.Count - 1; i >= 0; i--)
-                        {
-                            var existingTag = GetP(chartObjects[i], "Tag") as string;
-                            if (existingTag == tag) chartObjects.RemoveAt(i);
-                        }
+                        var existingTag = GetP(chartObjects[i], "Tag") as string;
+                        if (existingTag == tag) chartObjects.RemoveAt(i);
                     }
-        
-                    // Construct the drawing object and set its tag + anchors + color.
-                    var draw = Activator.CreateInstance(drawType);
-                    SetP(draw, "Tag", tag);
-                    try { SetP(draw, "IsUserDrawn", false); } catch { }
-        
-                    // Color: parse "#RRGGBB" to a Brush and assign to the tool's stroke.
+
+                    // Parse color and dash style.
+                    var brush = (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFromString(colorStr);
+                    brush.Freeze();
+                    var stroke = new Stroke { Brush = brush, Width = width };
                     try
                     {
-                        var brush = (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFromString(colorStr);
-                        brush.Freeze();
-                        // Most tools carry a Stroke (NinjaTrader.Gui.Stroke) with a Brush property.
-                        var stroke = GetP(draw, "Stroke");
-                        if (stroke != null) SetP(stroke, "Brush", brush);
-                        else try { SetP(draw, "OutlineStroke", MakeStroke(brush)); } catch { }
+                        var dashEnum = (DashStyleHelper)Enum.Parse(typeof(DashStyleHelper), dashStyle, true);
+                        stroke.DashStyleHelper = dashEnum;
                     }
-                    catch { /* color is best-effort */ }
-        
-                    // Anchors. HorizontalLine needs a single price; Ray/Rectangle need two
-                    // (time,price) anchors. We anchor time to the most recent bar time and
-                    // one bar earlier, which is enough for NT8 to render a full-width object.
-                    SetChartAnchors(draw, cb, shapeType, price1, price2);
-        
-                    var chartObjects2 = GetP(cc, "ChartObjects") as System.Collections.IList;
-                    chartObjects2?.Add(draw);
-                    InvokeM(cc, "InvalidateVisual");
-                    resultStatus = "drawn";
+                    catch { }
+
+                    DrawingTool drawTool = null;
+                    string shapeLower = shapeType.ToLowerInvariant();
+
+                    if (shapeLower == "rectangle")
+                    {
+                        var rect = new Rectangle();
+                        rect.Tag = tag;
+                        SetRectangleAnchors(rect, chartBars, price1, price2, tStart, tEnd);
+                        try { var outlineStroke = stroke.Clone() as System.Windows.Media.Brush; if (outlineStroke != null) outlineStroke.Freeze(); SetP(rect, "OutlineStroke", outlineStroke ?? stroke.Clone()); } catch { }
+                        try
+                        {
+                            var areaBrush = brush.Clone();
+                            areaBrush.Opacity = 0.10;
+                            areaBrush.Freeze();
+                            SetP(rect, "AreaBrush", areaBrush);
+                        }
+                        catch { }
+                        drawTool = rect;
+                    }
+                    else
+                    {
+                        var line = new Line { Tag = tag };
+                        object lineType = null;
+                        try
+                        {
+                            var ltEnum = typeof(Line).GetNestedType("ChartLineType", BindingFlags.NonPublic);
+                            if (ltEnum != null && ltEnum.IsEnum)
+                            {
+                                var enumName = shapeLower switch
+                                {
+                                    "ray"          => "Ray",
+                                    "verticalline" => "VerticalLine",
+                                    "line"         => "Linear",
+                                    _              => "HorizontalLine"
+                                };
+                                lineType = Enum.Parse(ltEnum, enumName, true);
+                            }
+                        }
+                        catch { }
+                        if (lineType != null)
+                            try { SetP(line, "LineType", lineType); } catch { }
+
+                        // Build anchors.  For HorizontalLine/Ray/Line we use two chart anchors;
+                        // for VerticalLine both anchors share the same time and span price1..price2.
+                        var startAnchor = new ChartAnchor
+                        {
+                            Price       = price1,
+                            Time        = tStart,
+                            DrawingTool = line,
+                            BarsAgo     = 0
+                        };
+                        var endAnchor = new ChartAnchor
+                        {
+                            Price       = shapeLower == "verticalline" ? price2 : price1,
+                            Time        = tEnd,
+                            DrawingTool = line,
+                            BarsAgo     = 0
+                        };
+
+                        line.StartAnchor = startAnchor;
+                        line.EndAnchor   = endAnchor;
+                        line.Stroke      = stroke;
+                        drawTool = line;
+                    }
+
+                    if (drawTool != null)
+                    {
+                        chartObjects.Add(drawTool);
+                        chartControl.InvalidateVisual();
+                        resultStatus = "drawn";
+                    }
                 }
                 catch (Exception ex) { drawErr = ex; }
             }));
-        
+
             if (drawErr != null)
                 return new { status = "not_implemented", reason = "draw failed: " + drawErr.Message };
             if (resultStatus != "drawn")
                 return new { status = "not_implemented", reason = "chart present but drawing object could not be added" };
-        
-            return new { success = true, symbol, tag, shapeType, price1, price2, color = colorStr, status = "drawn" };
+
+            return new { success = true, symbol, tag, shapeType, price1, price2, color = colorStr, width, dashStyle, status = "drawn" };
         }
-        
-        // Helper: build a NinjaTrader.Gui.Stroke around a brush (reflected, optional).
-        private static object MakeStroke(System.Windows.Media.Brush brush)
+
+        // Helper: set a Rectangle's two corner anchors.  Rectangle exposes the anchors through
+        // its base type; we use the public properties directly where visible and fall back to
+        // reflection if NT8's API surface changes in a future build.
+        private static void SetRectangleAnchors(Rectangle rect, ChartBars chartBars, double price1, double price2, DateTime time1, DateTime time2)
         {
-            var strokeType = Type.GetType("NinjaTrader.Gui.Stroke, NinjaTrader.Gui");
-            if (strokeType == null) return null;
-            var s = Activator.CreateInstance(strokeType);
-            try { s.GetType().GetProperty("Brush")?.SetValue(s, brush); } catch { }
-            return s;
-        }
-        
-        // Helper: set drawing anchors appropriate to the shape. Uses the chart's primary
-        // ChartBars (cb) to anchor time to real bars so the object is placed on the series.
-        private void SetChartAnchors(object draw, object chartBars, string shapeType, double price1, double price2)
-        {
-            // A HorizontalLine only needs a Y price; NT8 exposes it via StartAnchor.Price
-            // (and the line spans the full width automatically).
-            DateTime tNow = DateTime.Now, tPrev = DateTime.Now.AddMinutes(-1);
-            try
-            {
-                var bars = GetP(chartBars, "Bars");
-                int cnt = Convert.ToInt32(GetP(bars, "Count") ?? 0);
-                if (cnt > 0)
-                {
-                    tNow  = (DateTime)InvokeM(bars, "GetTime", cnt - 1);
-                    tPrev = cnt > 1 ? (DateTime)InvokeM(bars, "GetTime", cnt - 2) : tNow.AddMinutes(-1);
-                }
-            }
-            catch { }
-        
-            var start = GetP(draw, "StartAnchor");
-            var end   = GetP(draw, "EndAnchor");
-        
-            if (start != null) { SetP(start, "Price", price1); TrySetAnchorTime(start, tPrev); }
-            if (end   != null)
-            {
-                bool isRect = shapeType.Equals("Rectangle", StringComparison.OrdinalIgnoreCase);
-                SetP(end, "Price", isRect ? price2 : price1);
-                TrySetAnchorTime(end, tNow);
-            }
-        }
-        
-        private static void TrySetAnchorTime(object anchor, DateTime t)
-        {
-            try { anchor.GetType().GetProperty("Time")?.SetValue(anchor, t); } catch { }
+            var start = GetP(rect, "StartAnchor") as ChartAnchor ?? new ChartAnchor();
+            var end   = GetP(rect, "EndAnchor")   as ChartAnchor ?? new ChartAnchor();
+
+            start.Price       = price1;
+            start.Time        = time1;
+            start.DrawingTool = rect;
+            start.BarsAgo     = 0;
+
+            end.Price       = price2;
+            end.Time        = time2;
+            end.DrawingTool = rect;
+            end.BarsAgo     = 0;
+
+            try { rect.StartAnchor = start; } catch { }
+            try { rect.EndAnchor   = end; }   catch { }
+            try { SetP(rect, "StartAnchor", start); } catch { }
+            try { SetP(rect, "EndAnchor",   end); }   catch { }
         }
                 
         // ─────────────────────────────────────────────────────────────────────────
@@ -3933,8 +4304,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (string.IsNullOrWhiteSpace(indicatorName))
                 return new { error = "indicatorName required (e.g. SMA, EMA, RSI, ATR)" };
 
-            int period   = int.TryParse(periodStr,   out var p)  ? Math.Max(1, p)  : 14;
-            int barsBack = int.TryParse(barsBackStr, out var bb) ? Math.Max(1, bb) : 20;
+            int p;
+            int period   = int.TryParse(periodStr,   out p)  ? Math.Max(1, p)  : 14;
+            int bb;
+            int barsBack = int.TryParse(barsBackStr, out bb) ? Math.Max(1, bb) : 20;
 
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
@@ -3954,9 +4327,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 using (var request = new BarsRequest(instrument, need) { BarsPeriod = barsPeriod })
                 {
                     request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
+                    // Must wait INSIDE the using block — the async callback reads
+                    // req.Bars after the provider returns data. Disposing the
+                    // request before the callback fires returns empty/stale bars.
+                    if (!done.Wait(TimeSpan.FromSeconds(30)))
+                        status = "timeout";
                 }
             }));
-            if (!done.Wait(TimeSpan.FromSeconds(30)))
+            if (status == "timeout")
                 return new { status = "not_implemented", reason = "bars request timed out; no series to compute on" };
             if (bars == null || bars.Count == 0)
                 return new { status = "not_implemented", reason = $"no bar data for '{symbol}' (status={status})" };
@@ -4215,13 +4593,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 using (var writer = new StreamWriter(ctx.Response.OutputStream, new UTF8Encoding(false)))
                 {
-                    var initMsg = JsonConvert.SerializeObject(new { @event = "heartbeat", status = "connected", serverVersion = Version, timestamp = DateTime.UtcNow });
-
-                    writer.WriteLine("data: " + initMsg + "\n");
-                    writer.Flush();
+                    // Send periodic heartbeats until the client disconnects.
+                    while (_running)
+                    {
+                        var heartbeat = JsonConvert.SerializeObject(new { @event = "heartbeat", status = "connected", serverVersion = Version, timestamp = DateTime.UtcNow });
+                        writer.WriteLine("data: " + heartbeat + "\n");
+                        writer.Flush();
+                        System.Threading.Thread.Sleep(15000); // 15s heartbeat interval
+                    }
                 }
             }
-            catch {}
+            catch { }
         }
 
         private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");
@@ -4320,10 +4702,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         var etStr = t["entryTime"]?.ToString();
                         var pc = (double?)t["profitCurrency"] ?? 0;
-                        if (DateTime.TryParse(etStr, out var et))
+                        DateTime et;
+                        if (DateTime.TryParse(etStr, out et))
                         {
                             var key = et.Date.ToString("yyyy-MM-dd");
-                            daily[key] = (daily.TryGetValue(key, out var v) ? v : 0) + pc;
+                            double v;
+                            daily[key] = (daily.TryGetValue(key, out v) ? v : 0) + pc;
                         }
                     }
                 dailyBySymbol[sym] = daily;
@@ -4374,7 +4758,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ── Combined portfolio equity curve from the union of all daily P&L ──
             var allDates = dailyBySymbol.Values.SelectMany(d => d.Keys).Distinct().OrderBy(d => d).ToList();
             var portDaily = allDates.Select(d =>
-                dailyBySymbol.Values.Sum(sd => sd.TryGetValue(d, out var v) ? v : 0)).ToList();
+                dailyBySymbol.Values.Sum(sd => { double v; return sd.TryGetValue(d, out v) ? v : 0; })).ToList();
         
             // Drawdown on the cumulative dollar equity curve.
             double equity = 0, peak = 0, maxDd = 0;
@@ -4507,6 +4891,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
 
+            // Only sma_crossover is implemented. Other rules are not supported.
+            if (!entryRule.Equals("sma_crossover", StringComparison.OrdinalIgnoreCase))
+                return new { error = $"entryRule '{entryRule}' is not supported. Only 'sma_crossover' is implemented." };
+
             var barsResult = GetBars(symbol, "Minute", 5, 500);
             var barsJObj = JObject.FromObject(barsResult);
             var barsArr = barsJObj["bars"] as JArray;
@@ -4586,7 +4974,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, taskId, cronExpression = cron, status = "scheduled", totalScheduled = _scheduledTasks.Count };
+
+            // Ensure the scheduler timer is running (starts on first task registration).
+            EnsureScheduler();
+
+            return new { success = true, taskId, cronExpression = cron, status = "scheduled", totalScheduled = _scheduledTasks.Count, note = "Task registered with the in-process scheduler. Fires the 'command' endpoint at the specified interval. Scheduler restarts on NT8 recompile." };
         }
 
         private object TradeJournal(string body)
@@ -4594,6 +4986,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "list";
             var id = req.Str("id") ?? Guid.NewGuid().ToString("N");
+
+            // Always load from disk first to ensure we have the latest persisted state
+            try
+            {
+                if (File.Exists(TradeJournalFile))
+                {
+                    var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(TradeJournalFile));
+                    if (loaded != null) foreach (var kv in loaded) _tradeJournal[kv.Key] = kv.Value;
+                }
+            }
+            catch { }
 
             lock (_tradeJournal)
             {
@@ -4607,14 +5010,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     catch {}
                 }
-                else if (File.Exists(TradeJournalFile) && !_tradeJournal.ContainsKey(id))
+                else if (action.Equals("delete", StringComparison.OrdinalIgnoreCase) || action.Equals("remove", StringComparison.OrdinalIgnoreCase))
                 {
-                    try
-                    {
-                        var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(TradeJournalFile));
-                        if (loaded != null) foreach (var kv in loaded) _tradeJournal[kv.Key] = kv.Value;
-                    }
-                    catch {}
+                    if (string.IsNullOrEmpty(req.Str("id")))
+                        return new { error = "id required for delete action" };
+                    _tradeJournal.Remove(req.Str("id"));
+                    try { File.WriteAllText(TradeJournalFile, JsonConvert.SerializeObject(_tradeJournal)); } catch {}
+                    return new { success = true, action, count = _tradeJournal.Count };
+                }
+                else if (action.Equals("update", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrEmpty(req.Str("id")))
+                        return new { error = "id required for update action" };
+                    _tradeJournal[req.Str("id")] = req;
+                    try { File.WriteAllText(TradeJournalFile, JsonConvert.SerializeObject(_tradeJournal)); } catch {}
+                    return new { success = true, action, count = _tradeJournal.Count };
                 }
                 return new { success = true, action, count = _tradeJournal.Count, entries = _tradeJournal.Values.ToList() };
             }
@@ -4639,23 +5049,89 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch {}
             }
-            return new { success = true, alertId, symbol, status = "active", totalAlerts = _alerts.Count };
+
+            // Register a price-level monitor that fires AlertCallback when the condition is met.
+            // NT8's AlertCallback fires into the Alerts Log window (Control Center → New → Alerts Log).
+            double priceLevel = req["price"] != null ? (double)req["price"] : 0;
+            string condition = req.Str("condition") ?? "cross_above";
+            string message = req.Str("message") ?? $"{symbol} {condition} {priceLevel}";
+
+            if (priceLevel > 0)
+            {
+                try
+                {
+                    var inst = Instrument.GetInstrument(symbol);
+                    if (inst != null)
+                    {
+                        _alertMonitors[alertId] = new AlertMonitor
+                        {
+                            Instrument = inst,
+                            Level = priceLevel,
+                            Condition = condition,
+                            AlertId = alertId,
+                            Message = message,
+                            Triggered = false
+                        };
+                        return new { success = true, alertId, symbol, status = "active_with_monitor", totalAlerts = _alerts.Count, note = "Alert registered with price-level monitor. Fires NT8 AlertCallback into the Alerts Log when condition is met." };
+                    }
+                }
+                catch { }
+            }
+
+            return new { success = true, alertId, symbol, status = "recorded", totalAlerts = _alerts.Count, note = "Alert persisted. Price-level monitor could not be registered (instrument not found or no price specified). Alert is a log entry only." };
         }
+
+        // Alert price-level monitor
+        private class AlertMonitor
+        {
+            public Instrument Instrument;
+            public double Level;
+            public string Condition; // "cross_above" or "cross_below"
+            public string AlertId;
+            public string Message;
+            public bool Triggered;
+            public double LastPrice;
+        }
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, AlertMonitor> _alertMonitors =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, AlertMonitor>(StringComparer.OrdinalIgnoreCase);
 
         private object RiskGuardConfig(string body)
         {
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            string key = "global";
-            lock (_riskGuardConfig)
+            // GET (no body or empty body): return the current live config
+            if (string.IsNullOrWhiteSpace(body))
             {
-                _riskGuardConfig[key] = req;
-                try
+                if (RiskGuardAddOn.Instance == null)
+                    return new { error = "RiskGuardAddOn not loaded" };
+                return new { success = true, config = RiskGuardAddOn.Instance.Config };
+            }
+
+            var req = JObject.Parse(body);
+
+            if (RiskGuardAddOn.Instance == null)
+            {
+                // Fallback: persist to riskguard_config.json (no live engine to apply to)
+                string key = "global";
+                lock (_riskGuardConfig)
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile));
-                    File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig));
+                    _riskGuardConfig[key] = req;
+                    try { Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile)); File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig)); } catch {}
                 }
-                catch {}
-                return new { success = true, status = "updated", config = req };
+                return new { success = true, status = "persisted_only", config = req, note = "RiskGuardAddOn not loaded. Config persisted to riskguard_config.json but NOT applied to a live engine." };
+            }
+
+            // Deserialize the JObject into a typed RiskConfig and apply via SaveAndReloadConfig.
+            // This writes to RiskGuard/config.json (the correct file) AND reloads the live engine.
+            try
+            {
+                var cfg = req.ToObject<RiskConfig>();
+                if (cfg == null)
+                    return new { error = "Could not deserialize body to RiskConfig." };
+                RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
+                return new { success = true, status = "applied", config = req, note = "Written to RiskGuard/config.json and reloaded into the live RiskGuard engine via SaveAndReloadConfig." };
+            }
+            catch (Exception ex)
+            {
+                return new { error = "Failed to apply config: " + ex.Message };
             }
         }
 
@@ -4665,10 +5141,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             int totalTrades = 0;
             int maxPositionExposure = 0;
             string accName = accountName ?? "Sim101";
+            double dailyLossLimit = -2500.0; // default fallback
 
+            // Try to get the real prop-firm daily loss limit from PropFirmProtectionSuite
+            try
+            {
+                var propConfig = PropFirmProtectionSuite.Instance?.Config;
+                if (propConfig != null)
+                {
+                    // PropFirmProtectionConfig may have a DailyLossLimit field
+                    var dll = GetMember(propConfig, "DailyLossLimit");
+                    if (dll != null) dailyLossLimit = -Math.Abs(Convert.ToDouble(dll));
+                }
+            }
+            catch { }
+
+            bool accountFound = false;
             foreach (Account acc in Account.All)
             {
                 if (!string.IsNullOrEmpty(accountName) && !acc.Name.Equals(accountName, StringComparison.OrdinalIgnoreCase)) continue;
+                accountFound = true;
                 dailyPnL += AcctGet(acc, AccountItem.RealizedProfitLoss) + AcctGet(acc, AccountItem.UnrealizedProfitLoss);
                 totalTrades += acc.Executions.Count;
                 foreach (Position pos in acc.Positions)
@@ -4677,7 +5169,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            string status = (dailyPnL >= -2500.0) ? "COMPLIANT" : "VIOLATION_DAILY_LOSS_EXCEEDED";
+            if (!accountFound) return new { error = $"account '{accName}' not found" };
+
+            string status = (dailyPnL >= dailyLossLimit) ? "COMPLIANT" : "VIOLATION_DAILY_LOSS_EXCEEDED";
 
             return new
             {
@@ -4687,6 +5181,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyPnL,
                 totalTrades,
                 maxPositionExposure,
+                dailyLossLimit = dailyLossLimit,
                 complianceStatus = status
             };
         }
@@ -4697,12 +5192,217 @@ namespace NinjaTrader.NinjaScript.Strategies
             var action = req.Str("action") ?? "sync_hedge";
             var accList = req["accounts"] as JArray;
             var targetAccounts = accList != null ? accList.Select(a => a.ToString()).ToList() : Account.All.Select(a => a.Name).ToList();
-            return new { success = true, action, targetAccounts, status = "executed" };
+            var orders = req["orders"] as JArray;
+            if (orders == null || orders.Count == 0)
+                return new { error = "orders array required, e.g. [{symbol,action,quantity,orderType}, ...]" };
+
+            var results = new List<object>();
+            foreach (string accName in targetAccounts)
+            {
+                Account account = Account.All.FirstOrDefault(a => a.Name.Equals(accName, StringComparison.OrdinalIgnoreCase));
+                if (account == null) { results.Add(new { account = accName, status = "error", error = "account not found" }); continue; }
+
+                foreach (var ord in orders)
+                {
+                    var symbol = ord["symbol"]?.ToString();
+                    var actionStr = ord["action"]?.ToString() ?? "buy";
+                    var quantity = ord["quantity"] != null ? (int)ord["quantity"] : 1;
+                    var orderTypeStr = ord["orderType"]?.ToString() ?? "Market";
+                    if (string.IsNullOrEmpty(symbol)) { results.Add(new { account = accName, status = "error", error = "symbol required" }); continue; }
+
+                    var instrument = Instrument.GetInstrument(symbol);
+                    if (instrument == null) { results.Add(new { account = accName, status = "error", error = "instrument not found: " + symbol }); continue; }
+
+                    var orderAction = actionStr.Equals("sell", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.Buy;
+                    var orderType = orderTypeStr.Equals("Limit", StringComparison.OrdinalIgnoreCase) ? OrderType.Limit : OrderType.Market;
+                    double limitPrice = ord["limitPrice"] != null ? (double)ord["limitPrice"] : 0;
+                    double stopPrice = ord["stopPrice"] != null ? (double)ord["stopPrice"] : 0;
+
+                    try
+                    {
+                        var order = account.CreateOrder(instrument, orderAction, orderType, TimeInForce.Day, quantity, limitPrice, stopPrice, string.Empty, "McpOrchestrator", null);
+                        account.Submit(new[] { order });
+                        results.Add(new { account = accName, symbol, action = actionStr, quantity, orderId = order.Id.ToString(), status = "submitted" });
+                    }
+                    catch (Exception ex) { results.Add(new { account = accName, symbol, status = "error", error = ex.Message }); }
+                }
+            }
+            return new { success = true, action, targetAccounts, status = "executed", results };
         }
 
         // - Helpers -
 
 
+
+        // Generic JSON store loader for persistent dictionaries.
+        private static void LoadJsonStore(string path, Dictionary<string, JObject> store)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var loaded = JsonConvert.DeserializeObject<Dictionary<string, JObject>>(File.ReadAllText(path));
+                    if (loaded != null)
+                        lock (store) { store.Clear(); foreach (var kv in loaded) store[kv.Key] = kv.Value; }
+                }
+            }
+            catch { }
+        }
+
+        // ── Scheduler + Alert Monitor ──────────────────────────────────────────
+        private System.Threading.Timer _schedulerTimer;
+        private static readonly object _schedLock = new object();
+
+        private void EnsureScheduler()
+        {
+            if (_schedulerTimer != null) return;
+            lock (_schedLock)
+            {
+                if (_schedulerTimer != null) return;
+                // Tick every 30s — cron resolution to the minute is sufficient.
+                _schedulerTimer = new System.Threading.Timer(SchedulerTick, null, 30000, 30000);
+                Log("Scheduler started (30s tick)");
+            }
+        }
+
+        private void SchedulerTick(object _)
+        {
+            try { CheckScheduledTasks(); } catch { }
+            try { CheckAlertMonitors(); } catch { }
+        }
+
+        private void CheckScheduledTasks()
+        {
+            if (_scheduledTasks.Count == 0) return;
+            DateTime now = DateTime.Now;
+            List<KeyValuePair<string, JObject>> due;
+            lock (_scheduledTasks)
+            {
+                due = _scheduledTasks.Where(kv => IsTaskDue(kv.Value, now)).ToList();
+            }
+            foreach (var kv in due)
+            {
+                var task = kv.Value;
+                var command = task.Str("command");
+                if (string.IsNullOrEmpty(command)) continue;
+                // Fire-and-forget loopback HTTP call to the command endpoint.
+                try
+                {
+                    var url = "http://localhost:7890/" + command.TrimStart('/');
+                    var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                    req.Method = "POST";
+                    req.ContentType = "application/json";
+                    req.Headers["Authorization"] = "Bearer " + ServerToken;
+                    req.Timeout = 30000;
+                    var args = task["args"]?.ToString() ?? "{}";
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(args);
+                    req.ContentLength = bytes.Length;
+                    using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                    using (var resp = req.GetResponse()) { }
+                    // Update lastRun
+                    task["lastRun"] = now.ToString("o");
+                }
+                catch (Exception ex)
+                {
+                    task["lastError"] = ex.Message;
+                }
+            }
+        }
+
+        // Simple interval-based scheduling: supports "interval" (seconds) or "cronExpression" (basic 5-field).
+        // For cron, we evaluate minute/hour/day-of-month/month/day-of-week with * and */n support.
+        private static bool IsTaskDue(JObject task, DateTime now)
+        {
+            // Interval-based (simpler, more reliable)
+            int intervalSec;
+            if (task["interval"] != null && int.TryParse(task["interval"].ToString(), out intervalSec) && intervalSec > 0)
+            {
+                DateTime lastRun;
+                if (!DateTime.TryParse(task["lastRun"]?.ToString(), out lastRun))
+                    return true; // never run → due now
+                return (now - lastRun).TotalSeconds >= intervalSec;
+            }
+
+            // Cron-based (basic 5-field: minute hour dom month dow)
+            var cron = task.Str("cronExpression");
+            if (string.IsNullOrEmpty(cron)) return false;
+            var parts = cron.Split(' ');
+            if (parts.Length < 5) return false;
+            DateTime lastRun2;
+            DateTime.TryParse(task["lastRun"]?.ToString(), out lastRun2);
+            // Check if current minute matches and hasn't been run this minute
+            if (lastRun2 > now.AddMinutes(-1)) return false;
+            return CronFieldMatches(parts[0], now.Minute, 0, 59)
+                && CronFieldMatches(parts[1], now.Hour, 0, 23)
+                && CronFieldMatches(parts[2], now.Day, 1, 31)
+                && CronFieldMatches(parts[3], now.Month, 1, 12)
+                && CronFieldMatches(parts[4], (int)now.DayOfWeek, 0, 6);
+        }
+
+        private static bool CronFieldMatches(string field, int value, int min, int max)
+        {
+            if (field == "*") return true;
+            if (field.StartsWith("*/"))
+            {
+                int step;
+                if (int.TryParse(field.Substring(2), out step) && step > 0)
+                    return (value - min) % step == 0;
+                return false;
+            }
+            int v;
+            if (int.TryParse(field, out v)) return v == value;
+            // Comma-separated list
+            foreach (var part in field.Split(','))
+            {
+                if (int.TryParse(part, out v) && v == value) return true;
+            }
+            return false;
+        }
+
+        private void CheckAlertMonitors()
+        {
+            if (_alertMonitors.Count == 0) return;
+            foreach (var kv in _alertMonitors.ToList())
+            {
+                var m = kv.Value;
+                if (m.Triggered) continue;
+                try
+                {
+                    // Get last price from the instrument's market data
+                    double lastPrice = 0;
+                    var md = m.Instrument?.MarketData;
+                    if (md != null && md.Last != null)
+                        lastPrice = md.Last.Price;
+                    if (lastPrice <= 0) continue;
+
+                    bool trigger = false;
+                    if (m.Condition == "cross_above" && m.LastPrice > 0 && m.LastPrice < m.Level && lastPrice >= m.Level)
+                        trigger = true;
+                    else if (m.Condition == "cross_below" && m.LastPrice > 0 && m.LastPrice > m.Level && lastPrice <= m.Level)
+                        trigger = true;
+
+                    m.LastPrice = lastPrice;
+
+                    if (trigger)
+                    {
+                        m.Triggered = true;
+                        // Fire NT8 AlertCallback into the Alerts Log
+                        try
+                        {
+                            NinjaTrader.NinjaScript.Alert.AlertCallback(
+                                m.Instrument, this, m.AlertId, NinjaTrader.Core.Globals.Now,
+                                NinjaTrader.NinjaScript.Priority.High, m.Message,
+                                NinjaTrader.Core.Globals.InstallDir + @"\sounds\Alert1.wav",
+                                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Yellow),
+                                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Black),
+                                0);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+        }
 
         private void WriteResponse(HttpListenerContext ctx, int code, object data)
         {
@@ -4730,7 +5430,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 public static class DictionaryExtensions
 {
     public static object GetValueOrDefault(this Dictionary<string, object> dict, string key, object defaultValue = null)
-        => dict.TryGetValue(key, out var val) ? val : defaultValue;
+        { object val; return dict.TryGetValue(key, out val) ? val : defaultValue; }
 }
 
 // Safe JObject accessors. JObject.Value<T>(string) resolves to the IEnumerable<JToken>

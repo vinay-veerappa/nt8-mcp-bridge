@@ -96,21 +96,44 @@ const TOOLS = [
   },
   {
     name: 'nt_place_atm_order',
-    description: 'Place an order bound to server-side ATM strategy brackets (stop loss, profit target, auto-breakeven)',
+    description: 'Place a bracket order with server-side ATM strategy (stop loss, profit target, auto-breakeven, trailing, partials). Supports 8 strategies: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal. Auto-selects strategy per instrument if omitted.',
     inputSchema: {
       type: 'object',
       properties: {
-        symbol:         { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
-        action:         { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
-        quantity:       { type: 'number', description: 'Contracts' },
-        strategyName:   { type: 'string', description: 'ATM strategy template name (e.g. SwingPointTrailing, VolatilityAdaptive, DrawdownShield)', default: 'VolatilityAdaptive' },
-        stopTicks:      { type: 'number', description: 'Stop loss distance in ticks' },
-        targetTicks:    { type: 'number', description: 'Profit target distance in ticks' },
-        account:        { type: 'string', description: 'Target account', default: 'Sim101' },
-        confirmLive:    { type: 'boolean', description: 'Explicit confirmation required when placing orders on live (non-Sim) accounts' },
-        idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+        symbol:              { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
+        action:              { type: 'string', enum: ['buy', 'sell'], description: 'Direction' },
+        quantity:            { type: 'number', description: 'Contracts (overridden by VolatilityScaled/KellyOptimal if riskPerTrade set)' },
+        strategyName:        { type: 'string', description: 'ATM strategy: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal. Omit for auto-select per instrument.' },
+        stopTicks:           { type: 'number', description: 'Stop loss distance in ticks (FixedTicks, DrawdownShield, ScaledRunner, SessionAdaptive)' },
+        targetTicks:         { type: 'number', description: 'Profit target distance in ticks (FixedTicks, DrawdownShield, ScaledRunner, SessionAdaptive)' },
+        atrMultiplierSL:     { type: 'number', description: 'ATR multiplier for stop loss (AtrAdaptive, VolatilityScaled, KellyOptimal)', default: 1.5 },
+        atrMultiplierTP:     { type: 'number', description: 'ATR multiplier for target (AtrAdaptive, VolatilityScaled, KellyOptimal)', default: 2.5 },
+        atrPeriod:           { type: 'number', description: 'ATR calculation period', default: 14 },
+        swingLookbackBars:   { type: 'number', description: 'Bars to look back for swing point (SwingPoint)', default: 5 },
+        swingBufferTicks:    { type: 'number', description: 'Buffer ticks past swing point (SwingPoint)', default: 4 },
+        breakevenTriggerTicks: { type: 'number', description: 'Ticks profit before moving stop to breakeven (DrawdownShield, ScaledRunner)', default: 12 },
+        breakevenOffsetTicks:  { type: 'number', description: 'Ticks past entry for breakeven stop (DrawdownShield)', default: 2 },
+        partialProfitPct:    { type: 'number', description: 'Fraction to take partial profit (DrawdownShield)', default: 0.50 },
+        trailMultiplier:     { type: 'number', description: 'Trailing stop multiplier on stopTicks (ScaledRunner)', default: 2.0 },
+        riskPerTrade:        { type: 'number', description: 'Max $ risk per trade (VolatilityScaled, KellyOptimal)', default: 200 },
+        kellyFraction:       { type: 'number', description: 'Fractional Kelly multiplier (KellyOptimal)', default: 0.25 },
+        winRate:             { type: 'number', description: 'Assumed win rate for Kelly (KellyOptimal)', default: 0.55 },
+        avgRR:               { type: 'number', description: 'Assumed avg risk-reward for Kelly (KellyOptimal)', default: 2.0 },
+        account:             { type: 'string', description: 'Target account', default: 'Sim101' },
+        confirmLive:         { type: 'boolean', description: 'Explicit confirmation required when placing orders on live (non-Sim) accounts' },
+        idempotencyKey:      { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
       },
       required: ['symbol', 'action', 'quantity', 'idempotencyKey'],
+    },
+  },
+  {
+    name: 'nt_atm_bracket_status',
+    description: 'Query active ATM bracket status by bracketId, or list all active brackets',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bracketId: { type: 'string', description: 'Bracket ID from nt_place_atm_order response. Omit to list all active brackets.' },
+      },
     },
   },
   {
@@ -782,6 +805,13 @@ async function handleToolCall(name, args) {
 
     case 'nt_place_atm_order': {
       const res = await ntFetch('/api/order/atm', 'POST', args);
+      return res.data;
+    }
+
+    case 'nt_atm_bracket_status': {
+      const params = new URLSearchParams();
+      if (args.bracketId) params.append('bracketId', args.bracketId);
+      const res = await ntFetch(`/api/order/atm/status?${params}`);
       return res.data;
     }
 
