@@ -432,7 +432,18 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 // - RiskGuard FSM observation & Version (read-only) -
                 case "/api/riskguard/version":
-                    return new { success = true, version = RiskGuardAddOn.Version, name = "RiskGuardAddOn" };
+                    // P1-47: report the arm state here too. It was previously visible only on the
+                    // dashboard, so a silently disarmed guard was indistinguishable from a working one.
+                    return new
+                    {
+                        success = true,
+                        version = RiskGuardAddOn.Version,
+                        name = "RiskGuardAddOn",
+                        loaded = RiskGuardAddOn.Instance != null,
+                        mode = RiskGuardAddOn.Instance != null ? RiskGuardAddOn.Instance.GetMode() : null,
+                        isArmed = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed,
+                        guarding = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed
+                    };
                 case "/api/riskguard/fsm-state":
                     return GetFsmState(query["account"], query["instrument"]);
                 case "/api/riskguard/fsm-reset":
