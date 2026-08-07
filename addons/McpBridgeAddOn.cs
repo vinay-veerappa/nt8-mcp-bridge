@@ -250,26 +250,46 @@ namespace NinjaTrader.NinjaScript.AddOns
                 LoadJsonStore(RiskGuardConfigFile, _riskGuardConfig);
                 LoadJsonStore(TradeJournalFile, _tradeJournal);
 #if !TESTING
-                foreach (Account acc in Account.All)
-                {
-                    acc.ExecutionUpdate -= OnAccountExecutionUpdate;
-                    acc.ExecutionUpdate += OnAccountExecutionUpdate;
-                }
+                // P1-21: this pass used to be the ONLY one, so any account that connected
+                // after State.Configure never fed the copier and its relationships were
+                // silently dead. Subscribe now, and again on every connection change.
+                TradeCopierEngine.Instance.RefreshAccountSubscriptions();
+                Connection.ConnectionStatusUpdate -= OnConnectionStatusUpdateForCopier;
+                Connection.ConnectionStatusUpdate += OnConnectionStatusUpdateForCopier;
 #endif
                 StartServer();
             }
             else if (State == State.Terminated)
             {
+#if !TESTING
+                Connection.ConnectionStatusUpdate -= OnConnectionStatusUpdateForCopier;
+                // Handlers left attached outlive the AddOn reload that follows every
+                // recompile, and the next engine instance cannot detach them -- the account
+                // would then deliver each execution to both engines and copy every fill twice.
+                TradeCopierEngine.Instance.UnsubscribeAllAccounts();
+#endif
                 StopServer();
             }
         }
 
 #if !TESTING
-        private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs e)
+        private void OnConnectionStatusUpdateForCopier(object sender, ConnectionStatusEventArgs e)
         {
-            if (e != null && e.Execution != null)
+            try
             {
-                TradeCopierEngine.Instance.OnExecution(e.Execution);
+                int added = TradeCopierEngine.Instance.RefreshAccountSubscriptions();
+                if (added > 0)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        string.Format("[McpBridge] Copier subscribed to {0} newly available account(s) after connection change.", added),
+                        PrintTo.OutputTab1);
+                }
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    string.Format("[McpBridge] Copier re-subscribe failed: {0}", ex.Message),
+                    PrintTo.OutputTab1);
             }
         }
 #endif
