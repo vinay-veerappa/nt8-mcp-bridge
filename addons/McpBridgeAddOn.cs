@@ -1738,8 +1738,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             var account = Account.All.FirstOrDefault(a => a.Name == accountName);
             if (account == null) return new { error = "account not found: " + accountName };
             // SIM-first guard: refuse a non-sim account unless explicitly confirmed.
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             if (!isSim && !confirmLive)
                 return new { error = "refusing to deploy to LIVE account '" + account.Name + "' without confirmLive=true" };
 
@@ -2271,8 +2273,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
             if (!isSim && !confirmLive)
             {
@@ -2335,8 +2339,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
             if (!isSim && !confirmLive)
             {
@@ -3989,7 +3995,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                           ?? Account.All.FirstOrDefault();
             if (account == null) return new { error = "no account available" };
 
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase);
+            // P2-38: this site was worse than the other three -- name prefix ONLY, with no
+            // provider test at all to fall back on.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.Bool("confirmLive");
             if (!isSim && !confirmLive)
                 return new { error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" };
@@ -5154,11 +5162,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             // This writes to RiskGuard/config.json (the correct file) AND reloads the live engine.
             try
             {
-                var cfg = req.ToObject<RiskConfig>();
+                // P2-41: MERGE onto the live config, never deserialize the body on its own.
+                // req.ToObject<RiskConfig>() gives every omitted field its DEFAULT, and
+                // SaveAndReloadConfig then wrote those defaults to disk and reloaded them. A
+                // caller adding one entry to ExcludedAccounts also reset Mode to shadow,
+                // MinShadowSessions to 0, EnableWindowGate to false and every StopGuard /
+                // PnLRules / FirmMirror value -- destroying the live risk configuration while
+                // replying "applied".
+                JObject mergedJson;
+                var cfg = RiskConfigMerge.Apply(RiskGuardAddOn.Instance.Config, req, out mergedJson);
                 if (cfg == null)
-                    return new { error = "Could not deserialize body to RiskConfig." };
+                    return new { error = "Could not deserialize merged body to RiskConfig." };
                 RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
-                return new { success = true, status = "applied", config = req, note = "Written to RiskGuard/config.json and reloaded into the live RiskGuard engine via SaveAndReloadConfig." };
+                // Echo the RESULT, not the request. The old reply looked identical whether the
+                // fields the caller omitted survived or were flattened to their defaults.
+                return new { success = true, status = "applied", config = RiskGuardAddOn.Instance.Config, requested = req, note = "Partial body merged onto the live config, written to RiskGuard/config.json and reloaded. `config` is the RESULTING live config; `requested` is what you sent." };
             }
             catch (Exception ex)
             {
