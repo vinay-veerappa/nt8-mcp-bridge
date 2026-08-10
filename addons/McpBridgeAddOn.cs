@@ -464,6 +464,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                         isArmed = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed,
                         guarding = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed
                     };
+                // P0-9 targets/OCO research: what does each connection actually support?
+                // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
+                // must simulate the pairing itself, is a per-connection fact -- NT8 exposes
+                // NativeOcoOrders, RequiresOcoSubmitInPairs, NoIndependentOcoOrders and
+                // OcoNeedsManualCancellation -- and it was previously being guessed at. Read-only.
+                case "/api/connections":
+                    return GetConnectionFeatures(query["account"]);
                 case "/api/riskguard/fsm-state":
                     return GetFsmState(query["account"], query["instrument"]);
                 case "/api/riskguard/fsm-reset":
@@ -3728,6 +3735,69 @@ namespace NinjaTrader.NinjaScript.AddOns
                 bool enforcing = cfg != null && cfg.ArmedForLive;
                 return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = enforcing, config = cfg };
             }
+        }
+
+        /// <summary>
+        /// Read-only: what each account's connection says it can do about OCO.
+        ///
+        /// Exists because the copier's mirrored-target design (P0-9 item 1) turns entirely on four
+        /// per-connection capability flags, and those were being assumed rather than read. The Sim
+        /// accounts and the funded Provider31 accounts need not agree, and picking a design from
+        /// the wrong one is how you build a bracket that works in Sim and leaves a live follower
+        /// half-covered.
+        /// </summary>
+        private object GetConnectionFeatures(string accountFilter)
+        {
+            var rows = new List<object>();
+            foreach (Account acc in Account.All.ToList())
+            {
+                if (acc == null) continue;
+                if (!string.IsNullOrEmpty(accountFilter)
+                    && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
+
+                string connName = null;
+                string[] features = new string[0];
+                string err = null;
+                try
+                {
+                    var conn = acc.Connection;
+                    if (conn != null)
+                    {
+                        try { connName = conn.Options != null ? conn.Options.Name : null; } catch { }
+                        var f = conn.Features;
+                        if (f != null) features = f.Select(x => x.ToString()).OrderBy(x => x).ToArray();
+                    }
+                }
+                catch (Exception ex) { err = ex.Message; }
+
+                bool nativeOco   = features.Contains("NativeOcoOrders");
+                bool pairSubmit  = features.Contains("RequiresOcoSubmitInPairs");
+                bool noIndep     = features.Contains("NoIndependentOcoOrders");
+                bool manualCncl  = features.Contains("OcoNeedsManualCancellation");
+
+                rows.Add(new
+                {
+                    account = acc.Name,
+                    provider = acc.Provider.ToString(),
+                    connection = connName,
+                    connectionStatus = acc.ConnectionStatus.ToString(),
+                    isSimulation = TradeCopierEngine.IsSimulationAccount(acc),
+                    ocoFeatures = new
+                    {
+                        nativeOcoOrders = nativeOco,
+                        requiresOcoSubmitInPairs = pairSubmit,
+                        noIndependentOcoOrders = noIndep,
+                        ocoNeedsManualCancellation = manualCncl
+                    },
+                    // The straight answer to "can the copier hand this follower a real OCO pair?"
+                    ocoVerdict = nativeOco
+                        ? (manualCncl ? "native-but-manual-cancel" : "native")
+                        : "simulate-in-copier",
+                    allFeatures = features,
+                    error = err
+                });
+            }
+            return new { success = true, count = rows.Count, accounts = rows };
         }
 
         private object HandleLockout(string body)
