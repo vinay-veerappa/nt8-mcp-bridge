@@ -1698,6 +1698,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         orderType = order.OrderType.ToString(), quantity = order.Quantity,
                         limitPrice = order.LimitPrice, stopPrice = order.StopPrice,
                         state = order.OrderState.ToString(), filled = order.Filled, time = order.Time,
+                        // Which OCO group the order belongs to, if any. Read-only, and the field
+                        // that makes bracket pairing legible from outside NT8: two orders sharing
+                        // an oco are siblings, and a re-created leg carrying a NEW id is evidence
+                        // of per-generation ids rather than one id held for the bracket's life.
+                        oco = order.Oco ?? "",
                     });
                 }
             return orders;
