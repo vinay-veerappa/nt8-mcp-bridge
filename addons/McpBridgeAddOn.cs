@@ -3871,11 +3871,25 @@ namespace NinjaTrader.NinjaScript.AddOns
                     quarantineReason = r.QuarantineReason
                 }).ToList();
 
+                // P1-76. A follower belongs to a direct relationship OR a group, never both.
+                // The write paths refuse to create an overlap, so a non-empty list here means
+                // someone hand-edited copier_config.json. Surfaced because the whole point of
+                // the rule is that there is ONE place to look for what applies to a follower --
+                // and where that is not true, the UI has to be able to say so rather than
+                // render a group setting that is silently ignored.
+                var configConflicts = TradeCopierEngine.Instance.DetectConfigConflicts();
+
                 return new
                 {
                     success = true, action, leaderAccount = leader,
                     persisted = File.Exists(CopierConfigFile), loaded = true, enforcing = enforcing,
                     config = rel, relationships = rels, groups = groups,
+                    configConflicts = configConflicts,
+                    configConflictNote = configConflicts.Count == 0
+                        ? "none -- every follower is covered by a direct relationship OR a group, not both."
+                        : "⚠️ a follower is covered by BOTH a direct relationship and a group. The DIRECT "
+                          + "one applies and the group's settings are IGNORED for it. The write paths refuse "
+                          + "to create this, so it came from editing copier_config.json by hand.",
                     metrics = metrics,
                     metricsScope = "session",
                     metricsNote = "latencyMs/avgSlippageTicks are measured live per fill and are "
