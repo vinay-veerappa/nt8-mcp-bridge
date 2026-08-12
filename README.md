@@ -5,7 +5,9 @@ and the risk guard's own state to external tooling (an MCP server, scripts, agen
 it drives the dynamic ATM manager.
 
 Extracted from `tvDownloadOHLC` on 2026-08-12 with full history (see
-[vendor/nt8-riskguard/docs/NT8_REPO_SPLIT_PLAN.md](vendor/nt8-riskguard/docs/NT8_REPO_SPLIT_PLAN.md)).
+[NT8_REPO_SPLIT_PLAN.md](https://github.com/vinay-veerappa/nt8-riskguard/blob/main/docs/NT8_REPO_SPLIT_PLAN.md)).
+That link deliberately points at the core's `main`, not at the copy under `vendor/`: the
+submodule is pinned to a tag, so its docs are frozen at whatever that tag said.
 
 ## Layout
 
