@@ -525,7 +525,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // to POST -- i.e. to write in order to read. That defeats the GET-mutate-POST-GET-diff
                 // discipline this project relies on, and it is why the live metrics could not simply
                 // be read off the box. Mirrors /api/riskguard/config below.
-                case "/api/copier/config":      return method == "GET" ? CopierConfig(null) : Post(method, () => CopierConfig(body));
+                case "/api/copier/config":      return method == "GET" ? CopierReadFromQuery(query) : Post(method, () => CopierConfig(body));
                 case "/api/prop/limits":        return Post(method, () => PropLimits(body));
                 case "/api/trades/extract":     return ExtractTrades(query["account"], query["format"], query["from"], query["to"], query["limit"]);
                 case "/api/trades/monte-carlo": return Post(method, () => MonteCarlo(body));
@@ -555,6 +555,45 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static object Post(string method, Func<object> fn)
             => method == "POST" ? fn() : new { error = "method not allowed" };
+
+        // A GET carries no body, but it can still name what it is asking ABOUT.
+        //
+        // Passing null (as this route did until 2026-08-13) makes CopierConfig fall back
+        // to leaderAccount "Sim101", so `GET /api/copier/config?leaderAccount=Sim-ORB`
+        // returned Sim101's relationship in `config` with success: true and the wrong
+        // account echoed back. Measured on the live box, not inferred. A response that
+        // confidently answers a question nobody asked is P0-68's shape.
+        //
+        // The action is WHITELISTED rather than passed through. CopierConfig's if-chain
+        // contains every write branch, so forwarding an arbitrary query action would let
+        // `GET ...?action=remove_group&groupName=X` mutate config over a GET -- turning
+        // the read this route exists to provide into the write it exists to avoid.
+        private object CopierReadFromQuery(System.Collections.Specialized.NameValueCollection query)
+        {
+            string action = query == null ? null : query["action"];
+            string leader = query == null ? null : query["leaderAccount"];
+
+            bool isRead = string.IsNullOrWhiteSpace(action)
+                          || action.Equals("get", StringComparison.OrdinalIgnoreCase)
+                          || action.Equals("get_groups", StringComparison.OrdinalIgnoreCase);
+
+            if (!isRead)
+                return new
+                {
+                    success = false,
+                    error = "method not allowed",
+                    detail = "action '" + action + "' modifies configuration and cannot be issued over GET. "
+                           + "POST it instead. Only 'get' and 'get_groups' are readable here.",
+                };
+
+            if (string.IsNullOrWhiteSpace(leader) && string.IsNullOrWhiteSpace(action))
+                return CopierConfig(null);
+
+            var req = new JObject();
+            if (!string.IsNullOrWhiteSpace(action)) req["action"] = action;
+            if (!string.IsNullOrWhiteSpace(leader)) req["leaderAccount"] = leader;
+            return CopierConfig(req.ToString());
+        }
 
         // -
         //  Strategy authoring (safe - pure file I/O)
@@ -3736,7 +3775,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action.Equals("get_groups", StringComparison.OrdinalIgnoreCase))
             {
-                TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
+                // P1-69, second half. The LoadFromDisk here was left behind when the
+                // `get` branch below had its own removed on 2026-08-13: the fix went in
+                // one of TWO read branches. Same defect, same consequence -- the reload
+                // REPLACES the in-memory relationships that ObserveFollowerFill writes
+                // its latency/slippage measurements onto, so listing the GROUPS silently
+                // discarded the relationship measurements. A read must not mutate, and
+                // "a read" means every read, not the one the defect report named.
                 return new { success = true, action, groups = TradeCopierEngine.Instance.GetGroups() };
             }
 
@@ -3863,7 +3908,22 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else
             {
-                PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
+                // P1-75. This used to call LoadFromDisk, and that was strictly worse than
+                // P1-69's version of the same mistake. LoadFromDisk ends in
+                // UpdateConfig(cfg) with no confirmLive, and UpdateConfig's safety gate
+                // forces ArmedForLive to false without it -- so READING the prop-firm
+                // rules DISARMED them. Every other field survived the reload, which is
+                // why it could sit here unnoticed: the only thing lost was whether
+                // anything is enforced at all.
+                //
+                // The gate is right and stays. What was wrong is a read path invoking it.
+                // Pinned by TestP1_75_ReloadingPropLimitsFromDiskDisarmsThem in the core
+                // suite, which asserts the disarm so nobody "fixes" this by weakening the
+                // gate and letting an armed config load itself at startup.
+                //
+                // In-memory IS the live config: it is loaded at State.Configure and every
+                // write path above saves. A hand-edit to prop_limits.json is picked up at
+                // the next NT8 start, deliberately not by a reader.
                 var cfg = PropFirmProtectionSuite.Instance.Config;
                 bool enforcing = cfg != null && cfg.ArmedForLive;
                 return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = enforcing, config = cfg };
