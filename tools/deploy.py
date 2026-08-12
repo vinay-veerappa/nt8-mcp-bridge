@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -92,6 +93,81 @@ def collect_sources() -> list:
     return ([("core", p) for p in vendor_files] + [("bridge", p) for p in bridge_files])
 
 
+def _git(repo: Path, *args: str):
+    """Run git in `repo`; return stripped stdout, or None if it failed or git is absent."""
+    try:
+        proc = subprocess.run(["git", "-C", str(repo)] + list(args),
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def check_vendor_not_stale(deploying: bool) -> None:
+    """Refuse to deploy a vendored core that is BEHIND the sibling core checkout.
+
+    This tool deploys the bridge AND its vendored core, so a stale pin does not
+    merely fail to bring a fix -- it OVERWRITES a newer core already live in NT8
+    and silently reverts it. That is not hypothetical: on 2026-08-12 the pin sat
+    at v1.0.1 while v1.0.2 (the P0-63 fix, without which the mirrored stop had
+    never trailed) was deployed and running. Nothing would have warned.
+
+    The check is local and needs no network: if the canonical core checkout is
+    beside this repo, ask git whether the pinned commit is a strict ancestor of
+    its main. Strictly behind is the one unsafe case. Equal, ahead, or unknown
+    are all allowed -- unknown only warns, because refusing on "I could not tell"
+    would block a legitimate deploy on a machine that has no core checkout, and
+    this tool must stay usable there.
+    """
+    vendor_repo = REPO_ROOT / "vendor" / "nt8-riskguard"
+    sibling = REPO_ROOT.parent / "nt8-riskguard"
+
+    pinned = _git(vendor_repo, "rev-parse", "HEAD")
+    described = _git(vendor_repo, "describe", "--tags", "--always") or "unknown"
+
+    if pinned is None or not (sibling / ".git").exists():
+        print("  [WARN] cannot compare the vendored core against a canonical checkout")
+        print("         (pinned: {0}). Deploying it anyway -- but if a NEWER core is".format(described))
+        print("         live in NT8, this OVERWRITES it. Check before trusting this run.")
+        return
+
+    sibling_main = _git(sibling, "rev-parse", "main")
+    if sibling_main is None:
+        print("  [WARN] {0} has no `main` to compare against; pinned {1}.".format(sibling, described))
+        return
+
+    if pinned == sibling_main:
+        print("  vendored core: {0} -- matches {1} main".format(described, sibling.name))
+        return
+
+    behind = subprocess.run(
+        ["git", "-C", str(vendor_repo), "merge-base", "--is-ancestor", pinned, sibling_main],
+        capture_output=True, text=True)
+    if behind.returncode != 0:
+        # Not an ancestor: ahead, or on an unrelated branch. Not the unsafe case.
+        print("  vendored core: {0} -- not behind {1} main".format(described, sibling.name))
+        return
+
+    count = _git(vendor_repo, "rev-list", "--count", "{0}..{1}".format(pinned, sibling_main)) or "?"
+    print()
+    print("[FATAL] the vendored core is STALE: {0} is {1} commit(s) behind {2} main.".format(
+        described, count, sibling.name))
+    print()
+    print("        This tool deploys the core as well as the bridge, so deploying now")
+    print("        would overwrite whatever core is live in NT8 with an OLDER one and")
+    print("        silently revert it. On 2026-08-12 that would have reverted P0-63,")
+    print("        the fix without which the mirrored stop never trailed.")
+    print()
+    print("        Keep the two repos in sync, then retry:")
+    print("          cd {0} && git tag -a vX.Y.Z && git push origin main --tags".format(sibling))
+    print("          cd {0}/vendor/nt8-riskguard && git fetch --tags && git checkout vX.Y.Z".format(REPO_ROOT))
+    print("          cd {0} && git add vendor/nt8-riskguard && git commit".format(REPO_ROOT))
+    print()
+    print("        --verify and --dry-run are unaffected; only deploying is blocked.")
+    if deploying:
+        sys.exit(2)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Deploy the bridge and its vendored core into NT8, together or not at all.")
@@ -108,6 +184,11 @@ def main() -> int:
     print("  core:     {0}".format(VENDOR_SRC))
     print("  NT8 dest: {0}".format(ADDONS_DST))
     print("  mode:     {0}".format("VERIFY" if args.verify else "DRY-RUN" if args.dry_run else "DEPLOY"))
+    print()
+
+    # Before touching anything: is the core we are about to deploy actually the
+    # current one? Exits 2 on a stale pin when deploying.
+    check_vendor_not_stale(deploying=not (args.verify or args.dry_run))
     print()
 
     if not NT8_HOME.exists():
