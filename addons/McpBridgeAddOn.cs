@@ -2495,16 +2495,138 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (OrderMatches(order, orderId))
                     {
-                        order.Quantity = quantity > 0 ? quantity : order.Quantity;
+                        // P0-68. This used to be: write the desired values, call Change(), and return
+                        // `status = "modified"` with the order's own fields. Every part of that is a
+                        // trap.
+                        //
+                        // `Account.Change()` is a REQUEST. NT8 leaves the caller's desired values on
+                        // the Order until the provider settles, so reading them back on the next line
+                        // ALWAYS agrees with what was asked -- and on `provider: Simulator` the change
+                        // is then silently discarded. Verified twice on 2026-08-13: a resting buy limit
+                        // at 29500 was asked to move to 29450, this endpoint answered
+                        // `{"status": "modified", "limitPrice": 29500}`, and the order never moved.
+                        // The refutation was already in the response body, beside the success claim.
+                        //
+                        // So: remember what the order held BEFORE, request the change, wait a bounded
+                        // time for the provider to settle, and report what actually happened. Nothing
+                        // here says "modified" without having observed it.
+                        int wasQuantity = order.Quantity;
+                        double wasLimit = order.LimitPrice;
+                        double wasStop = order.StopPrice;
+
+                        int wantQuantity = quantity > 0 ? quantity : order.Quantity;
+                        double wantLimit = limitPrice >= 0 ? limitPrice : order.LimitPrice;
+                        double wantStop = stopPrice >= 0 ? stopPrice : order.StopPrice;
+
+                        order.Quantity = wantQuantity;
                         if (limitPrice >= 0) order.LimitPrice = limitPrice;
                         if (stopPrice >= 0) order.StopPrice = stopPrice;
 
                         account.Change(new[] { order });
-                        return new { status = "modified", orderId, quantity = order.Quantity, limitPrice = order.LimitPrice, stopPrice = order.StopPrice };
+
+                        // Bounded wait for the provider to settle. Deliberately short: this is an
+                        // interactive endpoint, and a caller that gets `change_pending` can re-read the
+                        // order -- which is strictly better than a caller that gets "modified" and
+                        // believes it.
+                        bool settled = false;
+                        for (int waited = 0; waited < ChangeSettleTimeoutMs; waited += ChangeSettlePollMs)
+                        {
+                            var st = order.OrderState;
+                            if (st != OrderState.ChangePending && st != OrderState.ChangeSubmitted)
+                            {
+                                settled = true;
+                                break;
+                            }
+                            System.Threading.Thread.Sleep(ChangeSettlePollMs);
+                        }
+
+                        bool quantityTook = order.Quantity == wantQuantity;
+                        bool limitTook = limitPrice < 0 || Math.Abs(order.LimitPrice - wantLimit) <= 1e-9;
+                        bool stopTook = stopPrice < 0 || Math.Abs(order.StopPrice - wantStop) <= 1e-9;
+                        bool allTook = quantityTook && limitTook && stopTook;
+
+                        bool unchanged = order.Quantity == wasQuantity
+                                         && Math.Abs(order.LimitPrice - wasLimit) <= 1e-9
+                                         && Math.Abs(order.StopPrice - wasStop) <= 1e-9;
+
+                        string status;
+                        string note;
+                        if (!settled)
+                        {
+                            status = "change_pending";
+                            note = "The provider had not settled the change within "
+                                 + ChangeSettleTimeoutMs + " ms. NOTHING is claimed: re-read the order "
+                                 + "to find out what it holds. Do not treat this as success.";
+                        }
+                        else if (allTook)
+                        {
+                            status = "modified";
+                            note = "Confirmed: the provider settled the order at the requested values.";
+                        }
+                        else if (unchanged)
+                        {
+                            status = "change_ignored";
+                            note = "The provider ACCEPTED the change and then discarded it -- the order "
+                                 + "settled back at the values it already held. This is normal on "
+                                 + "provider: Simulator. To move this order, cancel it and place a new "
+                                 + "one; asking again will fail the same way.";
+                        }
+                        else
+                        {
+                            status = "partially_modified";
+                            note = "The order moved, but NOT to everything that was requested. A "
+                                 + "quantity increase in particular is silently refused by some "
+                                 + "providers (see P0-62).";
+                        }
+
+                        LogChangeOutcome(account.Name, orderId, status, wasQuantity, wasLimit, wasStop,
+                            wantQuantity, wantLimit, wantStop, order);
+
+                        return new
+                        {
+                            status,
+                            orderId,
+                            note,
+                            settled,
+                            requested = new { quantity = wantQuantity, limitPrice = wantLimit, stopPrice = wantStop },
+                            observed = new { quantity = order.Quantity, limitPrice = order.LimitPrice, stopPrice = order.StopPrice, orderState = order.OrderState.ToString() },
+                            before = new { quantity = wasQuantity, limitPrice = wasLimit, stopPrice = wasStop },
+                            // Kept so existing callers reading these fields see the OBSERVED values
+                            // rather than the requested ones. They previously got the request echoed
+                            // back, which is what made the defect invisible.
+                            quantity = order.Quantity,
+                            limitPrice = order.LimitPrice,
+                            stopPrice = order.StopPrice
+                        };
                     }
                 }
             }
             return new { error = $"order not found: {orderId}" };
+        }
+
+        /// <summary>How long ChangeOrder waits for the provider to settle before declining to claim.</summary>
+        private const int ChangeSettleTimeoutMs = 1500;
+        private const int ChangeSettlePollMs = 50;
+
+        /// <summary>
+        /// P0-68. A change outcome belongs in the guard's structured log, not only in an HTTP
+        /// response nobody keeps. `interventions.jsonl` is where every other order decision on this
+        /// box is recorded, and a silently-refused stop move is exactly the thing someone will be
+        /// looking for after the fact.
+        /// </summary>
+        private void LogChangeOutcome(string accountName, string orderId, string status,
+            int wasQty, double wasLimit, double wasStop,
+            int wantQty, double wantLimit, double wantStop, Order settledOrder)
+        {
+            try
+            {
+                RiskGuardAddOn.LogFromComponent(accountName, "BRIDGE_ORDER_CHANGE_" + status.ToUpperInvariant(),
+                    $"order '{orderId}': requested {wantQty}@limit {wantLimit}/stop {wantStop}, "
+                    + $"was {wasQty}@limit {wasLimit}/stop {wasStop}, "
+                    + $"settled {settledOrder.Quantity}@limit {settledOrder.LimitPrice}/stop {settledOrder.StopPrice} "
+                    + $"(state {settledOrder.OrderState}).");
+            }
+            catch { }
         }
 
         private object CancelAllOrders()

@@ -183,8 +183,11 @@ def check_vendor_not_stale(deploying: bool) -> None:
         return
 
     print()
-    print("[FATAL] the vendored core is STALE: {0} is {1} commit(s) behind {2} main,".format(
-        described, count, sibling.name))
+    # Label it for what it IS in this invocation. On --verify/--dry-run nothing is blocked,
+    # so printing [FATAL] and exiting 0 was a message overstating its own outcome -- the
+    # same class of defect as P1-70's log line, in the tool that reports on it.
+    print("[{0}] the vendored core is STALE: {1} is {2} commit(s) behind {3} main,".format(
+        "FATAL" if deploying else "WARN", described, count, sibling.name))
     print("        including {0} that touch addons/.".format(addon_commits or "?"))
     print()
     print("        This tool deploys the core as well as the bridge, so deploying now")
