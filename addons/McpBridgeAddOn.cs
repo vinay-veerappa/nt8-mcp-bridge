@@ -3616,33 +3616,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action.Equals("set_group", StringComparison.OrdinalIgnoreCase) || action.Equals("upsert_group", StringComparison.OrdinalIgnoreCase))
             {
-                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
-                var followerList = new List<string>();
-                if (req["followers"] is JArray arr)
-                {
-                    foreach (var tok in arr) followerList.Add(tok.ToString());
-                }
-                else if (req["followerAccounts"] is JArray arr2)
-                {
-                    foreach (var tok in arr2) followerList.Add(tok.ToString());
-                }
-
-                var grp = new CopierGroup
-                {
-                    GroupName = groupName ?? "DefaultGroup",
-                    LeaderAccountName = leader,
-                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
-                    ArmedForLive = requestedArmed && confirmLive,
-                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
-                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
-                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
-                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
-                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
-                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
-                    FollowerAccounts = followerList
-                };
-
-                TradeCopierEngine.Instance.UpsertGroup(grp, confirmLive);
+                // The mapping lives on the engine (slice 3b): this file is excluded
+                // from RiskGuardTests.csproj, so anything written here cannot be
+                // covered by an executed test. ApplyGroupRequest upserts.
+                var grp = TradeCopierEngine.Instance.ApplyGroupRequest(req, confirmLive);
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
                 return new { success = true, action, groupName = grp.GroupName, persisted = true, group = grp };
             }
@@ -3680,24 +3657,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
             {
-                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
-
-                var rel = new CopierRelationship
-                {
-                    LeaderAccountName = leader,
-                    FollowerAccountName = req.Str("followerAccount") ?? req.Str("FollowerAccountName") ?? "SimCopy2",
-                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
-                    ArmedForLive = requestedArmed && confirmLive,
-                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
-                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
-                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
-                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
-                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
-                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
-                    IsQuarantined = req["isQuarantined"] != null ? (bool)req["isQuarantined"] : (req["IsQuarantined"] != null ? (bool)req["IsQuarantined"] : false)
-                };
-
-                TradeCopierEngine.Instance.UpsertRelationship(rel, confirmLive);
+                // See the set_group branch: the mapping lives on the engine so it
+                // can be covered by an executed test. ApplyRelationshipRequest upserts.
+                var rel = TradeCopierEngine.Instance.ApplyRelationshipRequest(req, confirmLive);
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
 
                 bool enforcing = rel.IsEnabled && rel.ArmedForLive;
