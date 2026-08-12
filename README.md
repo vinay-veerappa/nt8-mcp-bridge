@@ -33,12 +33,29 @@ git submodule update --init
 ```
 
 The submodule is pinned to a **tag**, not a branch, so this repo always states which core
-it was built against. To move to a newer core:
+it was built against. **Currently `v1.0.2`.** To move to a newer core:
 
 ```bash
-cd vendor/nt8-riskguard && git fetch --tags && git checkout v1.0.1
-cd ../.. && git add vendor/nt8-riskguard && git commit -m "chore: bump core to v1.0.1"
+# in nt8-riskguard: tag and PUSH first -- a submodule cannot resolve a
+# tag that exists only locally
+cd vendor/nt8-riskguard && git fetch --tags && git checkout v1.0.3
+cd ../.. && dotnet run --project tests/BridgeTests.csproj      # against the NEW core
+git add vendor/nt8-riskguard && git commit -m "chore: bump core to v1.0.3"
 ```
+
+### ⚠️ Never leave the pin behind the core
+
+`deploy.py` deploys the vendored core **as well as** the bridge, so a stale pin does not
+merely fail to bring a fix across -- it **overwrites a newer core already live in NT8 and
+silently reverts it**. On 2026-08-12 the pin sat at `v1.0.1` while `v1.0.2` was deployed and
+running; `v1.0.2` carries `P0-63`, the fix without which the mirrored follower stop had
+never trailed. Nothing would have warned.
+
+So `deploy.py` now **refuses (exit 2)** when the pinned commit is a strict ancestor of a
+sibling `nt8-riskguard` checkout's `main`. Strictly-behind is the only unsafe case: equal,
+ahead, and unknown are all allowed, and a missing sibling checkout only warns -- refusing on
+"I could not tell" would block a legitimate deploy on a machine that has only this repo.
+`--verify` and `--dry-run` are never blocked.
 
 **The dependency is one-way.** This repo depends on the core; the core must never depend on
 this one. `nt8-riskguard/tools/check_direction.py` enforces that from the other side.

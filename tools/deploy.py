@@ -140,15 +140,30 @@ def check_vendor_not_stale(deploying: bool) -> None:
         print("  vendored core: {0} -- matches {1} main".format(described, sibling.name))
         return
 
+    # Ask the SIBLING, not the vendored clone. The vendor is a submodule checkout
+    # that only fetches when someone tells it to, so it does not know commits the
+    # canonical repo has made since the last bump -- and `merge-base --is-ancestor`
+    # against a revision git cannot resolve EXITS NON-ZERO, which this function used
+    # to read as "not behind". That inverted the guard in precisely the case it
+    # exists for: a pin left behind while the core moved on. Found 2026-08-13, one
+    # commit after the guard shipped, by watching it pass when it should have failed.
+    # The sibling authored both commits, so it can always answer.
     behind = subprocess.run(
-        ["git", "-C", str(vendor_repo), "merge-base", "--is-ancestor", pinned, sibling_main],
+        ["git", "-C", str(sibling), "merge-base", "--is-ancestor", pinned, sibling_main],
         capture_output=True, text=True)
-    if behind.returncode != 0:
-        # Not an ancestor: ahead, or on an unrelated branch. Not the unsafe case.
+    if behind.returncode == 1:
+        # Definitively NOT an ancestor: ahead, or an unrelated branch. Safe.
         print("  vendored core: {0} -- not behind {1} main".format(described, sibling.name))
         return
+    if behind.returncode != 0:
+        # Could not evaluate at all (unknown revision, git error). Say so loudly
+        # rather than silently allowing it -- an unreadable guard is not a pass.
+        print("  [WARN] cannot tell whether the vendored core is behind {0} main".format(sibling.name))
+        print("         (pinned {0}; `merge-base --is-ancestor` failed). Treating as".format(described))
+        print("         NOT behind, but verify by hand before trusting this run.")
+        return
 
-    count = _git(vendor_repo, "rev-list", "--count", "{0}..{1}".format(pinned, sibling_main)) or "?"
+    count = _git(sibling, "rev-list", "--count", "{0}..{1}".format(pinned, sibling_main)) or "?"
     print()
     print("[FATAL] the vendored core is STALE: {0} is {1} commit(s) behind {2} main.".format(
         described, count, sibling.name))
