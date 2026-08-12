@@ -164,9 +164,28 @@ def check_vendor_not_stale(deploying: bool) -> None:
         return
 
     count = _git(sibling, "rev-list", "--count", "{0}..{1}".format(pinned, sibling_main)) or "?"
+
+    # Behind, but behind in WHAT? This tool deploys addons/*.cs and nothing else, so
+    # a pin trailing only docs, tests, tooling or the agent profile carries no deploy
+    # risk at all -- the .cs it would write are byte-identical. Blocking on that would
+    # make every documentation commit in the core require a tag-and-bump before the
+    # bridge could be deployed, and a guard that fires when nothing is wrong is one
+    # people learn to override. Same reasoning as file_hash() normalising line endings:
+    # a check that cries wolf is worse than no check.
+    #
+    # So: narrow the question to the only files that can hurt.
+    addon_commits = _git(sibling, "rev-list", "--count",
+                         "{0}..{1}".format(pinned, sibling_main), "--", "addons/")
+    if addon_commits == "0":
+        print("  vendored core: {0} -- {1} commit(s) behind {2} main, but NONE touch".format(
+            described, count, sibling.name))
+        print("                 addons/, so the deployed .cs are identical. Proceeding.")
+        return
+
     print()
-    print("[FATAL] the vendored core is STALE: {0} is {1} commit(s) behind {2} main.".format(
+    print("[FATAL] the vendored core is STALE: {0} is {1} commit(s) behind {2} main,".format(
         described, count, sibling.name))
+    print("        including {0} that touch addons/.".format(addon_commits or "?"))
     print()
     print("        This tool deploys the core as well as the bridge, so deploying now")
     print("        would overwrite whatever core is live in NT8 with an OLDER one and")
