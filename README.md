@@ -21,9 +21,37 @@ AI Client (MCP stdio)  →  nt-mcp-server.js  →  HTTP :7890  →  NT8 McpBridg
 
 Three layers, zero external APIs, everything runs locally on the NT8 machine.
 
+## Tests
+
+```bash
+npm test          # 33 tests, node:test, still zero dependencies
+```
+
+⚠️ **Not `node --test tests/`** — on Node ≥ 22 the directory is resolved as a module path
+and the run dies with `MODULE_NOT_FOUND`, which looks exactly like a legitimate red
+baseline. Use `npm test`.
+
+Coverage is currently `lib/copier-config-request.js` only, and that is deliberate about
+where it lives: `nt-mcp-server.js` starts a stdin readline loop at import, so a test of a
+function defined inside it hangs. **Any request-building logic worth testing belongs in
+`lib/`.** The mapping for `nt_copier_config` was moved there after four defects
+(`P1-72`…`P1-75`) were found in it — see
+[`nt8-riskguard`'s hardening plan](https://github.com/vinay-veerappa/nt8-riskguard/blob/main/docs/RISKGUARD_COPIER_HARDENING_PLAN.md).
+
+Two rules those defects establish, both enforced by tests here:
+
+1. **A read must not write.** `action: get` uses HTTP `GET` and carries no body.
+2. **A write sends only the fields you named.** The engine *merges*, so a schema `default`
+   that reaches the body overwrites stored config. There is deliberately **no `default:`**
+   on any value field of `nt_copier_config`, and an unknown `action` throws rather than
+   falling through to a read.
+
 ## Version
 
 **AddOn + MCP server version: 1.5.0** (`X-NT8-MCP-Version: 1.5.0`)
+
+⚠️ **The server must be restarted to pick up a change to this file or `lib/`.** A client
+that spawned `nt-mcp-server.js` earlier is still running the old tool schema.
 
 ## Quick Start
 

@@ -13,6 +13,8 @@
 import { createInterface } from 'node:readline';
 import { request as httpRequest } from 'node:http';
 
+import { buildCopierConfigRequest } from './lib/copier-config-request.js';
+
 // ─── Config ─────────────────────────────────────────────────────────────
 const NT8_HOST = process.env.NT8_HOST || '127.0.0.1';
 const NT8_PORT = parseInt(process.env.NT8_PORT || '7890', 10);
@@ -353,15 +355,44 @@ const TOOLS = [
   },
   {
     name: 'nt_copier_config',
-    description: 'Get/Set TradeCopierEngine relationships (Leader-Follower account ratios, Micro/Mini scaling, account quarantine)',
+    description:
+      'Read or modify TradeCopierEngine relationships and groups: leader/follower ratios, ' +
+      'the per-ticker ratio matrix, symbol mappings, slippage quarantine, and group membership. ' +
+      'action=get is a pure read (HTTP GET). Writes send ONLY the fields you name -- the engine ' +
+      'merges, so an omitted field keeps its stored value and is never reset to a default.',
     inputSchema: {
       type: 'object',
       properties: {
-        action:        { type: 'string', enum: ['get', 'set', 'quarantine'], default: 'get' },
-        leaderAccount: { type: 'string', description: 'Leader account name' },
-        followerAccount:{ type: 'string', description: 'Follower account name' },
-        quantityRatio: { type: 'number', description: 'Quantity scaling ratio', default: 1.0 },
-        autoConversion: { type: 'boolean', description: 'Auto Mini -> Micro conversion (NQ -> 10 MNQ)', default: true },
+        // NOTE: no `default:` on any value field. The engine merges, so a default
+        // materialised into the request would OVERWRITE stored config (P1-73).
+        action: {
+          type: 'string',
+          enum: [
+            'get', 'get_groups',
+            'set', 'update', 'remove',
+            'quarantine', 'unquarantine',
+            'set_group', 'remove_group', 'add_follower_to_group', 'remove_follower_from_group',
+          ],
+          description: 'Default get. An unrecognised action is REFUSED, not treated as a read.',
+        },
+        leaderAccount:   { type: 'string', description: 'Leader account name. Required for every relationship write.' },
+        followerAccount: { type: 'string', description: 'Follower account name. Required for every relationship write; never guessed.' },
+        quantityRatio:   { type: 'number', description: 'Quantity scaling ratio, e.g. 2 copies 1 leader lot as 2' },
+        autoConversion:  { type: 'boolean', description: 'Auto Mini <-> Micro symbol conversion. ⚠️ With ratio 1.0 this DROPS a 1-lot micro copy, because 1 MNQ translated to NQ rounds below one contract.' },
+        sizingMode:      { type: 'string', enum: ['QuantityRatio', 'FixedLot', 'PerTickerMatrix'], description: 'PerTickerMatrix uses perTickerRatios' },
+        perTickerRatios: { type: 'object', description: 'Per-instrument ratio matrix, e.g. {"NQ": 2, "ES": 1}. Case-insensitive keys.' },
+        customSymbolMappings: { type: 'object', description: 'Leader-symbol -> follower-symbol overrides, e.g. {"MNQ": "NQ"}' },
+        maxSlippageTicks: { type: 'number', description: 'Adverse entry slippage that quarantines the relationship. 0 disables.' },
+        dailyLossLimit:  { type: 'number', description: 'Per-relationship daily loss limit ($)' },
+        maxPositionSize: { type: 'number', description: 'Cap on the follower position size' },
+        isEnabled:       { type: 'boolean', description: 'Whether the relationship copies at all' },
+        stealthMode:     { type: 'boolean', description: 'Stealth submission' },
+        mode:            { type: 'string', enum: ['Executions', 'Orders'], description: 'Copy trigger source' },
+        armedForLive:    { type: 'boolean', description: 'Arm for live copying. true REQUIRES confirmLive: true.' },
+        confirmLive:     { type: 'boolean', description: 'Explicit confirmation for arming. Real orders on a real account.' },
+        quarantineReason: { type: 'string', description: 'Free text stored alongside a quarantine' },
+        groupName:       { type: 'string', description: 'Group name. Required for every group action.' },
+        followerAccounts: { type: 'array', items: { type: 'string' }, description: 'Group follower list, for set_group' },
       },
     },
   },
@@ -931,7 +962,11 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_copier_config': {
-      const res = await ntFetch('/api/copier/config', 'POST', args);
+      // The mapping lives in lib/copier-config-request.js so an executed test can
+      // reach it -- the same rule the bridge follows for ApplyRelationshipRequest.
+      // It also decides GET vs POST: a read must not write (P1-69/P2-41).
+      const { method, path, body } = buildCopierConfigRequest(args);
+      const res = await ntFetch(path, method, body);
       return res.data;
     }
 
