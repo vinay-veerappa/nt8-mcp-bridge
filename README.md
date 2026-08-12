@@ -33,14 +33,21 @@ git submodule update --init
 ```
 
 The submodule is pinned to a **tag**, not a branch, so this repo always states which core
-it was built against. **Currently `v1.0.2`.** To move to a newer core:
+it was built against. **Currently `v1.1.0`.** Do not trust that sentence -- it is
+hand-maintained and has been stale before. `git submodule status` prints the truth:
+
+```bash
+git submodule status          # -> <sha> vendor/nt8-riskguard (v1.1.0)
+```
+
+To move to a newer core:
 
 ```bash
 # in nt8-riskguard: tag and PUSH first -- a submodule cannot resolve a
 # tag that exists only locally
-cd vendor/nt8-riskguard && git fetch --tags && git checkout v1.0.3
+cd vendor/nt8-riskguard && git fetch --tags && git checkout <new-tag>
 cd ../.. && dotnet run --project tests/BridgeTests.csproj      # against the NEW core
-git add vendor/nt8-riskguard && git commit -m "chore: bump core to v1.0.3"
+git add vendor/nt8-riskguard && git commit -m "chore: bump core to <new-tag>"
 ```
 
 ### ⚠️ Never leave the pin behind the core
@@ -50,6 +57,11 @@ merely fail to bring a fix across -- it **overwrites a newer core already live i
 silently reverts it**. On 2026-08-12 the pin sat at `v1.0.1` while `v1.0.2` was deployed and
 running; `v1.0.2` carries `P0-63`, the fix without which the mirrored follower stop had
 never trailed. Nothing would have warned.
+
+✅ **It has since fired for real, and it was right.** On 2026-08-13 the core moved to `v1.1.0`
+carrying three live fixes while this pin sat at `v1.0.3`; `deploy.py` refused, and deploying
+anyway would have reverted them in NT8. The working order is **tag core → push → bump pin →
+push → deploy → recompile**.
 
 So `deploy.py` now **refuses (exit 2)** when the pinned commit is a strict ancestor of a
 sibling `nt8-riskguard` checkout's `main`. Strictly-behind is the only unsafe case: equal,
