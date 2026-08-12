@@ -1,12 +1,11 @@
-# NOT ACTIVE YET. This file belongs at .github/workflows/ci.yml, but the OAuth
-# token that created this repo lacks the `workflow` scope, so GitHub refuses any
-# push that writes under .github/workflows/. To activate:
+# ACTIVE since 2026-08-13. It sat parked at ci/github-workflow-ci.yml for a day
+# because the `gh` OAuth token lacks the `workflow` scope, and GitHub refuses any
+# HTTPS push that writes under .github/workflows/ without it. Fixed by pushing over
+# SSH instead, which is not an OAuth App push -- see nt8-riskguard's handover, 5.11.
 #
-#     gh auth refresh -s workflow          # interactive, one time
-#     git mv ci/github-workflow-ci.yml .github/workflows/ci.yml
-#     git commit -m "ci: activate the workflow" && git push
-#
-# Until then the harness is runnable by hand -- see README.
+# The second step is the interesting one: it proves deploy.py REFUSES rather than
+# trusting the comment that says it does. Verified locally before activation --
+# hiding the vendored core makes --dry-run exit exactly 2.
 name: CI
 
 on:

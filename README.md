@@ -72,6 +72,13 @@ text. That is the open half of defect `P2-27` and it predates the split.
 missing types, 16 of which are already stubbed in the core's test file -- and gives the
 ordered remedy. Until that is done, **this bridge is not tested.**
 
+**CI** runs the harness on every push and pull request, on `windows-latest`, from
+[.github/workflows/ci.yml](.github/workflows/ci.yml) -- active since 2026-08-13. It also
+hides the vendored core and asserts `deploy.py --dry-run` exits **2**, so the refusal to
+half-deploy is a check rather than a comment claiming there is one. Deploy parity is
+deliberately absent: it compares against an NT8 install that exists only on the trading
+machine, so on a runner it would pass vacuously.
+
 ### Install the pre-commit hook -- once per clone
 
 ```bash
