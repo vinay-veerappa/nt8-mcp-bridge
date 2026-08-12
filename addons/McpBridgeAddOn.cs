@@ -521,7 +521,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/chart/draw":         return Post(method, () => DrawChartLevel(body));
 
                 case "/api/events/fills":       return GetFillEvents(query["count"] ?? "50");
-                case "/api/copier/config":      return Post(method, () => CopierConfig(body));
+                // P1-69 / §5.3: GET was missing, so the ONLY way to inspect the live copier config was
+                // to POST -- i.e. to write in order to read. That defeats the GET-mutate-POST-GET-diff
+                // discipline this project relies on, and it is why the live metrics could not simply
+                // be read off the box. Mirrors /api/riskguard/config below.
+                case "/api/copier/config":      return method == "GET" ? CopierConfig(null) : Post(method, () => CopierConfig(body));
                 case "/api/prop/limits":        return Post(method, () => PropLimits(body));
                 case "/api/trades/extract":     return ExtractTrades(query["account"], query["format"], query["from"], query["to"], query["limit"]);
                 case "/api/trades/monte-carlo": return Post(method, () => MonteCarlo(body));
@@ -3789,12 +3793,52 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else
             {
-                TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
+                // P1-69. This used to call LoadFromDisk first, which is why the slippage and latency
+                // figures always read as 0: the reload REPLACES the in-memory relationships, and
+                // ObserveFollowerFill writes its measurements onto exactly those objects. So reading
+                // the config destroyed the thing being read. A live 1-lot copy on 2026-08-13 measured
+                // 142.86 ms / 0 ticks on the entry and 314.21 ms / -4 ticks on the exit -- the numbers
+                // were always being computed correctly and then discarded by the reader.
+                //
+                // A read must not mutate. The engine's in-memory state IS the live config: it is
+                // loaded at startup and updated by every write path below, so re-reading the file
+                // bought nothing except the chance to pick up hand-edits to a file the UI does not
+                // even write to (P?-64).
                 var rels = TradeCopierEngine.Instance.GetRelationships();
                 var groups = TradeCopierEngine.Instance.GetGroups();
                 var rel = rels.FirstOrDefault(r => r.LeaderAccountName.Equals(leader, StringComparison.OrdinalIgnoreCase)) ?? new CopierRelationship { LeaderAccountName = leader };
                 bool enforcing = rel.IsEnabled && rel.ArmedForLive;
-                return new { success = true, action, leaderAccount = leader, persisted = File.Exists(CopierConfigFile), loaded = true, enforcing = enforcing, config = rel, relationships = rels, groups = groups };
+
+                // Surfaced explicitly rather than left to be spotted inside `relationships`, because
+                // "the metrics do not work" was diagnosed for two sessions when the truth was that
+                // nothing exposed them. `session` scope is deliberate: these are measurements, not
+                // configuration, and writing them on every fill would put a disk write on the copy
+                // hot path. They land in the file whenever the config is saved for another reason.
+                var metrics = rels.Select(r => new
+                {
+                    id = r.Id,
+                    leaderAccount = r.LeaderAccountName,
+                    followerAccount = r.FollowerAccountName,
+                    latencyMs = r.LatencyMs,
+                    avgSlippageTicks = r.AvgSlippageTicks,
+                    maxSlippageTicks = r.MaxSlippageTicks,
+                    isQuarantined = r.IsQuarantined,
+                    quarantineReason = r.QuarantineReason
+                }).ToList();
+
+                return new
+                {
+                    success = true, action, leaderAccount = leader,
+                    persisted = File.Exists(CopierConfigFile), loaded = true, enforcing = enforcing,
+                    config = rel, relationships = rels, groups = groups,
+                    metrics = metrics,
+                    metricsScope = "session",
+                    metricsNote = "latencyMs/avgSlippageTicks are measured live per fill and are "
+                        + "SESSION-scoped -- they reset when NT8 restarts, and the copy in "
+                        + "copier_config.json is only as fresh as the last config save. A zero here "
+                        + "means either no copy has filled this session or a genuinely clean fill; "
+                        + "the COPIER_FILL_MEASURED events in interventions.jsonl tell those apart."
+                };
             }
         }
 
