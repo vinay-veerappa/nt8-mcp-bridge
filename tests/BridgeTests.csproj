@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net8.0-windows with UseWPF rather than plain net8.0, because McpBridgeAddOn.cs
+         uses real WPF types (System.Windows.Window, Application.Current, Dispatcher,
+         VisualTreeHelper). On Windows those resolve for real and need no stubbing.
+         What still blocks compiling the bridge itself is NinjaTrader's own type
+         surface; tests/README.md records the exact measurement and the remedy. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <DefineConstants>TESTING</DefineConstants>
+    <!-- Only the harness compiles today. When the bridge itself becomes compilable
+         (tests/README.md), add addons/McpBridgeAddOn.cs and the vendored core here. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="BridgeSourceTests.cs" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,61 @@
+# NOT ACTIVE YET. This file belongs at .github/workflows/ci.yml, but the OAuth
+# token that created this repo lacks the `workflow` scope, so GitHub refuses any
+# push that writes under .github/workflows/. To activate:
+#
+#     gh auth refresh -s workflow          # interactive, one time
+#     git mv ci/github-workflow-ci.yml .github/workflows/ci.yml
+#     git commit -m "ci: activate the workflow" && git push
+#
+# Until then the harness is runnable by hand -- see README.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    # windows-latest, not ubuntu: the harness targets net8.0-windows with UseWPF,
+    # and NinjaTrader is Windows-only. Proving this builds on Linux would prove
+    # something about the runner, not about the product.
+    runs-on: windows-latest
+    steps:
+      # The vendored core is a compile-time dependency, so the submodule is not
+      # optional here either.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Harness
+        run: dotnet run --project tests/BridgeTests.csproj
+
+      # Proves deploy.py refuses to half-deploy rather than trusting the comment
+      # that says it does. Exit 2 is the refusal; anything else is a regression.
+      - name: Deploy tool refuses to deploy without the core
+        shell: bash
+        run: |
+          mv vendor/nt8-riskguard vendor/_hidden
+          set +e
+          python tools/deploy.py --dry-run
+          code=$?
+          set -e
+          mv vendor/_hidden vendor/nt8-riskguard
+          if [ "$code" != "2" ]; then
+            echo "expected exit 2 (refusal), got $code"
+            exit 1
+          fi
+          echo "OK: refused to half-deploy"
+
+# Deploy parity (tools/deploy.py --verify) is NOT run here: it compares against
+# %USERPROFILE%/Documents/NinjaTrader 8/, which exists only on the trading machine.
+# On a hosted runner it would pass vacuously, and a green check that proves nothing
+# is worse than an absent one. Run it locally before and after every deploy.

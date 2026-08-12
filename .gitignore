@@ -1,0 +1,11 @@
+# Build output. tvDownloadOHLC once tracked obj/ and a committed .exe (defect P2-28).
+bin/
+obj/
+*.exe
+*.pdb
+*.user
+
+# Python
+__pycache__/
+*.pyc
+.venv/

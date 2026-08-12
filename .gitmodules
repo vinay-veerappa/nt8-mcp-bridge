@@ -1,0 +1,3 @@
+[submodule "vendor/nt8-riskguard"]
+	path = vendor/nt8-riskguard
+	url = https://github.com/vinay-veerappa/nt8-riskguard.git
