@@ -250,26 +250,46 @@ namespace NinjaTrader.NinjaScript.AddOns
                 LoadJsonStore(RiskGuardConfigFile, _riskGuardConfig);
                 LoadJsonStore(TradeJournalFile, _tradeJournal);
 #if !TESTING
-                foreach (Account acc in Account.All)
-                {
-                    acc.ExecutionUpdate -= OnAccountExecutionUpdate;
-                    acc.ExecutionUpdate += OnAccountExecutionUpdate;
-                }
+                // P1-21: this pass used to be the ONLY one, so any account that connected
+                // after State.Configure never fed the copier and its relationships were
+                // silently dead. Subscribe now, and again on every connection change.
+                TradeCopierEngine.Instance.RefreshAccountSubscriptions();
+                Connection.ConnectionStatusUpdate -= OnConnectionStatusUpdateForCopier;
+                Connection.ConnectionStatusUpdate += OnConnectionStatusUpdateForCopier;
 #endif
                 StartServer();
             }
             else if (State == State.Terminated)
             {
+#if !TESTING
+                Connection.ConnectionStatusUpdate -= OnConnectionStatusUpdateForCopier;
+                // Handlers left attached outlive the AddOn reload that follows every
+                // recompile, and the next engine instance cannot detach them -- the account
+                // would then deliver each execution to both engines and copy every fill twice.
+                TradeCopierEngine.Instance.UnsubscribeAllAccounts();
+#endif
                 StopServer();
             }
         }
 
 #if !TESTING
-        private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs e)
+        private void OnConnectionStatusUpdateForCopier(object sender, ConnectionStatusEventArgs e)
         {
-            if (e != null && e.Execution != null)
+            try
             {
-                TradeCopierEngine.Instance.OnExecution(e.Execution);
+                int added = TradeCopierEngine.Instance.RefreshAccountSubscriptions();
+                if (added > 0)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        string.Format("[McpBridge] Copier subscribed to {0} newly available account(s) after connection change.", added),
+                        PrintTo.OutputTab1);
+                }
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    string.Format("[McpBridge] Copier re-subscribe failed: {0}", ex.Message),
+                    PrintTo.OutputTab1);
             }
         }
 #endif
@@ -432,7 +452,25 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 // - RiskGuard FSM observation & Version (read-only) -
                 case "/api/riskguard/version":
-                    return new { success = true, version = RiskGuardAddOn.Version, name = "RiskGuardAddOn" };
+                    // P1-47: report the arm state here too. It was previously visible only on the
+                    // dashboard, so a silently disarmed guard was indistinguishable from a working one.
+                    return new
+                    {
+                        success = true,
+                        version = RiskGuardAddOn.Version,
+                        name = "RiskGuardAddOn",
+                        loaded = RiskGuardAddOn.Instance != null,
+                        mode = RiskGuardAddOn.Instance != null ? RiskGuardAddOn.Instance.GetMode() : null,
+                        isArmed = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed,
+                        guarding = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed
+                    };
+                // P0-9 targets/OCO research: what does each connection actually support?
+                // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
+                // must simulate the pairing itself, is a per-connection fact -- NT8 exposes
+                // NativeOcoOrders, RequiresOcoSubmitInPairs, NoIndependentOcoOrders and
+                // OcoNeedsManualCancellation -- and it was previously being guessed at. Read-only.
+                case "/api/connections":
+                    return GetConnectionFeatures(query["account"]);
                 case "/api/riskguard/fsm-state":
                     return GetFsmState(query["account"], query["instrument"]);
                 case "/api/riskguard/fsm-reset":
@@ -1660,6 +1698,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         orderType = order.OrderType.ToString(), quantity = order.Quantity,
                         limitPrice = order.LimitPrice, stopPrice = order.StopPrice,
                         state = order.OrderState.ToString(), filled = order.Filled, time = order.Time,
+                        // Which OCO group the order belongs to, if any. Read-only, and the field
+                        // that makes bracket pairing legible from outside NT8: two orders sharing
+                        // an oco are siblings, and a re-created leg carrying a NEW id is evidence
+                        // of per-generation ids rather than one id held for the bracket's life.
+                        oco = order.Oco ?? "",
                     });
                 }
             return orders;
@@ -1707,8 +1750,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             var account = Account.All.FirstOrDefault(a => a.Name == accountName);
             if (account == null) return new { error = "account not found: " + accountName };
             // SIM-first guard: refuse a non-sim account unless explicitly confirmed.
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             if (!isSim && !confirmLive)
                 return new { error = "refusing to deploy to LIVE account '" + account.Name + "' without confirmLive=true" };
 
@@ -2240,8 +2285,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
             if (!isSim && !confirmLive)
             {
@@ -2304,8 +2351,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
-                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            // P2-38: provider only. The name clause was OR'd in FRONT of the provider test, so
+            // a funded account called "SimpsonFund" classified as simulated and slipped this
+            // gate without confirmLive=true. Same root cause as P1-20, different blast radius.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.ContainsKey("confirmLive") && Convert.ToBoolean(req["confirmLive"]);
             if (!isSim && !confirmLive)
             {
@@ -3567,33 +3616,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action.Equals("set_group", StringComparison.OrdinalIgnoreCase) || action.Equals("upsert_group", StringComparison.OrdinalIgnoreCase))
             {
-                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
-                var followerList = new List<string>();
-                if (req["followers"] is JArray arr)
-                {
-                    foreach (var tok in arr) followerList.Add(tok.ToString());
-                }
-                else if (req["followerAccounts"] is JArray arr2)
-                {
-                    foreach (var tok in arr2) followerList.Add(tok.ToString());
-                }
-
-                var grp = new CopierGroup
-                {
-                    GroupName = groupName ?? "DefaultGroup",
-                    LeaderAccountName = leader,
-                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
-                    ArmedForLive = requestedArmed && confirmLive,
-                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
-                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
-                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
-                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
-                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
-                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
-                    FollowerAccounts = followerList
-                };
-
-                TradeCopierEngine.Instance.UpsertGroup(grp, confirmLive);
+                // The mapping lives on the engine (slice 3b): this file is excluded
+                // from RiskGuardTests.csproj, so anything written here cannot be
+                // covered by an executed test. ApplyGroupRequest upserts.
+                var grp = TradeCopierEngine.Instance.ApplyGroupRequest(req, confirmLive);
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
                 return new { success = true, action, groupName = grp.GroupName, persisted = true, group = grp };
             }
@@ -3631,24 +3657,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
             {
-                bool requestedArmed = req["armedForLive"] != null ? (bool)req["armedForLive"] : (req["ArmedForLive"] != null ? (bool)req["ArmedForLive"] : false);
-
-                var rel = new CopierRelationship
-                {
-                    LeaderAccountName = leader,
-                    FollowerAccountName = req.Str("followerAccount") ?? req.Str("FollowerAccountName") ?? "SimCopy2",
-                    IsEnabled = req["isEnabled"] != null ? (bool)req["isEnabled"] : (req["IsEnabled"] != null ? (bool)req["IsEnabled"] : true),
-                    ArmedForLive = requestedArmed && confirmLive,
-                    QuantityRatio = req["quantityRatio"] != null ? (double)req["quantityRatio"] : (req["QuantityRatio"] != null ? (double)req["QuantityRatio"] : 1.0),
-                    FixedLotMode = req["fixedLotMode"] != null ? (bool)req["fixedLotMode"] : (req["FixedLotMode"] != null ? (bool)req["FixedLotMode"] : false),
-                    FixedLotSize = req["fixedLotSize"] != null ? (int)req["fixedLotSize"] : (req["FixedLotSize"] != null ? (int)req["FixedLotSize"] : 1),
-                    AutoSymbolConversion = req["autoSymbolConversion"] != null ? (bool)req["autoSymbolConversion"] : (req["AutoSymbolConversion"] != null ? (bool)req["AutoSymbolConversion"] : true),
-                    MaxPositionSize = req["maxPositionSize"] != null ? (int)req["maxPositionSize"] : (req["MaxPositionSize"] != null ? (int)req["MaxPositionSize"] : 100),
-                    DailyLossLimit = req["dailyLossLimit"] != null ? (double)req["dailyLossLimit"] : (req["DailyLossLimit"] != null ? (double)req["DailyLossLimit"] : 1000.0),
-                    IsQuarantined = req["isQuarantined"] != null ? (bool)req["isQuarantined"] : (req["IsQuarantined"] != null ? (bool)req["IsQuarantined"] : false)
-                };
-
-                TradeCopierEngine.Instance.UpsertRelationship(rel, confirmLive);
+                // See the set_group branch: the mapping lives on the engine so it
+                // can be covered by an executed test. ApplyRelationshipRequest upserts.
+                var rel = TradeCopierEngine.Instance.ApplyRelationshipRequest(req, confirmLive);
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
 
                 bool enforcing = rel.IsEnabled && rel.ArmedForLive;
@@ -3691,6 +3702,69 @@ namespace NinjaTrader.NinjaScript.AddOns
                 bool enforcing = cfg != null && cfg.ArmedForLive;
                 return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = enforcing, config = cfg };
             }
+        }
+
+        /// <summary>
+        /// Read-only: what each account's connection says it can do about OCO.
+        ///
+        /// Exists because the copier's mirrored-target design (P0-9 item 1) turns entirely on four
+        /// per-connection capability flags, and those were being assumed rather than read. The Sim
+        /// accounts and the funded Provider31 accounts need not agree, and picking a design from
+        /// the wrong one is how you build a bracket that works in Sim and leaves a live follower
+        /// half-covered.
+        /// </summary>
+        private object GetConnectionFeatures(string accountFilter)
+        {
+            var rows = new List<object>();
+            foreach (Account acc in Account.All.ToList())
+            {
+                if (acc == null) continue;
+                if (!string.IsNullOrEmpty(accountFilter)
+                    && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase)) continue;
+
+                string connName = null;
+                string[] features = new string[0];
+                string err = null;
+                try
+                {
+                    var conn = acc.Connection;
+                    if (conn != null)
+                    {
+                        try { connName = conn.Options != null ? conn.Options.Name : null; } catch { }
+                        var f = conn.Features;
+                        if (f != null) features = f.Select(x => x.ToString()).OrderBy(x => x).ToArray();
+                    }
+                }
+                catch (Exception ex) { err = ex.Message; }
+
+                bool nativeOco   = features.Contains("NativeOcoOrders");
+                bool pairSubmit  = features.Contains("RequiresOcoSubmitInPairs");
+                bool noIndep     = features.Contains("NoIndependentOcoOrders");
+                bool manualCncl  = features.Contains("OcoNeedsManualCancellation");
+
+                rows.Add(new
+                {
+                    account = acc.Name,
+                    provider = acc.Provider.ToString(),
+                    connection = connName,
+                    connectionStatus = acc.ConnectionStatus.ToString(),
+                    isSimulation = TradeCopierEngine.IsSimulationAccount(acc),
+                    ocoFeatures = new
+                    {
+                        nativeOcoOrders = nativeOco,
+                        requiresOcoSubmitInPairs = pairSubmit,
+                        noIndependentOcoOrders = noIndep,
+                        ocoNeedsManualCancellation = manualCncl
+                    },
+                    // The straight answer to "can the copier hand this follower a real OCO pair?"
+                    ocoVerdict = nativeOco
+                        ? (manualCncl ? "native-but-manual-cancel" : "native")
+                        : "simulate-in-copier",
+                    allFeatures = features,
+                    error = err
+                });
+            }
+            return new { success = true, count = rows.Count, accounts = rows };
         }
 
         private object HandleLockout(string body)
@@ -3958,7 +4032,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                           ?? Account.All.FirstOrDefault();
             if (account == null) return new { error = "no account available" };
 
-            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase);
+            // P2-38: this site was worse than the other three -- name prefix ONLY, with no
+            // provider test at all to fall back on.
+            bool isSim = TradeCopierEngine.IsSimulationAccount(account);
             bool confirmLive = req.Bool("confirmLive");
             if (!isSim && !confirmLive)
                 return new { error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" };
@@ -5123,11 +5199,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             // This writes to RiskGuard/config.json (the correct file) AND reloads the live engine.
             try
             {
-                var cfg = req.ToObject<RiskConfig>();
+                // P2-41: MERGE onto the live config, never deserialize the body on its own.
+                // req.ToObject<RiskConfig>() gives every omitted field its DEFAULT, and
+                // SaveAndReloadConfig then wrote those defaults to disk and reloaded them. A
+                // caller adding one entry to ExcludedAccounts also reset Mode to shadow,
+                // MinShadowSessions to 0, EnableWindowGate to false and every StopGuard /
+                // PnLRules / FirmMirror value -- destroying the live risk configuration while
+                // replying "applied".
+                JObject mergedJson;
+                var cfg = RiskConfigMerge.Apply(RiskGuardAddOn.Instance.Config, req, out mergedJson);
                 if (cfg == null)
-                    return new { error = "Could not deserialize body to RiskConfig." };
+                    return new { error = "Could not deserialize merged body to RiskConfig." };
                 RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
-                return new { success = true, status = "applied", config = req, note = "Written to RiskGuard/config.json and reloaded into the live RiskGuard engine via SaveAndReloadConfig." };
+                // Echo the RESULT, not the request. The old reply looked identical whether the
+                // fields the caller omitted survived or were flattened to their defaults.
+                return new { success = true, status = "applied", config = RiskGuardAddOn.Instance.Config, requested = req, note = "Partial body merged onto the live config, written to RiskGuard/config.json and reloaded. `config` is the RESULTING live config; `requested` is what you sent." };
             }
             catch (Exception ex)
             {
