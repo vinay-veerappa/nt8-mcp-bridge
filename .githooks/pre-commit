@@ -1,0 +1,64 @@
+#!/bin/sh
+# Block build output and binary bloat from entering history.
+#
+# .gitignore already lists bin/, obj/, *.exe and *.pdb -- but `git add -f` walks
+# straight past it, and that is exactly how tvDownloadOHLC ended up tracking obj/
+# and a committed .exe (defect P2-28), and a 126 MB parquet that made every push
+# fail against GitHub's 100 MB limit for 202 commits. This hook is the part that
+# cannot be bypassed by accident.
+#
+# This repo vendors nt8-riskguard as a submodule, so `git add -A` from the repo root can
+# reach into vendor/ output as well -- keep the guard wide.
+#
+# Install (once per clone):  git config core.hooksPath .githooks
+# Deliberate override:       ALLOW_BIG_FILES=1 git commit ...
+#
+# Verified to fire, 2026-08-13: a staged 60 MB file and a staged .dll were both
+# rejected, and `ALLOW_BIG_FILES=1` let them through. A gate nobody has watched
+# fail is not a gate -- see handover section 8.
+
+BLOCKED_EXT='\.(dll|pdb|exe|zip|nupkg|parquet|m4a|mp3|mp4|wav|webm|mkv|mov|avi|flac|ogg|aac|wma)$'
+MAX_BYTES=52428800   # 50 MB -- GitHub warns here and hard-rejects at 100 MB
+
+if [ "$ALLOW_BIG_FILES" = "1" ]; then
+    exit 0
+fi
+
+staged=$(git diff --cached --name-only --diff-filter=AM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+# 1. Blocked extensions, regardless of size. Neither repo tracks a single one of
+#    these today, so this cannot misfire on legitimate work.
+bad_ext=$(printf '%s\n' "$staged" | grep -iE "$BLOCKED_EXT")
+if [ -n "$bad_ext" ]; then
+    echo "BLOCKED: build output / binaries must not be committed." >&2
+    echo "" >&2
+    printf '%s\n' "$bad_ext" | sed 's/^/    /' >&2
+    echo "" >&2
+    echo "  These are rebuilt by dotnet, not source." >&2
+    echo "  Unstage with:  git restore --staged <file>" >&2
+    fail=1
+fi
+
+# 2. Anything oversized, whatever its extension.
+big=$(printf '%s\n' "$staged" | while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    size=$(git cat-file -s "$(git rev-parse ":$f" 2>/dev/null)" 2>/dev/null) || continue
+    [ "$size" -gt "$MAX_BYTES" ] && printf '%s (%s MB)\n' "$f" "$((size / 1048576))"
+done)
+if [ -n "$big" ]; then
+    echo "BLOCKED: files over 50 MB (GitHub rejects at 100 MB)." >&2
+    echo "" >&2
+    printf '%s\n' "$big" | sed 's/^/    /' >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "  If you are certain, re-run with:  ALLOW_BIG_FILES=1 git commit ..." >&2
+    exit 1
+fi
+
+exit 0

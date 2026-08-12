@@ -72,6 +72,17 @@ text. That is the open half of defect `P2-27` and it predates the split.
 missing types, 16 of which are already stubbed in the core's test file -- and gives the
 ordered remedy. Until that is done, **this bridge is not tested.**
 
+### Install the pre-commit hook -- once per clone
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` refuses build output, binaries and anything over 50 MB -- the
+hazard `.gitignore` alone does not cover, since `git add -f` walks past it.
+`core.hooksPath` is **local config, not tracked**, so a fresh clone has no hook until you
+run that line, and nothing will tell you. Override: `ALLOW_BIG_FILES=1 git commit ...`.
+
 ## Deploy
 
 ```bash

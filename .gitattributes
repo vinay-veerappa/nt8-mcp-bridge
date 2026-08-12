@@ -1,0 +1,8 @@
+# Shell hooks stay LF regardless of core.autocrlf (which is `true` on the box this
+# was written on, so a fresh clone would otherwise get CRLF here).
+#
+# Measured before adding this, rather than assumed: a CRLF copy of
+# .githooks/pre-commit runs correctly under Git for Windows' sh -- it blocked a
+# staged .dll with exit 1 and passed a clean tree with exit 0. So this is
+# belt-and-braces for a clone on Linux or macOS, not a fix for a proven break.
+.githooks/** text eol=lf
