@@ -3762,7 +3762,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
 
-        private static string CopierConfigFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "copier_config.json");
+        // UI2 / `P?-64`. This used to spell the path out, and the NT8 copier window spelled
+        // out a DIFFERENT one (`UserDataDir/CopierConfig.json`) at seven call sites -- so
+        // every change made in the UI was discarded at the next restart, silently, while
+        // both files sat on the operator's box with different contents.
+        //
+        // Core owns the path now. The six write sites below keep this name and are
+        // unchanged; what changed is that the string is no longer written down twice.
+        // Cross-repo, and one-directional on purpose: core cannot reference the bridge.
+        private static string CopierConfigFile => TradeCopierEngine.ConfigFilePath;
         private static string PropLimitsFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "prop_limits.json");
 
         private object CopierConfig(string body)
