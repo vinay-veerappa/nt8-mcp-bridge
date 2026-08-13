@@ -58,21 +58,56 @@ test('no tool advertises a default account — the class, not the four instances
     + 'resolve a name the caller never sent (P1-90/P1-91).');
 });
 
-test('nor a default for any other field that decides where money goes', () => {
-  // Widened deliberately. P1-91 was about `account`, but the defect class is
-  // "a default on a field whose wrong value is a real trade", and the cheapest
-  // time to pin the rest of the class is now.
-  const DANGEROUS = ['account', 'action', 'quantity', 'price', 'limitPrice', 'stopPrice'];
+test('no order-shaping quantity or price carries a default', () => {
+  // A quantity or a price the caller never sent is a different trade from the one
+  // they asked for. None exist today; this is a floor, not a fix.
   const offenders = [];
   for (const t of TOOLS) {
     const p = t.inputSchema?.properties ?? {};
-    for (const field of DANGEROUS) {
+    for (const field of ['quantity', 'price', 'limitPrice', 'stopPrice']) {
       if (p[field] && 'default' in p[field]) {
         offenders.push(`${t.name}.${field} = ${p[field].default}`);
       }
     }
   }
-  assert.deepEqual(offenders, [], 'No order-shaping field may carry a schema default');
+  assert.deepEqual(offenders, [], 'No quantity or price may carry a schema default');
+});
+
+test('a defaulted `action` must itself be a READ', () => {
+  // ⚠️ THIS TEST WAS WRONG ON ITS FIRST DRAFT, and the wrong version is worth
+  // recording. It forbade a `default` on `action` outright, which would have made
+  // the implementer delete two SAFE defaults to go green:
+  //
+  //   nt_prop_limits.action        default 'get'   enum [get, set]
+  //   nt_trade_journal.action      default 'list'  enum [list, add, tag, export]
+  //
+  // Defaulting to the read is the correct direction — it is the fail-closed
+  // choice, and forbidding it would have made the tool worse to satisfy a test.
+  // That is the "a too-broad test gets the CODE broken to satisfy it" failure.
+  //
+  // The real rule is about which way the default falls. An omitted `action` may
+  // resolve to a read; it may never resolve to something that moves a position:
+  //
+  //   nt_alert.action                        default 'webhook'     enum includes 'flatten'
+  //   nt_multi_account_orchestrator.action   default 'sync_hedge'  enum includes 'group_flatten'
+  //
+  // `sync_hedge` adjusts positions across accounts. An omitted action doing that
+  // is P1-90's class: something consequential happening that the caller did not
+  // name.
+  const READ_ACTIONS = new Set([
+    'get', 'list', 'status', 'read', 'export', 'report', 'summary',
+  ]);
+  const offenders = [];
+  for (const t of TOOLS) {
+    const action = t.inputSchema?.properties?.action;
+    if (!action || !('default' in action)) continue;
+    if (!READ_ACTIONS.has(String(action.default))) {
+      offenders.push(`${t.name}.action = ${action.default} (enum: ${(action.enum || []).join('|')})`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'An omitted `action` may fall through to a read, never to something that '
+    + 'moves a position. Either drop the default or make the default the read.');
 });
 
 test('every tool whose handler refuses a missing account declares it required', () => {

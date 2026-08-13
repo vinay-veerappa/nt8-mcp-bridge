@@ -37,14 +37,23 @@ JS_NINJATRADER_MCP = Profile(
     # {files} is substituted with the files the patch actually touched. Do NOT name
     # a fixed file here; that makes the gate pass regardless of what the patch did.
     build_cmd="node --check {files}",
-    # The real gate, ~0.1s.
+    # The real gate, ~0.2s.
     #
-    # ⚠️ THE QUOTED GLOB IS LOAD-BEARING. `node --test <dir>` is not directory
-    # discovery in Node 24 -- it resolves the path as a *file* and dies with
-    # MODULE_NOT_FOUND, which the loop reads as a red baseline and then refuses
-    # every ticket. Node expands the quoted pattern itself, so this does not depend
-    # on a shell.
-    test_cmd='node --test "tests/*.test.js"',
+    # ⚠️ NOT a bare `node --test`. `agent_loop.gates.parse_tests` understands only
+    # the NT8 format (`[FAIL] msg` + `RESULTS: Passed = N, Failed = M`) and
+    # pytest's. Node prints `ℹ pass 37` / `ℹ fail 3`, which matches neither, so the
+    # first run on this profile died at baseline with "produced no parseable result
+    # summary" before reaching a model. `Profile.test_runner_regex` looks like the
+    # configuration point for this and is DEAD -- declared at profiles.py:78 and
+    # read by nothing.
+    #
+    # The reporter emits the NT8 shape, chosen because its `[FAIL]` lines carry the
+    # failing test's NAME -- which is what a ticket's `expect_green` is matched
+    # against. Without per-failure names the test-first gate is vacuous.
+    #
+    # `agent/verify_reporter.py` feeds the reporter's real output through the real
+    # parser and asserts on the result. Run it after touching either.
+    test_cmd="node agent/loop_test_reporter.mjs",
     # No lock primitive: the server is single-threaded and request-serial.
     lock_name="",
     risk_calls=(),
