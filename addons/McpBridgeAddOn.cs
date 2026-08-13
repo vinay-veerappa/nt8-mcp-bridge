@@ -517,6 +517,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                         : GuardSnapshotJson.ToJson(snap));
                 }
 
+                // The copier's conformance rows: one per relationship PER INSTRUMENT ROOT, with
+                // expected vs actual position and a verdict. Serialized in core for the same
+                // reason as the inventory -- and with one extra: CopierConformance's integers are
+                // historical rather than severity, so each row carries a stated `severity` rank.
+                // Sorting by the enum cast would put an ORPHAN below a quarantined row.
+                case "/api/copier/snapshot":
+                    return JObject.Parse(CopierSnapshotJson.ToJson(
+                        TradeCopierEngine.Instance == null ? null : TradeCopierEngine.Instance.GetSnapshot()));
+
                 // P0-9 targets/OCO research: what does each connection actually support?
                 // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
                 // must simulate the pairing itself, is a per-connection fact -- NT8 exposes

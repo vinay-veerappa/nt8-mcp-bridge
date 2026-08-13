@@ -33,11 +33,11 @@ git submodule update --init
 ```
 
 The submodule is pinned to a **tag**, not a branch, so this repo always states which core
-it was built against. **Currently `v1.7.0`.** Do not trust that sentence -- it is
+it was built against. **Currently `v1.8.0`.** Do not trust that sentence -- it is
 hand-maintained and has been stale before. `git submodule status` prints the truth:
 
 ```bash
-git submodule status          # -> <sha> vendor/nt8-riskguard (v1.7.0)
+git submodule status          # -> <sha> vendor/nt8-riskguard (v1.8.0)
 ```
 
 To move to a newer core:

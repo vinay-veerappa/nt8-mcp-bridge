@@ -58,6 +58,12 @@
   .s-EvaluatedNotEnforcing { color: var(--amber); }
   .s-Enforcing { color: var(--green); }
   .s-Disabled { color: var(--grey); }
+  .v-Orphan, .v-Diverged { color: var(--red); }
+  .v-Quarantined { color: var(--amber); }
+  .v-Shadow { color: var(--amber); }
+  .v-Match, .v-Idle { color: var(--green); }
+  .pos { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bad { color: var(--red); }
   .note { color: var(--dim); font-size: 12px; }
   .path { color: var(--dim); font-family: Consolas, monospace; font-size: 11px; }
   .banner {
@@ -98,6 +104,7 @@
 
 <main>
   <div id="banner"></div>
+  <div id="copier"></div>
   <div id="content"></div>
 </main>
 
@@ -331,6 +338,100 @@ function wireNotes(root) {
   });
 }
 
+
+// ── the copier ───────────────────────────────────────────────────────────────
+// A different question from the guard half: not "is this limit protecting me?"
+// but "is the follower actually where the leader is?".
+//
+// ⚠️ Rows are sorted by the `severity` the SERVER puts on each one, never by the
+// verdict name or an enum value. CopierConformance's own integers are historical
+// (Idle=0 … Quarantined=5), so sorting by them would put a healthy Idle row first
+// and an ORPHAN -- leader flat, follower still holding a live position nothing is
+// managing -- below a quarantined one. That ordering is stated once, in core.
+
+var VLABEL = {
+  Orphan: "ORPHAN", Diverged: "DIVERGED", Quarantined: "QUARANTINED",
+  Shadow: "shadow", Match: "match", Idle: "idle"
+};
+
+// ⚠️ A metric with no samples is NOT zero. These are session-scoped and reset on
+// a recompile, so `0 ms` for a copier that has never filled is the P1-22 defect
+// restored -- it was once misdiagnosed as a broken measurement and cost two
+// sessions. No samples renders as a dash.
+function metric(m, unit) {
+  if (!m || !m.measured) return '<span class="note">not measured</span>';
+  return esc(m.value.toFixed(unit === "ms" ? 0 : 2)) + " " + unit
+       + ' <span class="note">(' + m.samples + ')</span>';
+}
+
+function position(side, qty) {
+  if (!side || side === "Flat" || !qty) return '<span class="note">flat</span>';
+  return esc(side === "Long" ? "L" : "S") + " " + esc(qty);
+}
+
+function renderCopier(data) {
+  var el = document.getElementById("copier");
+  if (!el) return;
+
+  if (data.error) {
+    el.innerHTML = '<section><h2>Copier</h2><div class="banner bad">'
+                 + esc(data.error) + '</div></section>';
+    return;
+  }
+
+  // "The copier mirrors nothing" and "the copier is not loaded" are different
+  // answers and the payload distinguishes them, so the page must too.
+  if (!data.rows || !data.rows.length) {
+    el.innerHTML = '<section><h2>Copier</h2><div class="banner">The copier is loaded and has '
+                 + '<b>no relationships</b>. Nothing is being mirrored.</div></section>';
+    return;
+  }
+
+  var rows = data.rows.slice().sort(function (a, b) {
+    return (a.severity - b.severity) ||
+           a.followerAccountName.localeCompare(b.followerAccountName);
+  });
+
+  var html = '<section><h2>Copier (' + rows.length + ')</h2>'
+    + '<table><thead><tr>'
+    + '<th>Verdict</th><th>Leader &rarr; Follower</th><th>Instrument</th>'
+    + '<th>Leader</th><th>Expected</th><th>Actual</th>'
+    + '<th>Latency</th><th>Slippage</th><th>Note</th>'
+    + '</tr></thead><tbody>';
+
+  rows.forEach(function (r) {
+    var flags = [];
+    if (!r.isEnabled) flags.push("disabled");
+    if (!r.armedForLive) flags.push("not armed");
+    if (r.stealthMode) flags.push("stealth");
+    if (r.expectedIsClamped) flags.push("clamped by MaxPositionSize");
+
+    var mismatch = r.actualSide !== r.expectedSide || r.actualQuantity !== r.expectedQuantity;
+
+    html += '<tr>'
+      + '<td class="state v-' + esc(r.verdict) + '">' + esc(VLABEL[r.verdict] || r.verdict) + '</td>'
+      + '<td>' + esc(r.leaderAccountName) + ' &rarr; ' + esc(r.followerAccountName)
+      + (r.groupName ? '<div class="path">group ' + esc(r.groupName) + '</div>' : '')
+      + '<div class="path">' + esc(r.sizingMode) + ' &times;' + esc(r.effectiveRatio) + '</div></td>'
+      + '<td>' + (r.instrumentFullName ? esc(r.instrumentFullName) : '<span class="note">&mdash;</span>') + '</td>'
+      + '<td class="pos">' + position(r.leaderSide, r.leaderQuantity) + '</td>'
+      + '<td class="pos">' + position(r.expectedSide, r.expectedQuantity) + '</td>'
+      + '<td class="pos' + (mismatch ? ' bad' : '') + '">' + position(r.actualSide, r.actualQuantity) + '</td>'
+      + '<td>' + metric(r.latency, "ms") + '</td>'
+      + '<td>' + metric(r.slippage, "ticks") + '</td>'
+      + '<td class="note">' + esc(r.quarantineReason || flags.join(" · ")) + '</td>'
+      + '</tr>';
+  });
+
+  el.innerHTML = html + '</tbody></table></section>';
+}
+
+function loadCopier() {
+  api("/api/copier/snapshot")
+    .then(renderCopier)
+    .catch(function (e) { renderCopier({ error: e.message }); });
+}
+
 function loadDetail(account) {
   api("/api/riskguard/inventory?account=" + encodeURIComponent(account))
     .then(function (d) {
@@ -364,6 +465,7 @@ function load() {
   api("/api/riskguard/inventory?view=summary")
     .then(renderFleet)
     .catch(function (e) { renderFleet({ error: e.message }); });
+  loadCopier();
 }
 
 document.getElementById("refresh").addEventListener("click", load);
