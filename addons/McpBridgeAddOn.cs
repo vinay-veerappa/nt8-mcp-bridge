@@ -374,6 +374,26 @@ namespace NinjaTrader.NinjaScript.AddOns
             bool responseSent = false;
             try
             {
+                // ── THE ONE AUTH EXEMPTION IN THIS FILE, AND WHY ────────────────────────────
+                // A browser cannot send an Authorization header on a top-level navigation, so a
+                // page served behind Bearer auth simply cannot be opened. The three ways out are:
+                //
+                //   1. accept the token in the QUERY STRING -- it then lands in browser history,
+                //      in any proxy log, and in the referrer of every outbound request. That
+                //      weakens auth for the whole surface to solve a problem in one corner of it.
+                //   2. store a cookie -- a second credential to issue, expire and revoke.
+                //   3. exempt the STATIC ASSETS only, and keep every byte of account data behind
+                //      the same Bearer check as before.
+                //
+                // (3) is taken. What becomes readable without a token is an HTML file and the
+                // JavaScript in it -- no positions, no P&L, no config, no account names. The page
+                // asks the operator for the token once and sends it as a Bearer header on every
+                // /api/ call, so the DATA path is unchanged. The listener is bound to localhost.
+                //
+                // ⚠️ Keep this branch to static assets. The moment a /ui/ path returns anything
+                // derived from an account, this exemption becomes a hole rather than a doorway.
+                if (ServeStaticUi(context)) return;
+
                 if (!CheckAuth(context))
                 {
                     WriteResponse(context, 401, new { error = "Unauthorized: Invalid or missing Bearer token" });
@@ -465,6 +485,38 @@ namespace NinjaTrader.NinjaScript.AddOns
                         isArmed = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed,
                         guarding = RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsArmed
                     };
+                // The rule inventory: every guard rule, per account, with its state DERIVED at
+                // read time rather than declared -- CONFIGURED-not-EVALUATED / INERT /
+                // EVALUATED-not-ENFORCING / ENFORCING / DISABLED. This is what makes "is this
+                // limit actually protecting me?" answerable; see the core's GuardRules.cs.
+                //
+                // ⚠️ The payload is built by GuardSnapshotJson.ToJson IN CORE, not here, and then
+                // re-parsed so WriteResponse can emit it. That looks like a wasted round trip and
+                // is not: the serializer settings are load-bearing (enum NAMES, nulls PRESERVED,
+                // empty lists PRESENT) and this file is excluded from the test build (P2-27), so
+                // anything decided here is unverifiable. JObject carries all three properties
+                // through unchanged.
+                //
+                // TWO VIEWS, because the real box has 96 accounts: the full inventory measured
+                // 2400 rows and 648 KB, on a page that polls. `view=summary` returns a count per
+                // state per account; `account=NAME` returns one account's rules. Both filters are
+                // one line here on purpose -- the SUMMARISING is in core, where a test proves the
+                // fleet counts are recomputable from the detail rows and so cannot drift from them.
+                case "/api/riskguard/inventory":
+                {
+                    var snap = RiskGuardAddOn.Instance == null ? null : RiskGuardAddOn.Instance.BuildGuardSnapshot();
+                    string wanted = query["account"];
+                    if (snap != null && !string.IsNullOrEmpty(wanted) && snap.Accounts != null)
+                    {
+                        snap.Accounts = snap.Accounts
+                            .Where(a => string.Equals(a.AccountName, wanted, StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+                    }
+                    return JObject.Parse(query["view"] == "summary"
+                        ? GuardSnapshotJson.ToSummaryJson(snap)
+                        : GuardSnapshotJson.ToJson(snap));
+                }
+
                 // P0-9 targets/OCO research: what does each connection actually support?
                 // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
                 // must simulate the pairing itself, is a per-connection fact -- NT8 exposes
@@ -5737,6 +5789,89 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 catch { }
             }
+        }
+
+        /// <summary>Where the browser UI's static files live once deployed. tools/deploy.py owns the copy.</summary>
+        private static string UiDirectory
+        {
+            get { return Path.Combine(Globals.UserDataDir, "RiskGuard", "ui"); }
+        }
+
+        /// <summary>
+        /// Serves the browser UI's static assets, and NOTHING derived from an account.
+        ///
+        /// Returns true when it has handled the request, so the caller stops. See the exemption
+        /// note at the top of ProcessRequest before adding anything here.
+        /// </summary>
+        private bool ServeStaticUi(HttpListenerContext context)
+        {
+            string path;
+            try { path = context.Request.Url.AbsolutePath; } catch { return false; }
+            if (string.IsNullOrEmpty(path)) return false;
+            if (path != "/ui" && path != "/ui/" && !path.StartsWith("/ui/", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string rel = (path == "/ui" || path == "/ui/") ? "index.html" : path.Substring(4);
+
+            // Path traversal: the UI directory is the whole world this branch may read from, and
+            // it is reachable WITHOUT a token. Resolve, then verify the result is still inside.
+            string full;
+            try
+            {
+                full = Path.GetFullPath(Path.Combine(UiDirectory, rel.Replace('/', Path.DirectorySeparatorChar)));
+            }
+            catch { WriteRaw(context, 400, "bad path", "text/plain; charset=utf-8"); return true; }
+
+            string root = Path.GetFullPath(UiDirectory);
+            if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(full, root, StringComparison.OrdinalIgnoreCase))
+            {
+                WriteRaw(context, 403, "outside the ui directory", "text/plain; charset=utf-8");
+                return true;
+            }
+
+            if (!File.Exists(full))
+            {
+                // Say WHICH file and WHERE. A bare 404 on a page that has never worked sends the
+                // operator to the browser console; the deploy step is the actual answer.
+                WriteRaw(context, 404,
+                    "Not deployed: " + full + "\r\n\r\n"
+                    + "The RiskGuard browser UI is served from this directory. Run "
+                    + "`python tools/deploy.py` in nt8-mcp-bridge to copy it there.",
+                    "text/plain; charset=utf-8");
+                return true;
+            }
+
+            string ext = Path.GetExtension(full).ToLowerInvariant();
+            string type = ext == ".html" ? "text/html; charset=utf-8"
+                : ext == ".js" ? "application/javascript; charset=utf-8"
+                : ext == ".css" ? "text/css; charset=utf-8"
+                : ext == ".svg" ? "image/svg+xml"
+                : "application/octet-stream";
+
+            try { WriteRawBytes(context, 200, File.ReadAllBytes(full), type); }
+            catch (Exception ex) { WriteRaw(context, 500, ex.Message, "text/plain; charset=utf-8"); }
+            return true;
+        }
+
+        private void WriteRaw(HttpListenerContext ctx, int code, string body, string contentType)
+        {
+            WriteRawBytes(ctx, code, Encoding.UTF8.GetBytes(body ?? string.Empty), contentType);
+        }
+
+        private void WriteRawBytes(HttpListenerContext ctx, int code, byte[] buffer, string contentType)
+        {
+            try
+            {
+                if (ctx == null || ctx.Response == null) return;
+                try { ctx.Response.Headers.Add("X-NT8-MCP-Version", Version); } catch {}
+                try { ctx.Response.StatusCode = code; } catch {}
+                try { ctx.Response.ContentType = contentType; } catch {}
+                try { ctx.Response.ContentLength64 = buffer.Length; } catch {}
+                ctx.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                ctx.Response.OutputStream.Close();
+            }
+            catch {}
         }
 
         private void WriteResponse(HttpListenerContext ctx, int code, object data)

@@ -38,9 +38,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_SRC = REPO_ROOT / "addons"
+# The browser UI. Static files, deployed OUTSIDE bin/Custom on purpose: NT8 compiles
+# that folder, so an .html sitting in it is at best ignored and at worst confusing.
+UI_SRC = REPO_ROOT / "ui"
 VENDOR_SRC = REPO_ROOT / "vendor" / "nt8-riskguard" / "addons"
 
 NT8_HOME = Path(os.environ.get("USERPROFILE", "")) / "Documents" / "NinjaTrader 8" / "bin" / "Custom"
+# Globals.UserDataDir as the addons see it -- the NinjaTrader 8 folder itself, not bin/Custom.
+UI_DST = Path(os.environ.get("USERPROFILE", "")) / "Documents" / "NinjaTrader 8" / "RiskGuard" / "ui"
 ADDONS_DST = NT8_HOME / "AddOns"
 
 # Nothing is skipped. RiskManagerAddOn.cs is excluded from the core's *test* build
@@ -277,6 +282,41 @@ def main() -> int:
             else:
                 print("  [DRIFT]   {0:<28} ({1})".format(src.name, label))
 
+    # ── the browser UI's static files ──────────────────────────────────────────────
+    # These are NOT .cs and do not go into bin/Custom -- NT8 compiles that folder and
+    # anything else there is noise at best. The bridge serves them from UserDataDir,
+    # and until they are here the /ui route returns a 404 that names this script.
+    ui_added, ui_drifted, ui_identical = 0, 0, 0
+    if UI_SRC.exists():
+        print()
+        print("[ui/]     {0} -> {1}".format(UI_SRC, UI_DST))
+        for src in sorted(p for p in UI_SRC.rglob("*") if p.is_file()):
+            rel = src.relative_to(UI_SRC)
+            dst = UI_DST / rel
+            if not dst.exists():
+                ui_added += 1
+                if not args.verify and not args.dry_run:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    print("  [COPIED]  {0}  (new)".format(rel))
+                elif args.verify:
+                    print("  [MISSING] {0}  (not deployed)".format(rel))
+                else:
+                    print("  [DRY-RUN] {0}  (would copy)".format(rel))
+            elif file_hash(src) == file_hash(dst):
+                ui_identical += 1
+                if args.verify:
+                    print("  [OK]      {0}".format(rel))
+            else:
+                ui_drifted += 1
+                if not args.verify and not args.dry_run:
+                    shutil.copy2(src, dst)
+                    print("  [SYNCED]  {0}  (differed)".format(rel))
+                elif args.verify:
+                    print("  [DRIFT]   {0}".format(rel))
+                else:
+                    print("  [DRY-RUN] {0}  (would sync)".format(rel))
+
     owned = set(path.name for _, path in sources)
     orphans = sorted(p.name for p in ADDONS_DST.glob("*.cs") if p.name not in owned)
 
@@ -296,6 +336,9 @@ def main() -> int:
     else:
         print("  DONE: {0} synced, {1} copied (new), {2} already identical".format(
             len(drifted), len(added), len(identical)))
+        if UI_SRC.exists():
+            print("  UI:   {0} synced, {1} copied (new), {2} already identical".format(
+                ui_drifted, ui_added, ui_identical))
 
     if orphans:
         print("  Orphans in AddOns/ (in neither tree -- stale deploys or hand-copies):")

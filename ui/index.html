@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<!--
+  RiskGuard — the rule inventory.
+
+  WHAT THIS PAGE IS FOR, IN ONE SENTENCE: to answer "is this limit actually
+  protecting me?" with something derived, rather than with the contents of a
+  config file.
+
+  It is deliberately NOT a dashboard. There are no charts, no gauges and no
+  colours that mean "good". Every row is a comparison between what was
+  CONFIGURED and what is actually happening, and the only thing the page adds
+  is ordering: the worst states sort first, because the whole reason this
+  exists is that three real defects (P1-77, P2-25, P2-78) were invisible in a
+  file that read as protection.
+
+  No framework, no build step, no network beyond localhost. See
+  docs/UI_REDESIGN_DESIGN.md §7 in nt8-riskguard for why it is a browser page
+  and not WPF: every line of UI code compiled into NT8 is a line that can stop
+  the risk guard from loading.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RiskGuard — rule inventory</title>
+<style>
+  :root {
+    --bg: #16181c; --panel: #1e2126; --line: #2c3038;
+    --text: #e7e9ee; --dim: #949aa6;
+    --red: #ff6b6b; --amber: #ffb454; --green: #63c98d; --grey: #6e7682;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .meta { color: var(--dim); font-size: 12px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  main { padding: 16px 20px 40px; }
+  section { margin-bottom: 26px; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  th, td {
+    text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .state { font-weight: 600; white-space: nowrap; }
+  .s-ConfiguredNotEvaluated, .s-Inert { color: var(--red); }
+  .s-EvaluatedNotEnforcing { color: var(--amber); }
+  .s-Enforcing { color: var(--green); }
+  .s-Disabled { color: var(--grey); }
+  .note { color: var(--dim); font-size: 12px; }
+  .path { color: var(--dim); font-family: Consolas, monospace; font-size: 11px; }
+  .banner {
+    padding: 10px 14px; border-radius: 4px; margin-bottom: 16px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .banner.bad { border-color: var(--red); color: var(--red); }
+  button, input {
+    font: inherit; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 3px; padding: 5px 10px;
+  }
+  button { cursor: pointer; }
+  .legend { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  tr.acct { cursor: pointer; }
+  tr.acct:hover { background: #23272e; }
+  .chip {
+    display: inline-block; padding: 1px 7px; margin-right: 5px; border-radius: 9px;
+    font-size: 11px; border: 1px solid var(--line);
+  }
+  .legend span { margin-right: 14px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RiskGuard — rule inventory</h1>
+  <span class="meta" id="hdr">connecting…</span>
+  <span style="flex:1"></span>
+  <span class="meta" id="taken"></span>
+  <button id="refresh">Refresh</button>
+</header>
+
+<main>
+  <div id="banner"></div>
+  <div id="content"></div>
+</main>
+
+<script>
+"use strict";
+
+// The token is asked for ONCE and kept in localStorage. It is never put in the
+// URL: a query-string token lands in browser history and in every referrer, and
+// the bridge deliberately exempts only this page's static files from auth --
+// every /api/ call below still carries the Bearer header.
+function token() {
+  var t = localStorage.getItem("nt8_token");
+  if (!t) {
+    t = window.prompt("Bridge token (stored locally, sent as a Bearer header):");
+    if (t) localStorage.setItem("nt8_token", t.trim());
+  }
+  return t;
+}
+
+// The five states, worst first. This order is the page's only opinion, and it
+// matches the enum's own: a rule nothing evaluates and a rule whose evidence
+// set is empty both mean "this is not protecting you", and they are the two
+// this whole inventory was built to surface.
+var ORDER = {
+  ConfiguredNotEvaluated: 0,
+  Inert: 1,
+  EvaluatedNotEnforcing: 2,
+  Enforcing: 3,
+  Disabled: 4
+};
+
+var LABEL = {
+  ConfiguredNotEvaluated: "NOT EVALUATED",
+  Inert: "INERT",
+  EvaluatedNotEnforcing: "not enforcing",
+  Enforcing: "enforcing",
+  Disabled: "off"
+};
+
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ⚠️ null and 0 are DIFFERENT and must render differently. A rule with no
+// numeric limit shows a dash; a rule whose limit is genuinely zero shows 0.
+// The core serializer preserves the null specifically so this is possible --
+// collapsing them is the defect that made the copier's latency read 0ms when
+// nothing had ever been measured.
+function num(v) {
+  return (v === null || v === undefined) ? "&mdash;" : esc(v);
+}
+
+function ruleRows(rules) {
+  var sorted = rules.slice().sort(function (a, b) {
+    var d = (ORDER[a.state] === undefined ? 9 : ORDER[a.state])
+          - (ORDER[b.state] === undefined ? 9 : ORDER[b.state]);
+    return d !== 0 ? d : a.name.localeCompare(b.name);
+  });
+  return sorted.map(function (r) {
+    return '<tr>'
+      + '<td class="state s-' + esc(r.state) + '">' + esc(LABEL[r.state] || r.state) + '</td>'
+      + '<td>' + esc(r.name) + '<div class="path">' + esc(r.configPath) + '</div></td>'
+      + '<td class="num">' + num(r.currentValue) + '</td>'
+      + '<td class="num">' + num(r.limit) + '</td>'
+      + '<td class="num">' + esc(r.evidenceCount) + '</td>'
+      + '<td class="note">' + esc(r.note) + '</td>'
+      + '</tr>';
+  }).join("");
+}
+
+function table(rules) {
+  return '<table><thead><tr>'
+    + '<th>State</th><th>Rule</th><th style="text-align:right">Now</th>'
+    + '<th style="text-align:right">Limit</th><th style="text-align:right">Evidence</th>'
+    + '<th>Note</th>'
+    + '</tr></thead><tbody>' + ruleRows(rules) + '</tbody></table>';
+}
+
+// ── the fleet ────────────────────────────────────────────────────────────────
+// The real box has 96 accounts. 96 x 25 = 2400 rows is not an inventory, it is a
+// wall, so the fleet lists one row per account and you open the one you care
+// about. The counts come from the bridge's summary view, which core derives from
+// the same rows the detail view shows -- so the two cannot disagree.
+var openAccount = null;   // the account currently expanded, if any. NOT `open` -- that shadows window.open.
+
+function stateChips(counts) {
+  return Object.keys(ORDER)
+    .filter(function (k) { return counts[k]; })
+    .map(function (k) {
+      return '<span class="chip s-' + k + '">' + counts[k] + ' ' + esc(LABEL[k]) + '</span>';
+    }).join(" ");
+}
+
+function renderFleet(data) {
+  var banner = document.getElementById("banner");
+  var content = document.getElementById("content");
+
+  if (data.error) {
+    banner.innerHTML = '<div class="banner bad">' + esc(data.error) + '</div>';
+    content.innerHTML = "";
+    document.getElementById("hdr").textContent = "";
+    return;
+  }
+
+  var canAct = data.mode === "live" && data.isArmed;
+  document.getElementById("hdr").innerHTML =
+    'mode <b>' + esc(data.mode) + '</b> &middot; '
+    + (data.isArmed ? 'armed' : '<b>DISARMED</b>') + ' &middot; '
+    + (canAct ? 'can act' : '<b>cannot act</b>');
+  document.getElementById("taken").textContent = "taken " + esc(data.takenUtc) + " UTC";
+
+  // Shadow mode is the state this box has lived in, and "armed" is the word an
+  // operator reads as "protected". Say it on the page rather than leaving it to
+  // be inferred from a wall of amber.
+  banner.innerHTML = canAct ? ""
+    : '<div class="banner">The guard is <b>' + esc(data.mode) + '</b>'
+      + (data.isArmed ? '' : ' and <b>disarmed</b>')
+      + '. It observes and logs; <b>no rule below can act</b>, whatever its row says.</div>';
+
+  var html = "";
+
+  // Reported once, and FIRST, because these are broken for every account equally
+  // -- a property of the build, not of an account. Shown even with zero accounts,
+  // which is the whole of P2-83.
+  if (data.unevaluatedRules && data.unevaluatedRules.length) {
+    html += '<section><h2>Configured, and evaluated by nothing ('
+         + data.unevaluatedRules.length + ')</h2>' + table(data.unevaluatedRules)
+         + '<div class="legend">These appear in the config file and no code reads them. '
+         + 'Shown once rather than per account because they are broken for every account '
+         + 'equally.</div></section>';
+  }
+
+  if (!data.accounts || !data.accounts.length) {
+    html += '<section><h2>Accounts</h2><div class="banner">No accounts are loaded, so no '
+         + 'per-account rules can be reported. This is <b>not</b> the same as "nothing is '
+         + 'wrong" &mdash; the rules above are still evaluated by nothing.</div></section>';
+    content.innerHTML = html;
+    return;
+  }
+
+  // Worst first, then by name. Same ordering as the rules themselves, for the
+  // same reason.
+  var accounts = data.accounts.slice().sort(function (a, b) {
+    var d = (ORDER[a.worst] === undefined ? 9 : ORDER[a.worst])
+          - (ORDER[b.worst] === undefined ? 9 : ORDER[b.worst]);
+    return d !== 0 ? d : a.accountName.localeCompare(b.accountName);
+  });
+
+  html += '<section><h2>Accounts (' + accounts.length + ')</h2>'
+       + '<table><thead><tr><th>Worst</th><th>Account</th><th>Rules</th><th></th></tr></thead><tbody>';
+
+  accounts.forEach(function (a) {
+    var tags = [];
+    if (a.isExcluded) tags.push("EXCLUDED");
+    if (a.isLockedOut) tags.push("LOCKED OUT");
+    html += '<tr class="acct" data-account="' + esc(a.accountName) + '">'
+         + '<td class="state s-' + esc(a.worst) + '">' + esc(LABEL[a.worst] || a.worst) + '</td>'
+         + '<td>' + esc(a.accountName)
+         + (tags.length ? ' <span class="note">' + esc(tags.join(" · ")) + '</span>' : '')
+         + '</td>'
+         + '<td>' + stateChips(a.counts || {}) + '</td>'
+         + '<td class="note">' + (openAccount === a.accountName ? "hide" : "show " + a.ruleCount) + '</td>'
+         + '</tr>';
+    if (openAccount === a.accountName) {
+      html += '<tr><td colspan="4" id="detail"><div class="note">loading…</div></td></tr>';
+    }
+  });
+
+  html += '</tbody></table></section>';
+  content.innerHTML = html;
+
+  Array.prototype.forEach.call(document.querySelectorAll("tr.acct"), function (row) {
+    row.addEventListener("click", function () {
+      openAccount = (openAccount === row.dataset.account) ? null : row.dataset.account;
+      load();
+    });
+  });
+
+  if (openAccount) loadDetail(openAccount);
+}
+
+function loadDetail(account) {
+  api("/api/riskguard/inventory?account=" + encodeURIComponent(account))
+    .then(function (d) {
+      var cell = document.getElementById("detail");
+      if (!cell) return;
+      cell.innerHTML = (d.accounts && d.accounts.length)
+        ? table(d.accounts[0].rules)
+        : '<div class="note">That account is no longer reported.</div>';
+    })
+    .catch(function (e) {
+      var cell = document.getElementById("detail");
+      if (cell) cell.innerHTML = '<div class="banner bad">' + esc(e.message) + '</div>';
+    });
+}
+
+function api(url) {
+  var t = token();
+  if (!t) return Promise.reject(new Error("No token entered, so nothing can be read."));
+  return fetch(url, { headers: { Authorization: "Bearer " + t } }).then(function (r) {
+    if (r.status === 401) {
+      localStorage.removeItem("nt8_token");
+      throw new Error("The bridge rejected that token. Reload to enter it again.");
+    }
+    if (!r.ok) throw new Error("The bridge returned HTTP " + r.status + ".");
+    return r.json();
+  });
+}
+
+function load() {
+  api("/api/riskguard/inventory?view=summary")
+    .then(renderFleet)
+    .catch(function (e) { renderFleet({ error: e.message }); });
+}
+
+document.getElementById("refresh").addEventListener("click", load);
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
