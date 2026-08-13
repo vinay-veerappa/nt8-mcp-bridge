@@ -147,6 +147,57 @@ namespace NinjaTrader.NinjaScript.AddOns
                     duplicates.Count > 0 ? ": " + string.Join(", ", duplicates) : ""));
         }
 
+        // P1-80. A write path that REPORTS SUCCESS and configures nothing, ever.
+        //
+        // `RiskGuardConfig`'s read half already refuses when the guard is not loaded --
+        // `{ error = "RiskGuardAddOn not loaded" }`. Its WRITE half did not: it stashed the
+        // operator's risk config in a `Dictionary<string, JObject>` called `_riskGuardConfig`,
+        // wrote that to `RiskGuard/riskguard_config.json`, and returned
+        // `success = true, status = "persisted_only"`.
+        //
+        // **Nothing ever read it back.** The dictionary was declared, loaded from disk at
+        // startup, and written to. It was never consumed by anything, so the config was not
+        // applied then, was not applied at the next startup, and would never be applied. The
+        // note said "NOT applied to a live engine", which is true about *now* and reads as
+        // "it will be picked up later". It would not.
+        //
+        // Found on the live box, where that file held `trailingDrawdown: 500,
+        // maxPositionCap: 5` from 2026-07-30 while the live config ran 1500 and 10 -- a file
+        // stating a limit 3x TIGHTER than the one actually enforced. That is
+        // CONFIGURED-and-not-EVALUATED, the same state as P1-77 and P?-64.
+        //
+        // The fix is deletion, not wiring: the fallback now refuses, matching the read half.
+        // A read that refuses and a write that pretends is the asymmetry that hid this.
+        private static void TestP1_80_NoWritePathPersistsRiskConfigNothingReads()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-80: the bridge has no risk-config write that succeeds without applying");
+
+            var path = BridgeSourcePath();
+            Assert(File.Exists(path), string.Format("The bridge source is readable at {0}", path));
+            if (!File.Exists(path))
+                return;
+
+            var code = StripComments(File.ReadAllText(path));
+
+            Assert(!code.Contains("riskguard_config.json"),
+                "no code path names riskguard_config.json -- the store nothing read is gone, "
+                + "not merely bypassed");
+
+            Assert(!code.Contains("_riskGuardConfig"),
+                "the write-only _riskGuardConfig dictionary is deleted rather than left "
+                + "loaded-and-unused, which is what made it look like a working store");
+
+            Assert(!code.Contains("persisted_only"),
+                "no write reports success for config it did not apply");
+
+            // The positive half. Without it, deleting the whole method would pass.
+            Assert(Regex.Matches(code, @"RiskGuardAddOn not loaded").Count >= 2,
+                "the write half now REFUSES exactly as the read half already did (both arms "
+                + "present) -- a read that refuses beside a write that pretends is the "
+                + "asymmetry that hid this for a month");
+        }
+
         public static int Run()
         {
             Console.WriteLine("====================================================");
@@ -156,11 +207,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2_38_NoBridgeGateClassifiesByAccountName();
             TestVendoredCoreIsPresentAndPinned();
             TestBridgeCarriesNoCopyOfACoreSource();
+            TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 3;
+            const int declared = 4;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 

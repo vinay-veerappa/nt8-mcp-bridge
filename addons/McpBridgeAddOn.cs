@@ -143,7 +143,6 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Persistent State Stores
         private static readonly Dictionary<string, JObject> _copierConfig = new Dictionary<string, JObject>();
         private static readonly Dictionary<string, JObject> _propLimits = new Dictionary<string, JObject>();
-        private static readonly Dictionary<string, JObject> _riskGuardConfig = new Dictionary<string, JObject>();
         private static readonly Dictionary<string, JObject> _scheduledTasks = new Dictionary<string, JObject>();
         private static readonly Dictionary<string, JObject> _tradeJournal = new Dictionary<string, JObject>();
         private static readonly Dictionary<string, JObject> _alerts = new Dictionary<string, JObject>();
@@ -244,10 +243,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 TradeCopierEngine.Instance.LoadFromDisk(CopierConfigFile);
                 PropFirmProtectionSuite.Instance.LoadFromDisk(PropLimitsFile);
-                // Load persisted stores for schedule, alerts, riskguard config, and trade journal
+                // Load persisted stores for schedule, alerts and the trade journal.
+                // riskguard_config.json USED to be loaded here into a dictionary nothing
+                // ever read -- see P1-80. The guard's own config is RiskGuard/config.json
+                // and RiskGuardAddOn owns it; the bridge does not keep a second copy.
                 LoadJsonStore(ScheduledTasksFile, _scheduledTasks);
                 LoadJsonStore(AlertsFile, _alerts);
-                LoadJsonStore(RiskGuardConfigFile, _riskGuardConfig);
                 LoadJsonStore(TradeJournalFile, _tradeJournal);
 #if !TESTING
                 // P1-21: this pass used to be the ONLY one, so any account that connected
@@ -4933,7 +4934,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");
         private static string TradeJournalFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "trade_journal.json");
         private static string AlertsFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "alerts.json");
-        private static string RiskGuardConfigFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "riskguard_config.json");
 
         
         // ─────────────────────────────────────────────────────────────────────────
@@ -5431,17 +5431,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             var req = JObject.Parse(body);
 
+            // P1-80. This used to stash the body in a dictionary, write it to
+            // riskguard_config.json, and return success = true, status = "persisted_only".
+            // NOTHING EVER READ THAT FILE BACK -- not at the next startup, not ever -- so the
+            // limits an operator set here were never applied and never would be, while the
+            // call reported success and a file on disk stated limits the guard was not
+            // enforcing. Found holding trailingDrawdown 500 against a live 1500.
+            //
+            // It REFUSES now, matching the read half four lines above. A read that refuses
+            // beside a write that pretends is the asymmetry that hid this; risk config with
+            // no engine to apply it to is an error, not a draft.
             if (RiskGuardAddOn.Instance == null)
-            {
-                // Fallback: persist to riskguard_config.json (no live engine to apply to)
-                string key = "global";
-                lock (_riskGuardConfig)
-                {
-                    _riskGuardConfig[key] = req;
-                    try { Directory.CreateDirectory(Path.GetDirectoryName(RiskGuardConfigFile)); File.WriteAllText(RiskGuardConfigFile, JsonConvert.SerializeObject(_riskGuardConfig)); } catch {}
-                }
-                return new { success = true, status = "persisted_only", config = req, note = "RiskGuardAddOn not loaded. Config persisted to riskguard_config.json but NOT applied to a live engine." };
-            }
+                return new { error = "RiskGuardAddOn not loaded", note = "Risk configuration is REFUSED rather than stored when there is no engine to apply it to. Nothing would read it back, so a stored copy would state limits that are not being enforced. Load the addon and retry." };
 
             // Deserialize the JObject into a typed RiskConfig and apply via SaveAndReloadConfig.
             // This writes to RiskGuard/config.json (the correct file) AND reloads the live engine.
