@@ -7,3 +7,17 @@ exports/
 strategies/
 *.csv
 __pycache__/
+
+# agent-loop per-run artifacts: prompts, raw model output, per-round build/test
+# logs, the candidate patch, and the .runlock a crashed run leaves behind.
+# NOTE the `/*` rather than `/`: git never descends into an excluded DIRECTORY,
+# so a negation under `logs/agent_loop/` would be silently impossible. `/*`
+# excludes the contents while still allowing the exceptions below. Same rule and
+# same reason as nt8-riskguard's and tvDownloadOHLC's.
+logs/agent_loop/*
+# These two ARE tracked, deliberately: they are cross-machine run history that
+# the loop itself reads back, not per-run artifacts. `report` mode reads the
+# ledger and `docs --docs-type handover` builds on it, so dropping them would
+# silently reset that history on a fresh clone.
+!logs/agent_loop/ledger.jsonl
+!logs/agent_loop/learning_feedback.jsonl
