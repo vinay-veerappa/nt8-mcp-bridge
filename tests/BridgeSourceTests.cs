@@ -198,6 +198,56 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "asymmetry that hid this for a month");
         }
 
+        // UI7. `ApplyRelationshipRequest` and `ApplyGroupRequest` return null to refuse a
+        // write -- a follower cannot be in a group and a direct relationship at once (P1-76).
+        // Both write branches here took the result and dereferenced it immediately
+        // (`rel.IsEnabled && rel.ArmedForLive`, `grp.GroupName`), so a REFUSAL reached the
+        // operator as a NullReferenceException. And SaveToDisk had already run by then.
+        //
+        // The NT8 window got this right at all five of its call sites. The bridge got it
+        // wrong at both of its two, which is what happens when the same rule has to be
+        // remembered per call site instead of enforced -- the same shape as P1-69, where the
+        // fix went into one of two read branches.
+        //
+        // Two assertions, and the pair is the point: a null check alone could be satisfied by
+        // swallowing the refusal, and returning a reason alone could be written above a
+        // deref that still runs. The engine now hands back the REASON (nt8-riskguard v1.10.0),
+        // so there is something worth returning.
+        private static void TestUi7_NoCopierWriteBranchDereferencesARefusal()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] UI7: no copier write branch dereferences a refused apply");
+
+            var path = BridgeSourcePath();
+            Assert(File.Exists(path), string.Format("The bridge source is readable at {0}", path));
+            if (!File.Exists(path))
+                return;
+
+            var code = StripComments(File.ReadAllText(path));
+
+            Assert(Regex.Matches(code, @"Apply(?:Relationship|Group)Request\s*\([^;]*out\s+\w+\s*\)").Count == 2,
+                "both write branches take the refusal reason from the engine rather than "
+                + "discarding it -- this surface has no log window to send the operator to");
+
+            // The deref guard. Anchored on the two expressions that actually threw, so this
+            // fails if either branch goes back to using the result without checking it.
+            bool guarded = Regex.Matches(code, @"==\s*null\s*\)\s*\n\s*(?:\{|return)").Count >= 2
+                && Regex.IsMatch(code, @"refused\s*=\s*true");
+
+            Assert(guarded,
+                "and each one checks for null BEFORE using the result, returning a stated "
+                + "refusal. A refusal that arrives as a NullReferenceException is "
+                + "indistinguishable from the bridge being broken");
+
+            // A refusal changed nothing, so it must not write the file. Harmless today --
+            // the engine refuses before mutating -- but it makes a rejected request look
+            // like an accepted one to anything watching the config file's mtime.
+            int saveInWriteBranches = Regex.Matches(
+                code, @"refused\s*=\s*true[^;]*;[^}]*SaveToDisk").Count;
+            Assert(saveInWriteBranches == 0,
+                "and a refused write does not touch the config file on its way out");
+        }
+
         public static int Run()
         {
             Console.WriteLine("====================================================");
@@ -208,11 +258,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestVendoredCoreIsPresentAndPinned();
             TestBridgeCarriesNoCopyOfACoreSource();
             TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
+            TestUi7_NoCopierWriteBranchDereferencesARefusal();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 4;
+            const int declared = 5;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 

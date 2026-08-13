@@ -3860,7 +3860,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // The mapping lives on the engine (slice 3b): this file is excluded
                 // from RiskGuardTests.csproj, so anything written here cannot be
                 // covered by an executed test. ApplyGroupRequest upserts.
-                var grp = TradeCopierEngine.Instance.ApplyGroupRequest(req, confirmLive);
+                //
+                // UI7. This used to Save and then read `grp.GroupName` with no null check, so
+                // a REFUSED group -- a follower already holding a direct relationship (P1-76) --
+                // arrived as a NullReferenceException, after the file had been written. The
+                // reason existed the whole time and went only to the copier log.
+                string groupRefusal;
+                var grp = TradeCopierEngine.Instance.ApplyGroupRequest(req, confirmLive, out groupRefusal);
+                if (grp == null)
+                {
+                    return new { success = false, action, groupName, refused = true,
+                                 reason = groupRefusal, persisted = false };
+                }
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
                 return new { success = true, action, groupName = grp.GroupName, persisted = true, group = grp };
             }
@@ -3900,7 +3911,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 // See the set_group branch: the mapping lives on the engine so it
                 // can be covered by an executed test. ApplyRelationshipRequest upserts.
-                var rel = TradeCopierEngine.Instance.ApplyRelationshipRequest(req, confirmLive);
+                // UI7, relationship half. `rel.IsEnabled` on a refused write was the actual
+                // throw site. Same fix, both branches -- a one-sided fix here is P1-69.
+                string relRefusal;
+                var rel = TradeCopierEngine.Instance.ApplyRelationshipRequest(req, confirmLive, out relRefusal);
+                if (rel == null)
+                {
+                    return new { success = false, action, leaderAccount = leader, refused = true,
+                                 reason = relRefusal, persisted = false };
+                }
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
 
                 bool enforcing = rel.IsEnabled && rel.ArmedForLive;
