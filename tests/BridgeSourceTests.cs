@@ -452,11 +452,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
             TestUi7_NoCopierWriteBranchDereferencesARefusal();
             TestP1_88_AnUnrecognisedCopierActionIsNotReportedAsAWrite();
+            TestP334_EnforcingIsDerivedFromTheCopierGate();
+            TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
+            TestP334_TheEndpointExposesAndCanSetTheMode();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 8;
+            const int declared = 11;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -465,6 +468,126 @@ namespace NinjaTrader.NinjaScript.AddOns
             Console.WriteLine(string.Format("RESULTS: Passed = {0}, Failed = {1}", _passed, _failed));
             Console.WriteLine("====================================================");
             return _failed == 0 ? 0 : 1;
+        }
+
+        // ================================================================================
+        // P3-34 read surface. EXECUTED, not grepped -- CopierEnforcementView names no NT8
+        // type, so it compiles into this project. See addons/CopierEnforcementView.cs for
+        // why it is its own file.
+        //
+        // The defect being defended: `enforcing` was `IsEnabled && ArmedForLive`, which was
+        // correct until core v1.15.0 gave the copier a global mode, and wrong the moment it
+        // did -- an enabled, armed relationship enforces NOTHING while the copier is in
+        // shadow. F-9's finding in a second place: what a thing reports drifting from what
+        // it does.
+        // ================================================================================
+
+        private static void TestP334_EnforcingIsDerivedFromTheCopierGate()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-34: `enforcing` accounts for the copier's global mode");
+
+            // The case the old derivation got wrong, and the whole reason this exists.
+            Assert(!CopierEnforcementView.IsEnforcing(true, true, false),
+                "an ENABLED and ARMED relationship is NOT enforcing while the copier is not "
+                + "acting -- the old `IsEnabled && ArmedForLive` said it was, and the page "
+                + "would have shown a copier in shadow as enforcing");
+
+            Assert(CopierEnforcementView.IsEnforcing(true, true, true),
+                "and it IS enforcing when all three hold -- a gate that never opens is as "
+                + "wrong as one that never closes");
+
+            // The two pre-existing terms must still each be sufficient to stop it, or this
+            // change would have widened what counts as enforcing while appearing to narrow it.
+            Assert(!CopierEnforcementView.IsEnforcing(false, true, true),
+                "a disabled relationship is not enforcing even with the copier live");
+            Assert(!CopierEnforcementView.IsEnforcing(true, false, true),
+                "an unarmed relationship is not enforcing even with the copier live");
+            Assert(!CopierEnforcementView.IsEnforcing(false, false, false),
+                "and nothing enforcing is not enforcing");
+        }
+
+        private static void TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-34: the reason names the global switch, not just 'false'");
+
+            Assert(CopierEnforcementView.NotEnforcingReason(true, true, true, "live") == null,
+                "an enforcing relationship has NO reason to render -- a reason beside a working "
+                + "relationship is noise, and noise is how a real one gets skipped");
+
+            string shadow = CopierEnforcementView.NotEnforcingReason(true, true, false, "shadow");
+            Assert(shadow != null && shadow.IndexOf("shadow", StringComparison.OrdinalIgnoreCase) >= 0,
+                "an enabled+armed relationship under a shadow copier is explained by naming the "
+                + "MODE. Got: " + (shadow ?? "<null>"));
+            Assert(shadow != null && shadow.IndexOf("global", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and says it is GLOBAL, because the operator is looking at a relationship that "
+                + "is configured correctly and needs to be told the cause is elsewhere. Got: "
+                + shadow);
+
+            string disabledMode = CopierEnforcementView.NotEnforcingReason(true, true, false, "disabled");
+            Assert(disabledMode != null && disabledMode.IndexOf("disabled", StringComparison.OrdinalIgnoreCase) >= 0,
+                "`disabled` is explained as disabled, not as shadow -- P1-87: one outcome split "
+                + "across two names is unfindable, and so is two outcomes sharing one. Got: "
+                + (disabledMode ?? "<null>"));
+            Assert(shadow != disabledMode,
+                "and the two modes do not produce the same sentence");
+
+            // An unrecognised mode is the P1-87 case: it does not trade, and the operator must
+            // be told the mode is the problem rather than hunting the relationship.
+            string typo = CopierEnforcementView.NotEnforcingReason(true, true, false, "Shadow_Mode_Typo");
+            Assert(typo != null && typo.Contains("Shadow_Mode_Typo"),
+                "an unrecognised mode is quoted back, so the typo is visible. Got: "
+                + (typo ?? "<null>"));
+            Assert(typo != null && typo.IndexOf("fails closed", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and the operator is told it fails CLOSED, so they do not read the silence as a "
+                + "copier that is working. Got: " + typo);
+
+            // The relationship's own terms still win when they are the cause: naming the mode
+            // for a disabled relationship would send the operator to the wrong switch.
+            string off = CopierEnforcementView.NotEnforcingReason(false, true, false, "shadow");
+            Assert(off != null && off.IndexOf("disabled", StringComparison.OrdinalIgnoreCase) >= 0
+                   && off.IndexOf("global", StringComparison.OrdinalIgnoreCase) < 0,
+                "a DISABLED relationship is explained by its own state, not by the global mode -- "
+                + "the nearest cause is the actionable one. Got: " + (off ?? "<null>"));
+        }
+
+        /// <summary>
+        /// The endpoint half, which is in McpBridgeAddOn.cs and therefore in no test build
+        /// (P2-27). This is a SOURCE gate and proves strictly less than the two above: it
+        /// shows the wiring is present, not that it behaves. Labelled as such deliberately --
+        /// section 5.26's rule is to keep the source gate for the call sites and say which
+        /// half proves less.
+        /// </summary>
+        private static void TestP334_TheEndpointExposesAndCanSetTheMode()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-34: the endpoint exposes copierMode and accepts set_mode (SOURCE gate)");
+
+            string code = File.ReadAllText(BridgeSourcePath());
+
+            Assert(Regex.IsMatch(code, @"""set_mode"""),
+                "set_mode is in the copier action whitelist -- without it, P1-88's refusal "
+                + "would reject the very action added to fix this");
+            Assert(Regex.IsMatch(code, @"TrySetCopierMode"),
+                "and it routes to TrySetCopierMode, which runs the copier preflight and REFUSES "
+                + "the move to live rather than reporting a refusal and applying it anyway");
+            Assert(Regex.IsMatch(code, @"copierMode = "),
+                "and the read payload carries copierMode -- the mode shipped in core v1.15.0 "
+                + "readable nowhere but the config file");
+
+            // The derivation must not have been re-inlined beside the view. Two copies of
+            // "is this enforcing?" is exactly how the report drifted from the gate to begin with.
+            Assert(!Regex.IsMatch(code, @"enforcing = rel\.IsEnabled && rel\.ArmedForLive\s*;"),
+                "and NO branch still derives `enforcing` as `IsEnabled && ArmedForLive` -- that "
+                + "is the stale two-term answer, and there were TWO sites carrying it");
+            Assert(Regex.Matches(code, @"CopierEnforcementView\.IsEnforcing").Count >= 2,
+                "both branches derive it through CopierEnforcementView instead");
+
+            // set_mode is a write. If it were readable over GET, a URL would change the
+            // copier's mode -- the trap CopierReadFromQuery's whitelist exists to prevent.
+            Assert(!Regex.IsMatch(code, @"action\.Equals\(""set_mode"", StringComparison\.OrdinalIgnoreCase\)\s*\|\|\s*isRead"),
+                "and set_mode is not in the GET read whitelist, so it cannot be issued as a URL");
         }
 
         public static int Main(string[] args)

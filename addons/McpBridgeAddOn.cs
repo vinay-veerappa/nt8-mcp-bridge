@@ -3865,7 +3865,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "set_group", "upsert_group",
                 "remove_group", "delete_group",
                 "add_follower_to_group", "remove_follower_from_group",
-                "remove", "clear", "delete"
+                "remove", "clear", "delete",
+                // P3-34. The copier's global mode shipped in core v1.15.0 with no way to read
+                // or set it over the bridge -- only by editing copier_config.json. A mode you
+                // cannot observe is a mode you cannot trust, which is P1-69's class: a value
+                // computed correctly and exposed nowhere.
+                "set_mode"
             };
             if (!knownActions.Contains(action))
             {
@@ -3879,6 +3884,56 @@ namespace NinjaTrader.NinjaScript.AddOns
                     reason = "'" + action + "' is not a copier action. Nothing was read and nothing "
                              + "was written. Use one of: " + string.Join(", ", knownActions.OrderBy(a => a)),
                     knownActions = knownActions.OrderBy(a => a).ToList()
+                };
+            }
+
+            // P3-34. Setting the copier's global mode. Deliberately a POST-only action -- it
+            // is not in CopierReadFromQuery's read whitelist, so it cannot be issued over GET.
+            //
+            // The refusal is the point. TrySetCopierMode runs the copier preflight when the
+            // target is `live` and REFUSES the transition when it fails; this handler must
+            // report that refusal as a refusal. Answering success and leaving the mode alone
+            // is P1-88 exactly, and answering success while the mode did not move is the same
+            // defect wearing the other face -- so the mode is READ BACK and returned either way.
+            if (action.Equals("set_mode", StringComparison.OrdinalIgnoreCase))
+            {
+                string requested = req.Str("mode") ?? req.Str("copierMode") ?? req.Str("CopierMode");
+                if (string.IsNullOrWhiteSpace(requested))
+                    return new
+                    {
+                        success = false,
+                        error = "COPIER_MODE_MISSING",
+                        action,
+                        applied = false,
+                        copierMode = TradeCopierEngine.Instance.GetCopierMode(),
+                        reason = "set_mode needs a 'mode'. One of: live, shadow, disabled."
+                    };
+
+                var outcome = TradeCopierEngine.Instance.TrySetCopierMode(requested);
+                string nowMode = TradeCopierEngine.Instance.GetCopierMode();
+                bool applied = outcome.Passed
+                               && string.Equals(nowMode, requested, StringComparison.OrdinalIgnoreCase);
+
+                if (applied)
+                    TradeCopierEngine.Instance.SaveToDisk();
+
+                return new
+                {
+                    success = applied,
+                    action,
+                    requestedMode = requested,
+                    copierMode = nowMode,
+                    applied,
+                    // Only true when the write actually happened: P1-88 was a handler reporting
+                    // an unwritten write as persisted.
+                    persisted = applied && File.Exists(CopierConfigFile),
+                    failures = outcome.Failures,
+                    reason = applied
+                        ? null
+                        : "the copier mode was NOT changed; it is still '" + nowMode + "'. "
+                          + (outcome.Failures.Count > 0
+                              ? "Preflight refused: " + string.Join(" | ", outcome.Failures)
+                              : "'" + requested + "' is not one of live/shadow/disabled.")
                 };
             }
 
@@ -3961,8 +4016,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 TradeCopierEngine.Instance.SaveToDisk(CopierConfigFile);
 
-                bool enforcing = rel.IsEnabled && rel.ArmedForLive;
-                return new { success = true, action, leaderAccount = leader, persisted = true, loaded = true, enforcing = enforcing, config = rel };
+                // P3-34. `enforcing` used to be `IsEnabled && ArmedForLive`, which stopped
+                // being true the moment the copier gained a global mode: a relationship can be
+                // enabled AND armed while the copier is in `shadow` and enforce nothing. Derived
+                // through CopierEnforcementView so the report cannot disagree with the gate (F-9).
+                string writeMode = TradeCopierEngine.Instance.GetCopierMode();
+                bool writeModeActing = TradeCopierEngine.IsCopierActingMode(writeMode);
+                bool enforcing = CopierEnforcementView.IsEnforcing(rel.IsEnabled, rel.ArmedForLive, writeModeActing);
+                return new { success = true, action, leaderAccount = leader, persisted = true, loaded = true,
+                             enforcing = enforcing, copierMode = writeMode,
+                             notEnforcingReason = CopierEnforcementView.NotEnforcingReason(
+                                 rel.IsEnabled, rel.ArmedForLive, writeModeActing, writeMode),
+                             config = rel };
             }
             else
             {
@@ -4006,7 +4071,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         && (string.IsNullOrWhiteSpace(wantedFollower)
                             || r.FollowerAccountName.Equals(wantedFollower, StringComparison.OrdinalIgnoreCase)))
                     ?? new CopierRelationship { LeaderAccountName = leader ?? "" };
-                bool enforcing = rel.IsEnabled && rel.ArmedForLive;
+                // P3-34. Same derivation as the write branch, from the same place, for the
+                // same reason: two copies of "is this enforcing?" is how the two answers drift.
+                string copierMode = TradeCopierEngine.Instance.GetCopierMode();
+                bool copierModeActing = TradeCopierEngine.IsCopierActingMode(copierMode);
+                bool enforcing = CopierEnforcementView.IsEnforcing(rel.IsEnabled, rel.ArmedForLive, copierModeActing);
 
                 // Surfaced explicitly rather than left to be spotted inside `relationships`, because
                 // "the metrics do not work" was diagnosed for two sessions when the truth was that
@@ -4037,6 +4106,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     success = true, action, leaderAccount = leader,
                     persisted = File.Exists(CopierConfigFile), loaded = true, enforcing = enforcing,
+                    // P3-34. The global switch, and why this relationship is or is not acting.
+                    // It shipped in core v1.15.0 readable nowhere but the config file.
+                    copierMode = copierMode,
+                    copierModeNote = copierModeActing
+                        ? "the copier is LIVE: an enabled, armed relationship places real orders."
+                        : "⚠️ the copier is '" + copierMode + "': NO relationship places an order, "
+                          + "however it is configured. This is a global switch. In 'shadow' the "
+                          + "order that would have been sent is logged as COPY_BLOCKED_COPIER_SHADOW "
+                          + "with its instrument, action and quantity.",
+                    notEnforcingReason = CopierEnforcementView.NotEnforcingReason(
+                        rel.IsEnabled, rel.ArmedForLive, copierModeActing, copierMode),
                     config = rel, relationships = rels, groups = groups,
                     configConflicts = configConflicts,
                     configConflictNote = configConflicts.Count == 0

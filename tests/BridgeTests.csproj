@@ -21,6 +21,11 @@
          no stub. Anything else extracted from McpBridgeAddOn.cs on those terms belongs
          here too; that is P2-27's cheapest available step. -->
     <Compile Include="../addons/BridgeAccountResolver.cs" />
+    <!-- P3-34's read surface. Same terms as the resolver: it takes primitives and names no
+         NT8 type, so what the endpoint REPORTS about a relationship is executed here rather
+         than grepped. The predicate deciding what an acting mode IS stays in the core's
+         TradeCopierEngine (one definition, passed in), so this cannot drift from the gate. -->
+    <Compile Include="../addons/CopierEnforcementView.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>
