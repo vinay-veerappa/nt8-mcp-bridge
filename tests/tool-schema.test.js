@@ -173,3 +173,88 @@ test('the schemas are still structurally sound after any edit', () => {
     }
   }
 });
+
+/**
+ * P1-72, REGRESSED — measured on the live box 2026-08-13, not inferred.
+ *
+ * `P1-72` was "nt_copier_config advertised a quarantine action that nothing
+ * implemented", closed 2026-08-13. The enum still lists `quarantine` and
+ * `unquarantine`, and the addon still refuses both:
+ *
+ *     POST /api/copier/config {"action":"quarantine",...}
+ *       -> {"success":false,"error":"UNKNOWN_COPIER_ACTION"}
+ *
+ * It fails CLOSED and loudly, because `P1-88` made an unrecognised action a
+ * refusal rather than a silent read — so this is a contract defect, not a
+ * dangerous one. But the contract is what a model reads to decide what to send,
+ * and the enum is the only description of this surface it ever sees.
+ *
+ * The second half is worse than the first: the field that ACTUALLY releases a
+ * quarantine — `isQuarantined`, sent with `action: "set"`, which is what the
+ * browser page posts — was not in the schema at all. So the wrapper advertised
+ * two ways to do it that do not work, and omitted the one that does.
+ */
+test('P1-72: the copier action enum names only actions the addon accepts', () => {
+  const action = props('nt_copier_config').action;
+  assert.ok(Array.isArray(action?.enum), 'nt_copier_config still declares an action enum');
+
+  // The addon's whitelist, from nt8-mcp-bridge McpBridgeAddOn.CopierConfig.
+  const ADDON_ACCEPTS = new Set([
+    'get', 'get_groups',
+    'set', 'update',
+    'set_group', 'upsert_group',
+    'remove_group', 'delete_group',
+    'add_follower_to_group', 'remove_follower_from_group',
+    'remove', 'clear', 'delete',
+    'set_mode',
+  ]);
+
+  for (const a of action.enum) {
+    assert.ok(ADDON_ACCEPTS.has(a),
+      `action "${a}" is advertised but the addon answers UNKNOWN_COPIER_ACTION for it`);
+  }
+
+  assert.ok(!action.enum.includes('quarantine'),
+    'quarantine is not an addon action -- P1-72, and it came back');
+  assert.ok(!action.enum.includes('unquarantine'),
+    'unquarantine is not an addon action either');
+});
+
+test('P1-72: the field that really releases a quarantine is declared', () => {
+  const p = props('nt_copier_config');
+  assert.ok(p.isQuarantined, 'isQuarantined is a declared property');
+  assert.equal(p.isQuarantined.type, 'boolean');
+  assert.ok(!('default' in p.isQuarantined),
+    'and carries NO default -- the engine merges, so a materialised default would '
+    + 'quarantine or release a relationship nobody asked to change (P1-73)');
+});
+
+/**
+ * P3-34. The copier's global live/shadow/disabled mode. It shipped in core
+ * v1.15.0 settable only by editing copier_config.json, and the bridge gained
+ * `set_mode` for it — but a wrapper that does not name the action cannot reach it.
+ */
+test('P3-34: the copier mode is reachable and unambiguous', () => {
+  const p = props('nt_copier_config');
+
+  assert.ok(p.action.enum.includes('set_mode'), 'set_mode is advertised');
+
+  assert.ok(p.copierMode, 'copierMode is a declared property');
+  assert.deepEqual(p.copierMode.enum, ['live', 'shadow', 'disabled'],
+    'and offers exactly the modes the addon recognises -- anything else is refused, '
+    + 'because the gate fails closed');
+  assert.ok(!('default' in p.copierMode),
+    'with no default: a client that materialised one would change how every copy '
+    + 'behaves, on a read (P1-73)');
+
+  // `mode` already existed on this tool meaning the copy TRIGGER source. Two
+  // fields called mode-something, with different meanings, on one tool, is how a
+  // wrong write gets sent confidently.
+  assert.deepEqual(p.mode.enum, ['Executions', 'Orders'],
+    'the pre-existing `mode` still means the copy trigger source');
+  assert.ok(/trigger/i.test(p.mode.description),
+    '`mode` says so in its description');
+  assert.ok(/not the global|copierMode/i.test(p.mode.description),
+    'and distinguishes itself from copierMode, because the two are one letter apart '
+    + 'in intent and worlds apart in effect');
+});
