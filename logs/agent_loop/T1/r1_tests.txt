@@ -1,0 +1,3 @@
+a defaulted `action` must itself be a READ
+every tool whose handler refuses a missing account declares it required
+no tool advertises a default account â€” the class, not the four instances

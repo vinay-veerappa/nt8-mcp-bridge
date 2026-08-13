@@ -1,0 +1,31 @@
+{
+  "ticket": "T1",
+  "rounds": [
+    {
+      "round": 1,
+      "stage": "review",
+      "ok": true,
+      "summary": "APPROVE [deepseek-v4-flash=APPROVE(0), glm-5.2=APPROVE(0)]",
+      "detail": "- NONE",
+      "cost_usd": 0.0,
+      "secs": 0.0,
+      "impl_input_tokens": 4196,
+      "impl_output_tokens": 5651,
+      "reviewer_input_tokens": 12626,
+      "reviewer_output_tokens": 99,
+      "arbiter_input_tokens": 0,
+      "arbiter_output_tokens": 0
+    }
+  ],
+  "applied": false,
+  "applied_approved": false,
+  "applied_unapproved": false,
+  "cost_usd": 0.0,
+  "baseline": [
+    "a defaulted `action` must itself be a READ",
+    "every tool whose handler refuses a missing account declares it required",
+    "no tool advertises a default account \u00e2\u20ac\u201d the class, not the four instances"
+  ],
+  "final_verdict": "APPROVE",
+  "exported_round": 1
+}

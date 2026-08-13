@@ -1,0 +1,94 @@
+diff --git a/lib/tools.js b/lib/tools.js
+index 6147d12..f90c22e 100644
+--- a/lib/tools.js
++++ b/lib/tools.js
+@@ -63,7 +63,7 @@ export const TOOLS = [
+         confirmLive:    { type: 'boolean', description: 'Explicit confirmation required when placing orders on live (non-Sim) accounts' },
+         idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+       },
+-      required: ['symbol', 'action', 'quantity', 'idempotencyKey'],
++      required: ['symbol', 'action', 'quantity', 'idempotencyKey', 'account'],
+     },
+   },
+   {
+@@ -74,14 +74,14 @@ export const TOOLS = [
+       properties: {
+         symbol:         { type: 'string', description: 'Ticker (e.g. NQ 09-26)' },
+         quantity:       { type: 'number', description: 'Order quantity' },
+-        account:        { type: 'string', description: 'Account name', default: 'Sim101' },
++        account:        { type: 'string', description: 'Account name' },
+         confirmLive:    { type: 'boolean', description: 'Explicit confirmation required when placing orders on live (non-Sim) accounts' },
+         limitPrice:     { type: 'number', description: 'Profit target limit price' },
+         stopPrice:      { type: 'number', description: 'Stop loss price' },
+         action:         { type: 'string', enum: ['buy', 'sell'], description: 'Primary entry direction' },
+         idempotencyKey: { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+       },
+-      required: ['symbol', 'quantity', 'limitPrice', 'stopPrice', 'action', 'idempotencyKey'],
++      required: ['symbol', 'quantity', 'limitPrice', 'stopPrice', 'action', 'idempotencyKey', 'account'],
+     },
+   },
+   {
+@@ -109,11 +109,11 @@ export const TOOLS = [
+         kellyFraction:       { type: 'number', description: 'Fractional Kelly multiplier (KellyOptimal)', default: 0.25 },
+         winRate:             { type: 'number', description: 'Assumed win rate for Kelly (KellyOptimal)', default: 0.55 },
+         avgRR:               { type: 'number', description: 'Assumed avg risk-reward for Kelly (KellyOptimal)', default: 2.0 },
+-        account:             { type: 'string', description: 'Target account', default: 'Sim101' },
++        account:             { type: 'string', description: 'Target account' },
+         confirmLive:         { type: 'boolean', description: 'Explicit confirmation required when placing orders on live (non-Sim) accounts' },
+         idempotencyKey:      { type: 'string', description: 'Mandatory UUID string to prevent duplicate orders' },
+       },
+-      required: ['symbol', 'action', 'quantity', 'idempotencyKey'],
++      required: ['symbol', 'action', 'quantity', 'idempotencyKey', 'account'],
+     },
+   },
+   {
+@@ -551,9 +551,9 @@ export const TOOLS = [
+       properties: {
+         symbol:    { type: 'string', description: 'Instrument symbol' },
+         condition: { type: 'string', description: 'Alert trigger condition' },
+-        action:    { type: 'string', enum: ['flatten', 'webhook', 'notify'], default: 'webhook' },
++        action:    { type: 'string', enum: ['flatten', 'webhook', 'notify'] },
+       },
+-      required: ['symbol', 'condition'],
++      required: ['symbol', 'condition', 'action'],
+     },
+   },
+   {
+@@ -573,8 +573,9 @@ export const TOOLS = [
+     inputSchema: {
+       type: 'object',
+       properties: {
+-        account: { type: 'string', description: 'Target account name', default: 'Sim101' },
++        account: { type: 'string', description: 'Target account name' },
+       },
++      required: ['account'],
+     },
+   },
+   {
+@@ -583,9 +584,10 @@ export const TOOLS = [
+     inputSchema: {
+       type: 'object',
+       properties: {
+-        action:   { type: 'string', enum: ['sync_hedge', 'rebalance', 'group_flatten'], default: 'sync_hedge' },
++        action:   { type: 'string', enum: ['sync_hedge', 'rebalance', 'group_flatten'] },
+         accounts: { type: 'array', items: { type: 'string' }, description: 'List of target account names' },
+       },
++      required: ['action'],
+     },
+   },
+ 
+@@ -657,12 +659,12 @@ export const TOOLS = [
+       properties: {
+         strategy:    { type: 'string', description: 'Compiled strategy class name (e.g. PathSignatureUnion)' },
+         instrument:  { type: 'string', description: 'Instrument of an OPEN chart to deploy onto (e.g. NQ 09-26)' },
+-        account:     { type: 'string', description: 'Account name', default: 'Sim101' },
++        account:     { type: 'string', description: 'Account name' },
+         params:      { type: 'object', description: 'Strategy parameter overrides { name: value }' },
+         enable:      { type: 'boolean', description: 'Enable after adding', default: true },
+         confirmLive: { type: 'boolean', description: 'Required to deploy to a non-sim (live) account', default: false },
+       },
+-      required: ['strategy', 'instrument'],
++      required: ['strategy', 'instrument', 'account'],
+     },
+   },
+   {
