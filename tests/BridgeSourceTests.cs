@@ -168,6 +168,57 @@ namespace NinjaTrader.NinjaScript.AddOns
         //
         // The fix is deletion, not wiring: the fallback now refuses, matching the read half.
         // A read that refuses and a write that pretends is the asymmetry that hid this.
+        private static void TestP1_88_AnUnrecognisedCopierActionIsNotReportedAsAWrite()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-88/P1-89: the copier handler refuses an unknown action and resolves by BOTH accounts");
+
+            var path = BridgeSourcePath();
+            Assert(File.Exists(path), string.Format("The bridge source is readable at {0}", path));
+            if (!File.Exists(path))
+                return;
+
+            var code = StripComments(File.ReadAllText(path));
+
+            // P1-88. Found on the live box: a POST with action "set_relationship" -- not one of
+            // the recognised names -- fell through every branch to the READ path, which returns
+            // success:true, loaded:true and persisted:File.Exists(...). The caller is told the
+            // write was persisted; nothing changed. That is P1-80's shape on the copier, and it
+            // is worse here because the caller supplied a payload it believes was applied.
+            //
+            // The handler must name its unknown-action refusal explicitly.
+            Assert(Regex.IsMatch(code, @"UNKNOWN_COPIER_ACTION"),
+                "the copier handler has an explicit refusal for an action it does not recognise");
+
+            // P1-89. The read branch resolved the relationship with FirstOrDefault on the LEADER
+            // alone, so a leader with two followers returned an arbitrary one -- a request naming
+            // SimCopy2 came back carrying Sim-ORB's object. Both accounts identify a relationship
+            // everywhere else in this system; they have to identify it here too.
+            var leaderOnly = Regex.Matches(
+                code, @"FirstOrDefault\(\s*r\s*=>\s*r\.LeaderAccountName\.Equals\([^)]*\)\s*\)");
+            Assert(leaderOnly.Count == 0,
+                string.Format("no copier lookup resolves a relationship by leader alone ({0} found)",
+                    leaderOnly.Count));
+
+            // P1-85 closed exactly this in core. The bridge kept its own copy of the guess, so a
+            // copier request that named no leader was still routed to a real, connected account.
+            //
+            // ⚠️ SCOPED TO THE COPIER HANDLER ON PURPOSE, and the reason is a bigger defect.
+            // Seven more "Sim101" fallbacks remain in this file, and three of them are on ORDER
+            // PLACEMENT paths, where the chain is worse than a single guess: an account name
+            // that does not resolve falls back to Sim101, then to ANY non-Backtest account, then
+            // to ANY account at all. On a box reporting 96 accounts that routes an order to one
+            // nobody chose. That is P1-90, filed separately -- it needs its own change, not a
+            // widened regex at the end of this one, and widening the scan here would either fail
+            // for months or get narrowed by whoever hits it next.
+            var copierMethod = Regex.Match(
+                code, @"private object CopierConfig\(string body\)(?:.|\n)*?\n        \}");
+            Assert(copierMethod.Success, "the copier config handler is locatable in the source");
+            Assert(copierMethod.Success && !copierMethod.Value.Contains("\"Sim101\""),
+                "the copier config handler names no default account of its own (P1-85 removed the "
+                + "same guess from core; see P1-90 for the order paths)");
+        }
+
         private static void TestP1_80_NoWritePathPersistsRiskConfigNothingReads()
         {
             _testsRun++;
@@ -259,11 +310,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestBridgeCarriesNoCopyOfACoreSource();
             TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
             TestUi7_NoCopierWriteBranchDereferencesARefusal();
+            TestP1_88_AnUnrecognisedCopierActionIsNotReportedAsAWrite();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 5;
+            const int declared = 6;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 

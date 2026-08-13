@@ -3839,9 +3839,46 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "get";
-            string leader = req.Str("leaderAccount") ?? req.Str("LeaderAccountName") ?? "Sim101";
+            // P1-85 removed the guessed "Sim101" from the engine; the bridge had kept its own
+            // copy, so a request naming no leader was still routed to a real, connected account.
+            // No fallback: the branches below refuse when they need a leader and have none.
+            string leader = req.Str("leaderAccount") ?? req.Str("LeaderAccountName");
             bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
             string groupName = req.Str("groupName") ?? req.Str("GroupName");
+
+            // ⚠️ P1-88. CHECKED ONCE, BEFORE ANY BRANCH, because the branches below end in an
+            // `else` that is the READ path -- so every unrecognised action used to be answered
+            // with `success = true`, `loaded = true` and `persisted = File.Exists(...)`. A caller
+            // that sent "set_relationship" instead of "set" was told its write had been
+            // persisted, and nothing had changed.
+            //
+            // A whitelist rather than a rename, because the failure is not that one name was
+            // wrong -- it is that ANY wrong name is answered as a successful write. The MCP
+            // wrapper, the browser page and curl all reach this one handler, and only one of
+            // them has a schema.
+            var knownActions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "get", "get_groups",
+                "set", "update",
+                "set_group", "upsert_group",
+                "remove_group", "delete_group",
+                "add_follower_to_group", "remove_follower_from_group",
+                "remove", "clear", "delete"
+            };
+            if (!knownActions.Contains(action))
+            {
+                return new
+                {
+                    success = false,
+                    error = "UNKNOWN_COPIER_ACTION",
+                    action,
+                    persisted = false,
+                    applied = false,
+                    reason = "'" + action + "' is not a copier action. Nothing was read and nothing "
+                             + "was written. Use one of: " + string.Join(", ", knownActions.OrderBy(a => a)),
+                    knownActions = knownActions.OrderBy(a => a).ToList()
+                };
+            }
 
             if (action.Equals("get_groups", StringComparison.OrdinalIgnoreCase))
             {
@@ -3938,9 +3975,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // loaded at startup and updated by every write path below, so re-reading the file
                 // bought nothing except the chance to pick up hand-edits to a file the UI does not
                 // even write to (P?-64).
+                // ⚠️ P1-88. THIS BRANCH USED TO BE REACHED BY EVERY UNRECOGNISED ACTION. A POST
+                // with `"action": "set_relationship"` -- which is not one of the names above --
+                // fell through to here, and this branch returns `success = true`, `loaded = true`
+                // and `persisted = File.Exists(...)`. The caller is told its write was persisted.
+                // Nothing was written. Found on the live box while setting a new default: two
+                // writes reported success and the value did not move.
+                //
+                // That is `P1-80`'s shape (a write that reported success and applied nothing) and
+                // it is worse here, because the caller sent a payload it believes was applied.
+                // An unrecognised action is now refused above, by name, so reaching this branch
+                // means the caller really did ask to read.
                 var rels = TradeCopierEngine.Instance.GetRelationships();
                 var groups = TradeCopierEngine.Instance.GetGroups();
-                var rel = rels.FirstOrDefault(r => r.LeaderAccountName.Equals(leader, StringComparison.OrdinalIgnoreCase)) ?? new CopierRelationship { LeaderAccountName = leader };
+
+                // ⚠️ P1-89. This resolved the relationship by LEADER ALONE, so a leader with two
+                // followers returned whichever came first: a request naming SimCopy2 came back
+                // carrying Sim-ORB's object, and both looked like a successful read. Both accounts
+                // identify a relationship everywhere else in this system -- the config key, the
+                // refusal paths, the conformance rows -- so they identify it here too.
+                //
+                // A request that names no follower still gets the leader's first relationship,
+                // which is the historical behaviour and is fine for "show me this leader": what
+                // was wrong was ignoring a follower the caller DID name.
+                string wantedFollower = req.Str("followerAccount") ?? req.Str("FollowerAccountName");
+                var rel = rels.FirstOrDefault(r =>
+                        r.LeaderAccountName.Equals(leader ?? "", StringComparison.OrdinalIgnoreCase)
+                        && (string.IsNullOrWhiteSpace(wantedFollower)
+                            || r.FollowerAccountName.Equals(wantedFollower, StringComparison.OrdinalIgnoreCase)))
+                    ?? new CopierRelationship { LeaderAccountName = leader ?? "" };
                 bool enforcing = rel.IsEnabled && rel.ArmedForLive;
 
                 // Surfaced explicitly rather than left to be spotted inside `relationships`, because
