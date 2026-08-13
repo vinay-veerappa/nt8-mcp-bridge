@@ -417,7 +417,6 @@ function renderCopier(data) {
     var flags = [];
     if (!r.isEnabled) flags.push("disabled");
     if (!r.armedForLive) flags.push("not armed");
-    if (r.stealthMode) flags.push("stealth");
     if (r.expectedIsClamped) flags.push("clamped by MaxPositionSize");
 
     var mismatch = r.actualSide !== r.expectedSide || r.actualQuantity !== r.expectedQuantity;
