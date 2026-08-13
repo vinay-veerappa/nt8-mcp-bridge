@@ -9,12 +9,18 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <DefineConstants>TESTING</DefineConstants>
-    <!-- Only the harness compiles today. When the bridge itself becomes compilable
-         (tests/README.md), add addons/McpBridgeAddOn.cs and the vendored core here. -->
+    <!-- The harness plus every bridge source that names no NinjaTrader type. When the
+         bridge itself becomes compilable (tests/README.md), add addons/McpBridgeAddOn.cs
+         and the vendored core here. -->
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="BridgeSourceTests.cs" />
+    <!-- P1-90's resolver. The FIRST bridge production source this project executes rather
+         than greps: it takes account names as strings and names no NT8 type, so it needs
+         no stub. Anything else extracted from McpBridgeAddOn.cs on those terms belongs
+         here too; that is P2-27's cheapest available step. -->
+    <Compile Include="../addons/BridgeAccountResolver.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

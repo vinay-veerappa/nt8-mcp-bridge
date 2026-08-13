@@ -299,6 +299,145 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "and a refused write does not touch the config file on its way out");
         }
 
+        // P1-90, the behavioural half -- and the FIRST test in this repo that executes a
+        // line of bridge production code instead of grepping it. That is only possible
+        // because the resolver was extracted to a file naming no NinjaTrader type; see
+        // addons/BridgeAccountResolver.cs.
+        private static void TestP1_90_ResolverRefusesRatherThanGuessing()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-90: an account that does not resolve is refused, not substituted");
+
+            var box = new[] { "Sim101", "Sim-ORB", "SimCopy2", "Backtest", "TAKEPROFITPRO524207503" };
+
+            // The defect, stated as a test: a typo used to land on Sim101.
+            var typo = BridgeAccountResolver.ResolveOrRefuse("Sim1O1", box, "place an order");
+            Assert(typo.Refused, "A typo'd account name is refused");
+            Assert(typo.Name == null,
+                "and carries NO account name -- a caller that ignores Error must not find a "
+                + "usable account sitting next to it, which is how P0-68 shipped");
+            Assert(typo.Error != null && typo.Error.Contains("Sim1O1"),
+                "and the refusal quotes what was asked for, so the operator can see the typo");
+            Assert(typo.Error != null && !typo.Error.Contains("Sim101"),
+                "and does NOT name Sim101 -- the substitution is gone from the text as well as "
+                + "the behaviour");
+
+            // Omission is the other half, and it is the one the three non-order sites had.
+            foreach (var omitted in new[] { null, "", "   " })
+            {
+                var r = BridgeAccountResolver.ResolveOrRefuse(omitted, box, "place an order");
+                Assert(r.Refused && r.Name == null, string.Format(
+                    "An omitted account ({0}) is refused rather than defaulted",
+                    omitted == null ? "null" : "'" + omitted + "'"));
+                // P1-85's lesson, applied here: missing and blank are different inputs, and
+                // "you did not say which account" is a different operator instruction from
+                // "that account does not exist". Without this, narrowing the emptiness test
+                // to a null check still refuses -- with the wrong reason -- and survives.
+                Assert(r.Error != null && r.Error.Contains("no `account` field was supplied"),
+                    "  and says the field was MISSING rather than that it was not found");
+            }
+
+            // Resolution still works, or this is a denial of service rather than a fix.
+            var ok = BridgeAccountResolver.ResolveOrRefuse("Sim-ORB", box, "place an order");
+            Assert(!ok.Refused && ok.Name == "Sim-ORB", "A named account still resolves");
+            Assert(ok.Error == null, "and a resolution carries no error text");
+
+            // The old code matched OrdinalIgnoreCase, so dropping that would break real
+            // callers -- MCP clients spell accounts however the operator typed them.
+            var cased = BridgeAccountResolver.ResolveOrRefuse("sim-orb", box, "place an order");
+            Assert(!cased.Refused, "Case-insensitive matching is preserved");
+            Assert(cased.Name == "Sim-ORB",
+                "and it returns the CANONICAL spelling, not the caller's -- the name is passed "
+                + "to Account lookups and log lines downstream");
+
+            // Whitespace: " Sim101 " is a client typo with one possible intent, and treating
+            // it as a named-but-absent account would report "not found" for an account that
+            // is right there.
+            var padded = BridgeAccountResolver.ResolveOrRefuse("  Sim101  ", box, "place an order");
+            Assert(!padded.Refused && padded.Name == "Sim101", "A padded name is trimmed, not rejected");
+
+            // An exact match must win over a case-insensitive one, or the resolver is itself
+            // choosing between accounts.
+            var ambiguous = new[] { "Fund", "FUND" };
+            var exact = BridgeAccountResolver.ResolveOrRefuse("FUND", ambiguous, "place an order");
+            Assert(!exact.Refused && exact.Name == "FUND", "An exact match wins over a case variant");
+            var noExact = BridgeAccountResolver.ResolveOrRefuse("fund", ambiguous, "place an order");
+            Assert(noExact.Refused,
+                "but with no exact match, two case variants are refused as ambiguous rather "
+                + "than resolved to whichever came first");
+
+            // No accounts at all is a platform state, not a bad request, and the two must not
+            // be reported as the same thing.
+            var none = BridgeAccountResolver.ResolveOrRefuse("Sim101", new string[0], "place an order");
+            Assert(none.Refused, "With no accounts available, a named account is refused");
+            var nullList = BridgeAccountResolver.ResolveOrRefuse("Sim101", null, "place an order");
+            Assert(nullList.Refused && nullList.Error != null,
+                "and a null account list refuses instead of throwing");
+
+            // Null entries in the list must not throw -- Account.All is a live platform
+            // collection, not a curated array.
+            var withNulls = BridgeAccountResolver.ResolveOrRefuse(
+                "Sim101", new[] { null, "Sim101", "" }, "place an order");
+            Assert(!withNulls.Refused && withNulls.Name == "Sim101",
+                "Null and empty entries in the available list are skipped, not fatal");
+
+            // The purpose text reaches the operator; a refusal that does not say what it
+            // refused is the shape UI7 was about.
+            var purposed = BridgeAccountResolver.ResolveOrRefuse("nope", box, "unlock an account");
+            Assert(purposed.Error != null && purposed.Error.Contains("unlock an account"),
+                "The refusal says what it refused to do");
+        }
+
+        // P1-90, the half that can only be a source assertion: the resolver existing proves
+        // nothing about whether the six call sites USE it. This is the gate that would catch
+        // the guess coming back, and it is source text because McpBridgeAddOn.cs is in no
+        // test build (P2-27). Stated as a limitation, not sold as coverage.
+        private static void TestP1_90_NoBridgePathInventsAnAccount()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-90: no bridge path substitutes an account it was not given");
+
+            var path = BridgeSourcePath();
+            if (!File.Exists(path)) { Assert(false, "The bridge source is readable"); return; }
+            var code = StripComments(File.ReadAllText(path));
+
+            // The literal itself. Comments are stripped, so the doc comments explaining the
+            // defect are still allowed to quote it.
+            int sim101 = Regex.Matches(code, "\"Sim101\"").Count;
+            Assert(sim101 == 0, string.Format(
+                "No executable line names \"Sim101\" (found {0}). Six sites used it as a "
+                + "fallback; three of them then placed orders on it.", sim101));
+
+            // The two other links in the chain, which are worse than Sim101 because they do
+            // not even name the account they pick.
+            Assert(!Regex.IsMatch(code, @"FirstOrDefault\s*\(\s*a\s*=>\s*!\s*a\.Name\.Equals\(\s*""Backtest"""),
+                "and nothing selects `ANY account not called Backtest`");
+            Assert(!Regex.IsMatch(code, @"\?\?\s*Account\.All\.FirstOrDefault\s*\(\s*\)"),
+                "and nothing falls back to `ANY account at all`");
+
+            // Positive evidence: the sites route through the tested resolver. Without this,
+            // deleting the fallback and leaving `account == null` would also pass the above.
+            int routed = Regex.Matches(code, @"ResolveOrRefuse\(").Count;
+            Assert(routed >= 6, string.Format(
+                "and all six account-resolution sites route through the tested resolver "
+                + "(found {0})", routed));
+
+            // The lockout path is the sharpest of the three non-order sites: it took the
+            // guessed name straight into UnlockAccount, which REMOVES protection, with no
+            // existence check at all.
+            var unlock = Regex.Match(code, @"private object HandleLockout\(.*?\n        \}",
+                RegexOptions.Singleline);
+            Assert(unlock.Success, "HandleLockout is still locatable");
+            if (unlock.Success)
+            {
+                int refusalBeforeUnlock = unlock.Value.IndexOf("ResolveOrRefuse");
+                int unlockCall = unlock.Value.IndexOf("UnlockAccount");
+                Assert(refusalBeforeUnlock >= 0 && (unlockCall < 0 || refusalBeforeUnlock < unlockCall),
+                    "and it resolves the account BEFORE unlocking one -- unlocking removes "
+                    + "protection, so a guess there is a guess about whose risk limits to drop");
+            }
+        }
+
         public static int Run()
         {
             Console.WriteLine("====================================================");
@@ -306,6 +445,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             Console.WriteLine("====================================================");
 
             TestP2_38_NoBridgeGateClassifiesByAccountName();
+            TestP1_90_ResolverRefusesRatherThanGuessing();
+            TestP1_90_NoBridgePathInventsAnAccount();
             TestVendoredCoreIsPresentAndPinned();
             TestBridgeCarriesNoCopyOfACoreSource();
             TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
@@ -315,7 +456,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 6;
+            const int declared = 8;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 

@@ -1845,7 +1845,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             string stratName = req.Str("strategy");
             string instrument = req.Str("instrument");
             string accountName = req.Str("account");
-            if (string.IsNullOrEmpty(accountName)) accountName = "Sim101";
+            // P1-90. Narrower than the order paths -- an unresolvable name was already
+            // refused below -- but omitting the field silently deployed to Sim101, and this
+            // ENABLES a strategy, which then places orders of its own. Refuse instead.
+            var acctResolution = BridgeAccountResolver.ResolveOrRefuse(
+                accountName, Account.All.Select(a => a.Name), "deploy a strategy");
+            if (acctResolution.Refused) return new { error = acctResolution.Error };
+            accountName = acctResolution.Name;
             bool enable = req["enable"] == null || (bool)req["enable"];
             bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
             var prms = req["params"] as JObject;
@@ -2376,17 +2382,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             string reqAccount = req.GetValueOrDefault("account")?.ToString();
-            Account account = null;
-            if (!string.IsNullOrEmpty(reqAccount))
-            {
-                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
-            }
-            if (account == null)
-            {
-                account = Account.All.FirstOrDefault(a => a.Name == "Sim101") 
-                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
-                          ?? Account.All.FirstOrDefault();
-            }
+            // P1-90: refuse rather than substitute. This fell through to Sim101, then to any
+            // account not called Backtest, then to ANY account -- so a typo placed the order
+            // somewhere else. Resolution is in BridgeAccountResolver, which is unit-tested;
+            // this call site is pinned by source assertion (P2-27).
+            var resolution = BridgeAccountResolver.ResolveOrRefuse(
+                reqAccount, Account.All.Select(a => a.Name), "place an order");
+            if (resolution.Refused) return new { error = resolution.Error };
+            Account account = Account.All.FirstOrDefault(a => a.Name == resolution.Name);
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
@@ -2446,13 +2449,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             string reqAccount = req.GetValueOrDefault("account")?.ToString();
-            Account account = null;
-            if (!string.IsNullOrEmpty(reqAccount))
-                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
-            if (account == null)
-                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
-                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
-                          ?? Account.All.FirstOrDefault();
+            // P1-90, same chain as PlaceOrder. An OCO pair placed on a guessed account is
+            // worse than a single order: both legs land there.
+            var resolution = BridgeAccountResolver.ResolveOrRefuse(
+                reqAccount, Account.All.Select(a => a.Name), "place an OCO order");
+            if (resolution.Refused) return new { error = resolution.Error };
+            Account account = Account.All.FirstOrDefault(a => a.Name == resolution.Name);
             if (account == null) return new { error = "no account available" };
 
             // SIM-first guard: refuse order placement on a LIVE account unless confirmLive=true is explicitly provided
@@ -4163,7 +4165,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var action = req.Str("action") ?? "status";
-            string acctName = req.Str("account") ?? req.Str("Account") ?? "Sim101";
+            // P1-90, and this is the sharpest of the six. It took the guessed name straight
+            // into UnlockAccount, which REMOVES protection, with no existence check at all --
+            // so omitting the field unlocked Sim101, and a TYPO returned
+            // `success:true, isLockedOut:false` for an account that does not exist, which
+            // reads as reassurance. Both are refusals now.
+            var lockoutResolution = BridgeAccountResolver.ResolveOrRefuse(
+                req.Str("account") ?? req.Str("Account"),
+                Account.All.Select(a => a.Name),
+                "read or clear a lockout");
+            if (lockoutResolution.Refused)
+                return new { success = false, error = lockoutResolution.Error };
+            string acctName = lockoutResolution.Name;
 
             if (action.Equals("unlock", StringComparison.OrdinalIgnoreCase) || action.Equals("reset", StringComparison.OrdinalIgnoreCase) || action.Equals("clear", StringComparison.OrdinalIgnoreCase))
             {
@@ -4415,13 +4428,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = "symbol '" + symbol + "' resolves to a master instrument, not a tradable contract. Use full futures format (e.g. NQ 09-26)." };
 
             string reqAccount = req.Str("account");
-            Account account = null;
-            if (!string.IsNullOrEmpty(reqAccount))
-                account = Account.All.FirstOrDefault(a => a.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase));
-            if (account == null)
-                account = Account.All.FirstOrDefault(a => a.Name == "Sim101")
-                          ?? Account.All.FirstOrDefault(a => !a.Name.Equals("Backtest", StringComparison.OrdinalIgnoreCase))
-                          ?? Account.All.FirstOrDefault();
+            // P1-90, same chain again. This is the ATM path, so the guessed account would
+            // also inherit the ATM template's brackets.
+            var resolution = BridgeAccountResolver.ResolveOrRefuse(
+                reqAccount, Account.All.Select(a => a.Name), "place an ATM order");
+            if (resolution.Refused) return new { error = resolution.Error };
+            Account account = Account.All.FirstOrDefault(a => a.Name == resolution.Name);
             if (account == null) return new { error = "no account available" };
 
             // P2-38: this site was worse than the other three -- name prefix ONLY, with no
@@ -5618,7 +5630,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             double dailyPnL = 0.0;
             int totalTrades = 0;
             int maxPositionExposure = 0;
-            string accName = accountName ?? "Sim101";
+            // P1-90. Read-only, but a compliance report is exactly the kind of answer an
+            // operator acts on: guessing meant reporting another account's drawdown against
+            // this one's limit, under a heading naming the account they asked about.
+            var complianceResolution = BridgeAccountResolver.ResolveOrRefuse(
+                accountName, Account.All.Select(a => a.Name), "report compliance");
+            if (complianceResolution.Refused)
+                return new { error = complianceResolution.Error };
+            string accName = complianceResolution.Name;
             double dailyLossLimit = -2500.0; // default fallback
 
             // Try to get the real prop-firm daily loss limit from PropFirmProtectionSuite
