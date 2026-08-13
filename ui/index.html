@@ -91,6 +91,15 @@
     font-size: 11px; border: 1px solid var(--line);
   }
   .legend span { margin-right: 14px; white-space: nowrap; }
+  .act { padding: 3px 8px; font-size: 12px; margin-right: 5px; white-space: nowrap; }
+  .act[disabled] { opacity: .4; cursor: not-allowed; }
+  .act.warn { border-color: var(--amber); color: var(--amber); }
+  .banner.ok { border-color: var(--green); }
+  .banner .dismiss { float: right; padding: 1px 8px; font-size: 12px; }
+  .banner .reason {
+    display: block; margin-top: 6px; color: var(--text);
+    font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap;
+  }
 </style>
 </head>
 <body>
@@ -104,6 +113,9 @@
 
 <main>
   <div id="banner"></div>
+  <!-- Outcomes live OUTSIDE #copier on purpose. The page re-renders every 5s, so
+       anything written inside a section is gone before it can be read. -->
+  <div id="outcome"></div>
   <div id="copier"></div>
   <div id="content"></div>
 </main>
@@ -392,14 +404,16 @@ function renderCopier(data) {
            a.followerAccountName.localeCompare(b.followerAccountName);
   });
 
+  lastCopierRows = rows;
+
   var html = '<section><h2>Copier (' + rows.length + ')</h2>'
     + '<table><thead><tr>'
     + '<th>Verdict</th><th>Leader &rarr; Follower</th><th>Instrument</th>'
     + '<th>Leader</th><th>Expected</th><th>Actual</th>'
-    + '<th>Latency</th><th>Slippage</th><th>Note</th>'
+    + '<th>Latency</th><th>Slippage</th><th>Note</th><th>Actions</th>'
     + '</tr></thead><tbody>';
 
-  rows.forEach(function (r) {
+  rows.forEach(function (r, i) {
     var flags = [];
     if (!r.isEnabled) flags.push("disabled");
     if (!r.armedForLive) flags.push("not armed");
@@ -420,10 +434,175 @@ function renderCopier(data) {
       + '<td>' + metric(r.latency, "ms") + '</td>'
       + '<td>' + metric(r.slippage, "ticks") + '</td>'
       + '<td class="note">' + esc(r.quarantineReason || flags.join(" · ")) + '</td>'
+      // The release button appears only on a quarantined row, because an action
+      // that is always offered and usually meaningless trains you to ignore it.
+      + '<td>'
+      + '<button class="act" data-row="' + i + '" data-do="toggle">'
+      + (r.isEnabled ? "Disable" : "Enable") + '</button>'
+      + (r.isQuarantined
+          ? '<button class="act warn" data-row="' + i + '" data-do="release">Release</button>'
+          : '')
+      + '</td>'
       + '</tr>';
   });
 
   el.innerHTML = html + '</tbody></table></section>';
+  wireActions(rows);
+}
+
+// ── writing ──────────────────────────────────────────────────────────────────
+// The first thing on this page that CHANGES anything. Three rules, and they are
+// the whole design:
+//
+//  1. A request names ONLY the fields it is changing. The engine merges it over
+//     what is stored, so a field this page has never heard of survives. Sending
+//     a whole row back is how PerTickerRatios, CustomSymbolMappings and
+//     MaxSlippageTicks were wiped twice before (P?-65) -- a surface cannot see
+//     those fields, so a round trip through it silently resets them to defaults.
+//
+//  2. Nothing is armed from here. `armedForLive` is never in any request below,
+//     which under merge semantics means the stored value is left alone. Arming
+//     is a decision that belongs where the operator can see the account.
+//
+//  3. Every confirmation states the CONSEQUENCE, not the action. "Disable this
+//     relationship?" tells you nothing you did not already know. What matters is
+//     whether the follower is holding something right now.
+
+var lastCopierRows = [];   // for deriving group membership from the detail
+
+function apiPost(url, body) {
+  var t = token();
+  if (!t) return Promise.reject(new Error("No token entered, so nothing can be written."));
+  return fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + t, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    if (r.status === 401) {
+      localStorage.removeItem("nt8_token");
+      throw new Error("The bridge rejected that token. Reload to enter it again.");
+    }
+    if (!r.ok) throw new Error("The bridge returned HTTP " + r.status + ".");
+    return r.json();
+  });
+}
+
+function outcome(kind, text, reason) {
+  var el = document.getElementById("outcome");
+  if (!el) return;
+  el.innerHTML = '<div class="banner ' + kind + '">'
+    + '<button class="dismiss" onclick="document.getElementById(\'outcome\').innerHTML=\'\'">dismiss</button>'
+    + esc(text)
+    + (reason ? '<span class="reason">' + esc(reason) + '</span>' : '')
+    + '</div>';
+}
+
+// What a follower is holding RIGHT NOW, in words, or null if it is flat. This is
+// the sentence that makes a disable confirmation worth reading.
+function holdingNow(r) {
+  if (!r.actualSide || r.actualSide === "Flat" || !r.actualQuantity) return null;
+  return r.followerAccountName + " is currently holding "
+       + (r.actualSide === "Long" ? "LONG " : "SHORT ") + r.actualQuantity
+       + (r.instrumentFullName ? " " + r.instrumentFullName : "");
+}
+
+function groupSiblings(groupName) {
+  var names = {};
+  lastCopierRows.forEach(function (r) {
+    if (r.groupName === groupName) names[r.followerAccountName] = true;
+  });
+  return Object.keys(names);
+}
+
+function confirmToggle(r, nextEnabled) {
+  var what = r.groupName
+    ? 'group "' + r.groupName + '"'
+    : r.leaderAccountName + " -> " + r.followerAccountName;
+
+  var lines = [(nextEnabled ? "ENABLE " : "DISABLE ") + what + "?"];
+
+  // A grouped row is not a per-follower switch, and pretending otherwise is the
+  // kind of quiet lie this whole UI exists to stop. Say who else it moves.
+  if (r.groupName) {
+    var sibs = groupSiblings(r.groupName);
+    if (sibs.length > 1) {
+      lines.push("");
+      lines.push("This follower is managed by a GROUP, so this affects all "
+                 + sibs.length + " of its followers: " + sibs.join(", "));
+    }
+  }
+
+  if (!nextEnabled) {
+    var held = holdingNow(r);
+    lines.push("");
+    lines.push(held
+      ? held + ".\n\nDisabling stops copying, so the leader's EXIT will not reach it either. "
+              + "That position becomes yours to close by hand."
+      : "The follower is flat, so nothing is stranded by this.");
+  }
+
+  return window.confirm(lines.join("\n"));
+}
+
+function confirmRelease(r) {
+  return window.confirm(
+    "RELEASE the quarantine on " + r.leaderAccountName + " -> " + r.followerAccountName + "?\n\n"
+    + "It was quarantined because:\n" + (r.quarantineReason || "(no reason recorded)") + "\n\n"
+    + "Releasing resumes copying immediately. Whatever caused this can happen again on the "
+    + "next entry -- the threshold that tripped is unchanged.");
+}
+
+// One dispatcher, so there is exactly one place that builds a request and one
+// place that reads the answer. `refused` is the engine declining on purpose and
+// is NOT an error: it comes back with the reason, which is the whole of UI7.
+function dispatch(body, describe) {
+  apiPost("/api/copier/config", body)
+    .then(function (res) {
+      if (res && res.refused) {
+        outcome("bad", "Refused. Nothing was changed.", res.reason);
+      } else if (res && res.success) {
+        outcome("ok", describe);
+      } else {
+        outcome("bad", "The bridge did not report success, and did not say it refused.",
+                JSON.stringify(res));
+      }
+      load();
+    })
+    .catch(function (e) { outcome("bad", e.message); });
+}
+
+function toggleRow(r, nextEnabled) {
+  if (!confirmToggle(r, nextEnabled)) return;
+  var verb = nextEnabled ? "Enabled " : "Disabled ";
+  if (r.groupName) {
+    dispatch({ action: "set_group", groupName: r.groupName, isEnabled: nextEnabled },
+             verb + 'group "' + r.groupName + '".');
+  } else {
+    dispatch({ action: "set", leaderAccount: r.leaderAccountName,
+               followerAccount: r.followerAccountName, isEnabled: nextEnabled },
+             verb + r.leaderAccountName + " -> " + r.followerAccountName + ".");
+  }
+}
+
+function releaseRow(r) {
+  if (!confirmRelease(r)) return;
+  // isQuarantined:false only. The engine clears QuarantineReason itself, because
+  // a reason without a quarantine is stale data and that invariant belongs there.
+  dispatch({ action: "set", leaderAccount: r.leaderAccountName,
+             followerAccount: r.followerAccountName, isQuarantined: false },
+           "Released the quarantine on " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
+}
+
+function wireActions(rows) {
+  Array.prototype.forEach.call(document.querySelectorAll("button.act"), function (b) {
+    var r = rows[parseInt(b.getAttribute("data-row"), 10)];
+    if (!r) return;
+    if (b.getAttribute("data-do") === "toggle") {
+      b.addEventListener("click", function () { toggleRow(r, !r.isEnabled); });
+    } else {
+      b.addEventListener("click", function () { releaseRow(r); });
+    }
+  });
 }
 
 function loadCopier() {
