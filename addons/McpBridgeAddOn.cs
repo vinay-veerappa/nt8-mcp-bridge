@@ -4137,11 +4137,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                           + "to create this, so it came from editing copier_config.json by hand.",
                     metrics = metrics,
                     metricsScope = "session",
-                    metricsNote = "latencyMs/avgSlippageTicks are measured live per fill and are "
-                        + "SESSION-scoped -- they reset when NT8 restarts, and the copy in "
-                        + "copier_config.json is only as fresh as the last config save. A zero here "
-                        + "means either no copy has filled this session or a genuinely clean fill; "
-                        + "the COPIER_FILL_MEASURED events in interventions.jsonl tell those apart."
+                    metricsNote = "latencyMs/avgSlippageTicks are measured live per COPY -- not per "
+                        + "fill: a partial fill is accumulated across its slices and reported once, "
+                        + "quantity-weighted, when the order is done (P2-98). latencyMs is "
+                        + "time-to-FIRST-fill, i.e. how long the copy took to reach the market, not "
+                        + "how long the market took to fill it. Both are SESSION-scoped -- they reset "
+                        + "when NT8 restarts, and the copy in copier_config.json is only as fresh as "
+                        + "the last config save. A zero here means either no copy has filled this "
+                        + "session or a genuinely clean fill; the COPIER_FILL_MEASURED events in "
+                        + "interventions.jsonl tell those apart, and carry the contract count the "
+                        + "reading was taken over."
                 };
             }
         }
