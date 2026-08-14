@@ -26,6 +26,8 @@
          than grepped. The predicate deciding what an acting mode IS stays in the core's
          TradeCopierEngine (one definition, passed in), so this cannot drift from the gate. -->
     <Compile Include="../addons/CopierEnforcementView.cs" />
+    <!-- P1-97. Same terms again: strings in, strings out, no NT8 type named. -->
+    <Compile Include="../addons/BridgeOrderAction.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

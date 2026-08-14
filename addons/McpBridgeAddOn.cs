@@ -2420,7 +2420,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
 
-            var orderAction = actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase) ? OrderAction.Buy : OrderAction.Sell;
+            // P1-97. This used to be `buy ? Buy : Sell`, unconditionally, so the bridge could
+            // never emit SellShort or BuyToCover. NT8 nets the position correctly either way --
+            // the ORDER works. What breaks is everything that reads the label, and the copier
+            // classifies exits from exactly that: a short ENTRY placed here arrived as `Sell`
+            // and was read as an exit, and a COVER arrived as `Buy` and was read as an ENTRY,
+            // i.e. copied to followers as a new position in the opposite direction. Measured on
+            // the live box, both halves. See addons/BridgeOrderAction.cs.
+            var currentPos = account.Positions.FirstOrDefault(pp =>
+                pp.Instrument != null && pp.Instrument.FullName == instrument.FullName);
+            string resolvedAction = BridgeOrderAction.Resolve(
+                actionStr, currentPos != null ? currentPos.MarketPosition.ToString() : null);
+            var orderAction = (OrderAction)Enum.Parse(typeof(OrderAction), resolvedAction, true);
             var orderType = (OrderType)Enum.Parse(typeof(OrderType), orderTypeStr, true);
 
             var tifStr = req.GetValueOrDefault("timeInForce")?.ToString() ?? "Day";

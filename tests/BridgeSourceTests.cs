@@ -455,11 +455,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();
+            TestP1_97_TheOrderActionIsResolvedFromThePosition();
+            TestP1_97_TheEndpointResolvesRatherThanHardcoding();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 11;
+            const int declared = 13;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -588,6 +590,87 @@ namespace NinjaTrader.NinjaScript.AddOns
             // copier's mode -- the trap CopierReadFromQuery's whitelist exists to prevent.
             Assert(!Regex.IsMatch(code, @"action\.Equals\(""set_mode"", StringComparison\.OrdinalIgnoreCase\)\s*\|\|\s*isRead"),
                 "and set_mode is not in the GET read whitelist, so it cannot be issued as a URL");
+        }
+
+
+        // ================================================================================
+        // P1-97. EXECUTED. `nt_place_order` mapped buy/sell to Buy/Sell unconditionally, so
+        // the bridge could never emit SellShort or BuyToCover. NT8 nets the position either
+        // way -- the order works -- but the copier classifies exits from the LABEL:
+        //
+        //     bool leaderIsExiting = leadAction == OrderAction.Sell || leadAction == BuyToCover;
+        //
+        // Measured live 2026-08-13: a short ENTRY arrived as `Sell` and was read as an exit,
+        // and a COVER arrived as `Buy` and was read as an ENTRY -- i.e. copied to followers as
+        // a new position in the OPPOSITE direction to the leader's close.
+        // ================================================================================
+
+        private static void TestP1_97_TheOrderActionIsResolvedFromThePosition()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-97: buy/sell resolves to the right one of NT8's FOUR order actions");
+
+            // The two the bridge could never produce, and the two defects they fix.
+            Assert(BridgeOrderAction.Resolve("sell", null) == BridgeOrderAction.SellShort,
+                "selling from FLAT is a short ENTRY -> SellShort. As `Sell` the copier read it as "
+                + "an exit and never copied the short at all");
+            Assert(BridgeOrderAction.Resolve("buy", "Short") == BridgeOrderAction.BuyToCover,
+                "buying while SHORT is a COVER -> BuyToCover. As `Buy` the copier read it as an "
+                + "entry and copied a position in the opposite direction to the leader's close");
+
+            // The two that already worked, so the fix cannot be an inversion.
+            Assert(BridgeOrderAction.Resolve("buy", null) == BridgeOrderAction.Buy,
+                "buying from FLAT is a long entry -> Buy");
+            Assert(BridgeOrderAction.Resolve("sell", "Long") == BridgeOrderAction.Sell,
+                "selling while LONG is an exit -> Sell");
+
+            // Adding to a position keeps the opening label.
+            Assert(BridgeOrderAction.Resolve("buy", "Long") == BridgeOrderAction.Buy,
+                "buying while LONG adds to it -> Buy, not BuyToCover");
+            Assert(BridgeOrderAction.Resolve("sell", "Short") == BridgeOrderAction.SellShort,
+                "selling while SHORT adds to it -> SellShort, not Sell");
+
+            // Flat arrives in more than one spelling, and every one of them must open.
+            foreach (var flat in new string[] { null, "", "Flat", "flat", "unknown" })
+                Assert(BridgeOrderAction.Resolve("sell", flat) == BridgeOrderAction.SellShort,
+                    "a side of '" + (flat ?? "<null>") + "' is not Long, so selling OPENS a short");
+
+            // Case-insensitive on both arguments: the action comes off an HTTP body and the
+            // side off MarketPosition.ToString().
+            Assert(BridgeOrderAction.Resolve("BUY", "short") == BridgeOrderAction.BuyToCover,
+                "the action and the side are both matched case-insensitively");
+            Assert(BridgeOrderAction.Resolve("SELL", "LONG") == BridgeOrderAction.Sell,
+                "and the other way round");
+
+            // Every result must be a real NT8 OrderAction name -- this string is Enum.Parse'd
+            // by the caller, so a typo here is a runtime throw on the order path.
+            foreach (var a in new string[] { "buy", "sell" })
+                foreach (var side in new string[] { null, "Long", "Short", "Flat" })
+                {
+                    string r = BridgeOrderAction.Resolve(a, side);
+                    Assert(r == "Buy" || r == "Sell" || r == "BuyToCover" || r == "SellShort",
+                        "Resolve(" + a + ", " + (side ?? "null") + ") returns a real OrderAction name, "
+                        + "because the caller Enum.Parses it. Got: " + r);
+                }
+        }
+
+        /// <summary>
+        /// SOURCE gate -- proves the wiring exists, not that it behaves. The behaviour is the
+        /// test above; this one exists because the call site is in McpBridgeAddOn.cs, which no
+        /// test build reaches (P2-27).
+        /// </summary>
+        private static void TestP1_97_TheEndpointResolvesRatherThanHardcoding()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-97: nt_place_order calls the resolver (SOURCE gate)");
+
+            string code = File.ReadAllText(BridgeSourcePath());
+
+            Assert(Regex.IsMatch(code, @"BridgeOrderAction\.Resolve"),
+                "the order path calls the resolver");
+            Assert(!Regex.IsMatch(code, @"orderAction = actionStr\.Equals\(""buy"".*\? OrderAction\.Buy : OrderAction\.Sell"),
+                "and the unconditional buy/sell mapping is GONE -- that exact expression is the "
+                + "defect, and it is the thing a later refactor would most naturally restore");
         }
 
         public static int Main(string[] args)
