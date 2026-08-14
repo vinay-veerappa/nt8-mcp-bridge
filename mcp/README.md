@@ -24,14 +24,14 @@ Three layers, zero external APIs, everything runs locally on the NT8 machine.
 ## Tests
 
 ```bash
-npm test          # 33 tests, node:test, still zero dependencies
+npm test          # 43 tests, node:test, still zero dependencies
 ```
 
 ⚠️ **Not `node --test tests/`** — on Node ≥ 22 the directory is resolved as a module path
 and the run dies with `MODULE_NOT_FOUND`, which looks exactly like a legitimate red
 baseline. Use `npm test`.
 
-Coverage is currently `lib/copier-config-request.js` only, and that is deliberate about
+Coverage is `lib/copier-config-request.js` and `lib/tools.js`, and that is deliberate about
 where it lives: `nt-mcp-server.js` starts a stdin readline loop at import, so a test of a
 function defined inside it hangs. **Any request-building logic worth testing belongs in
 `lib/`.** The mapping for `nt_copier_config` was moved there after four defects
@@ -138,7 +138,7 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_cancel_all_orders` | `POST /api/orders/cancel-all` | Cancel all working orders across accounts |
 | `nt_close_position` | `POST /api/position/close` | Flatten a symbol position for an account |
 | `nt_emergency_flatten` | `POST /api/emergency-flatten` | Atomic panic kill-switch: cancel all, flatten all, optional lockout |
-| `nt_lockout` | `POST /api/lockout` | Engage or query account lockout status |
+| `nt_atm_bracket_status` | `GET /api/order/atm/status` | Query active ATM bracket by `bracketId`, or list all active brackets |
 
 ### Quotes, Bars, Instruments
 
@@ -166,8 +166,6 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_deploy_strategy` | `POST /api/strategy/deploy` | Add compiled strategy to an **open chart** (SIM-first). Best-effort: NT8 has no public API to open a chart or attach a strategy from an AddOn, so the chart must already be open. |
 | `nt_stop_strategy` | `POST /api/strategy/stop` | Disable + remove running strategies |
 | `nt_set_strategy_param` | `POST /api/strategy/param` | Change inputs on a running strategy live |
-| `nt_sa_close` | `POST /api/sa/close` | Close Strategy Analyzer windows |
-| `nt_sa_inspect` | `GET /api/sa/inspect` | Inspect Strategy Analyzer date/control bindings |
 
 ### Observability & Logs
 
@@ -386,6 +384,18 @@ If `nt_compile` reports errors referencing line numbers beyond the file length o
 - **NinjaTrader 8** (any license: free, trial, or lifetime)
 - **Windows** (NinjaTrader only runs on Windows)
 
+## Repository
+
+This wrapper (`mcp/`) lives in the [`nt8-mcp-bridge`](https://github.com/vinay-veerappa/nt8-mcp-bridge)
+repo alongside the C# addon it talks to (`addons/McpBridgeAddOn.cs`). The wrapper and
+the addon are two halves of one contract: the wrapper advertises MCP tool schemas, the
+addon decides what it accepts. Keeping them in one repo makes the contract pinnable —
+see `mcp/tests/tool-schema.test.js`'s P1-72 test, which reads the addon source directly
+to verify the wrapper's enum matches the addon's `knownActions` whitelist.
+
+The JS tests (`node --test` from `mcp/`) run in CI alongside the C# harness
+(`dotnet run --project tests/BridgeTests.csproj`) and the mutation batteries.
+
 ## License
 
 MIT — do what you want, no strings attached. See [LICENSE](LICENSE).
@@ -394,3 +404,4 @@ MIT — do what you want, no strings attached. See [LICENSE](LICENSE).
 
 - **Phase 1** (accounts, trading, quotes, bars, instrument search) — original work by [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
 - **Phase 2+** (strategy authoring, in-process compile, Strategy Analyzer backtesting, live deployment, risk/copier/orchestration, and v1.5.0 expansion) — extended by the tvDownloadOHLC project.
+- The wrapper was folded into `nt8-mcp-bridge` on 2026-08-14 from its fork of `hoquet98/ninjatrader-mcp`, preserving the full history including the P1-91 and P1-72 contract-drift fixes.
