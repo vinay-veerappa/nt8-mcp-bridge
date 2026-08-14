@@ -418,10 +418,22 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // Positive evidence: the sites route through the tested resolver. Without this,
             // deleting the fallback and leaving `account == null` would also pass the above.
+            //
+            // ⚠️ EXACT, not `>= 6`, and the exactness is the point. This read `>= 6` until
+            // P1-105 added a SEVENTH site (ClosePosition) -- at which point a mutant that
+            // removed the resolver from the compliance site left 6 and the assertion still
+            // passed. Nothing in this gate changed; the CODE AROUND IT changed, and a
+            // lower-bound count is satisfied by unrelated growth. `mutate_p190.py` caught it
+            // on the first run after the addition.
+            //
+            // So: adding an eighth resolution site must bump this number in the same commit.
+            // That is a deliberate speed bump, not an oversight -- it makes the author of a new
+            // site look at what this gate is protecting.
             int routed = Regex.Matches(code, @"ResolveOrRefuse\(").Count;
-            Assert(routed >= 6, string.Format(
-                "and all six account-resolution sites route through the tested resolver "
-                + "(found {0})", routed));
+            Assert(routed == 7, string.Format(
+                "and all SEVEN account-resolution sites route through the tested resolver "
+                + "(found {0}). If you added a site, raise this number; if you removed one, "
+                + "say which and why", routed));
 
             // The lockout path is the sharpest of the three non-order sites: it took the
             // guessed name straight into UnlockAccount, which REMOVES protection, with no

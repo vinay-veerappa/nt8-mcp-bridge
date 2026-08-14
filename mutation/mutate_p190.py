@@ -126,12 +126,21 @@ MUTANTS = [
 def run():
     build = subprocess.run(
         ['dotnet', 'build', 'BridgeTests.csproj', '-v', 'q', '--nologo'],
-        cwd=os.path.join(REPO, 'tests'), capture_output=True, text=True)
+        cwd=os.path.join(REPO, 'tests'), capture_output=True, text=True,
+        encoding='utf-8', errors='replace')
     if build.returncode != 0:
         return 'BUILD FAILED'
     res = subprocess.run(
         ['dotnet', 'run', '--project', 'BridgeTests.csproj', '--no-build'],
-        cwd=os.path.join(REPO, 'tests'), capture_output=True, text=True)
+        cwd=os.path.join(REPO, 'tests'), capture_output=True, text=True,
+        # encoding pinned: the default on Windows is cp1252, and a single non-ASCII
+        # character in a test's message (the suite uses them) makes capture_output raise
+        # UnicodeDecodeError on a reader THREAD -- res.stdout comes back None and this
+        # dies before its first mutant. THIS BATTERY IS WHY THAT MATTERS: a bulk patch
+        # fixing the other three reported it as SKIPPED because its run() has a different
+        # shape, the skip was read and not acted on, and CI went red on the next push.
+        # A battery that cannot run is not a battery that passed.
+        encoding='utf-8', errors='replace')
     m = re.search(r'Passed = \d+, Failed = \d+', res.stdout)
     return m.group(0) if m else 'NO RESULT LINE'
 

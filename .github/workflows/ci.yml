@@ -70,6 +70,14 @@ jobs:
       # They are cheap here in a way they are not in the core: the harness is a small
       # project, so a mutant costs seconds rather than a full addon recompile. Listed
       # one step per battery so a failure names which one.
+      # ⚠️ BEFORE the batteries, because it decides whether they can run at all. All four
+      # captured their child's output with the Windows locale codec, so one non-ASCII
+      # character in a test name made stdout None and the battery died before its first
+      # mutant. A bulk fix patched three and printed SKIP for the fourth; the skip was read
+      # and not acted on, and this workflow went red on the next push.
+      - name: Every battery pins an explicit encoding (or none of them prove anything)
+        run: python tools/check_batteries_pin_encoding.py
+
       - name: Mutation P1-90 (the account resolver)
         run: python mutation/mutate_p190.py
 
