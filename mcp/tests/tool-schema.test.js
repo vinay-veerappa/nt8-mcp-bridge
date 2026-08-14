@@ -24,8 +24,63 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { TOOLS } from '../lib/tools.js';
+
+// The addon source, anchored on THIS file's location -- not the cwd -- so the
+// test behaves the same however the runner is launched. Same approach as
+// BridgeSourceTests.cs in this repo: the test and the source it pins are two
+// halves of one contract, and a path that depends on where you stood when you
+// ran it is a path that silently stops loading.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ADDON_SOURCE = path.resolve(__dirname, '..', '..', 'addons', 'McpBridgeAddOn.cs');
+
+// Extract the real `knownActions` whitelist from the addon source. The addon is
+// the authority: it decides what it accepts, and the wrapper's job is to advertise
+// exactly that. A hand-transcribed copy of the list (which is what this test used
+// to be) catches the wrapper drifting from a list that was true when someone typed
+// it, and CANNOT see the addon change -- which is how P1-72 regressed.
+//
+// The whitelist is a HashSet initializer in CopierConfig():
+//
+//     var knownActions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+//     {
+//         "get", "get_groups",
+//         "set", "update",
+//         ...
+//         "set_mode"
+//     };
+//
+// We strip comments first (the doc comments quote the defective pattern verbatim,
+// and a check that forbids describing the bug it prevents gets the comment deleted
+// instead), then match the string literals inside the HashSet initializer.
+function stripComments(src) {
+  // Block comments.
+  src = src.replace(/\/\*[\s\S]*?\*\//g, '');
+  // Line comments (naive -- does not handle // inside strings, but the whitelist
+  // initializer contains none, and this is the same rule BridgeSourceTests.cs uses).
+  return src.split('\n').map(l => {
+    const i = l.indexOf('//');
+    return i >= 0 ? l.substring(0, i) : l;
+  }).join('\n');
+}
+
+function extractKnownActions(src) {
+  const code = stripComments(src);
+  // Match the HashSet<string> initializer block. The `var knownActions = new
+  // HashSet<string>(...) { ... };` block is the only one of this shape in the file.
+  const m = code.match(/knownActions\s*=\s*new\s+HashSet<string>\s*\([^)]*\)\s*\{([\s\S]*?)\}/);
+  assert.ok(m, 'found the knownActions HashSet initializer in McpBridgeAddOn.cs');
+  // Extract all string literals from the initializer body.
+  const actions = [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]);
+  // set_mode has a comment above it; the comment is stripped, so the literal is
+  // all that remains. Filter out anything that is not a lowercase action name --
+  // the HashSet is OrdinalIgnoreCase so the addon stores them lowercase.
+  return new Set(actions.filter(a => /^[a-z_]+$/.test(a)));
+}
 
 const byName = new Map(TOOLS.map((t) => [t.name, t]));
 const props = (name) => byName.get(name)?.inputSchema?.properties ?? {};
@@ -198,21 +253,30 @@ test('P1-72: the copier action enum names only actions the addon accepts', () =>
   const action = props('nt_copier_config').action;
   assert.ok(Array.isArray(action?.enum), 'nt_copier_config still declares an action enum');
 
-  // The addon's whitelist, from nt8-mcp-bridge McpBridgeAddOn.CopierConfig.
-  const ADDON_ACCEPTS = new Set([
-    'get', 'get_groups',
-    'set', 'update',
-    'set_group', 'upsert_group',
-    'remove_group', 'delete_group',
-    'add_follower_to_group', 'remove_follower_from_group',
-    'remove', 'clear', 'delete',
-    'set_mode',
-  ]);
+  // The addon's REAL whitelist, extracted from addons/McpBridgeAddOn.cs -- not a
+  // hand-transcribed copy. This is the point of the merge: the wrapper and the
+  // addon are two halves of one contract, and a contract with its two sides in
+  // two repos cannot be pinned in one commit. The old test compared against a
+  // transcription with a comment naming where it came from; it caught the wrapper
+  // drifting from a list that was true when someone typed it, and CANNOT see the
+  // addon change. That is this project's recurring defect: a comment standing in
+  // for a gate.
+  assert.ok(fs.existsSync(ADDON_SOURCE),
+    `the addon source is readable at ${ADDON_SOURCE} -- without it the pin is a comment`);
+  const ADDON_ACCEPTS = extractKnownActions(fs.readFileSync(ADDON_SOURCE, 'utf8'));
+  assert.ok(ADDON_ACCEPTS.size > 0,
+    'extracted a non-empty action whitelist from the addon source');
 
   for (const a of action.enum) {
     assert.ok(ADDON_ACCEPTS.has(a),
       `action "${a}" is advertised but the addon answers UNKNOWN_COPIER_ACTION for it`);
   }
+
+  // The reverse direction: an action the addon accepts but the wrapper does not
+  // advertise is a feature the model cannot reach. Both directions are drift.
+  const undeclared = [...ADDON_ACCEPTS].filter(a => !action.enum.includes(a));
+  assert.deepEqual(undeclared, [],
+    `the wrapper advertises every addon action (undeclared: ${undeclared.join(', ')})`);
 
   assert.ok(!action.enum.includes('quarantine'),
     'quarantine is not an addon action -- P1-72, and it came back');

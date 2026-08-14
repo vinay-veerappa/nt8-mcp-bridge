@@ -364,9 +364,10 @@ export const TOOLS = [
           // tests/tool-schema.test.js pins the two together.
           enum: [
             'get', 'get_groups',
-            'set', 'update', 'remove',
+            'set', 'update', 'remove', 'clear', 'delete',
             'set_mode',
-            'set_group', 'remove_group', 'add_follower_to_group', 'remove_follower_from_group',
+            'set_group', 'upsert_group', 'remove_group', 'delete_group',
+            'add_follower_to_group', 'remove_follower_from_group',
           ],
           description: 'Default get. An unrecognised action is REFUSED, not treated as a read.',
         },

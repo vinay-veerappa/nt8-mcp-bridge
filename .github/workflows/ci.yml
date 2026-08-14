@@ -34,6 +34,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
       # ⚠️ Session 38 fixed the INSTANCE -- two unwired batteries -- by adding two steps
       # by hand, which leaves a third free to arrive unwired for just as long. This is
       # the class: it globs mutation/ and fails if any battery is not run exactly once.
@@ -45,6 +49,17 @@ jobs:
 
       - name: Harness
         run: dotnet run --project tests/BridgeTests.csproj
+
+      # The MCP wrapper (mcp/) is the other half of the contract: it advertises
+      # tool schemas, the addon decides what it accepts. P1-91 and P1-72 (twice)
+      # were found in the wrapper repo, which had NO CI -- 43 tests nothing ran on
+      # push. The wrapper is now folded into this repo (see PR for this branch),
+      # so its tests run here. The P1-72 test reads addons/McpBridgeAddOn.cs
+      # directly, which is why the JS step MUST run after checkout with submodules
+      # and cannot be split to a separate job without the addon source.
+      - name: MCP wrapper tests (JS)
+        working-directory: mcp
+        run: node --test
 
       # ⚠️ Added 2026-08-14 (session 38). This repo has had a mutation battery since
       # P1-90 and CI RAN NONE OF THEM -- the core's check_ci_runs_every_battery.py
