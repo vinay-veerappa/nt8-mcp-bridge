@@ -2403,11 +2403,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
             }
 
-            // Reject order if account is locked out by RiskGuard or by EmergencyFlatten lockout.
-            if (IsAccountLocked(account.Name))
-            {
-                return new { error = $"Order blocked: Account {account.Name} is locked out." };
-            }
+            // P1-106. The lockout test USED to be here, before the symbol was even read, so it
+            // could not tell an entry from an exit and refused both. It now runs below, once the
+            // instrument and the account's position in it are known -- a lockout must stop you
+            // opening risk and never stop you closing it. Moving it costs one thing worth naming:
+            // an unparseable request on a locked account now reports the parse error rather than
+            // the lockout. That is the better message anyway, and `nt_close_position` is
+            // ungated, so an exit was never gone entirely.
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString();
@@ -2432,6 +2434,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             string resolvedAction = BridgeOrderAction.Resolve(
                 actionStr, currentPos != null ? currentPos.MarketPosition.ToString() : null);
             var orderAction = (OrderAction)Enum.Parse(typeof(OrderAction), resolvedAction, true);
+
+            // P1-106. Now that the position is in hand, ask what this order DOES. Note the
+            // direction passed is the REQUEST's buy/sell, not `resolvedAction` -- feeding the
+            // label back in would make the gate read a label the caller chose, which is exactly
+            // the mistake P1-97 fixed one statement above.
+            var lockoutDecision = BridgeLockoutGate.Evaluate(
+                IsAccountLocked(account.Name),
+                actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase),
+                currentPos != null ? currentPos.MarketPosition.ToString() : null,
+                currentPos != null ? currentPos.Quantity : 0,
+                quantity,
+                false,
+                account.Name);
+            if (!lockoutDecision.Allowed)
+                return new { error = lockoutDecision.Reason };
+            if (lockoutDecision.AllowedAsReducing)
+                Log("P1-106 " + account.Name + " " + symbol + ": " + lockoutDecision.Reason, LogLevel.Warning);
             var orderType = (OrderType)Enum.Parse(typeof(OrderType), orderTypeStr, true);
 
             var tifStr = req.GetValueOrDefault("timeInForce")?.ToString() ?? "Day";
@@ -2479,10 +2498,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = $"Refusing to place order on LIVE account '{account.Name}' without confirmLive=true" };
             }
 
+            // P1-106. An OCO carries a bracket, so it stays refused even when its entry would
+            // reduce -- the stop and target legs take the opposite side and OPEN a position once
+            // the entry has closed one. Routed through the same gate rather than left as a bare
+            // `if` so the refusal SAYS that, and so one predicate owns the rule: the guard's
+            // second reader is how P1-100 happened.
+            // ⚠️ The RiskGuard clause below is not redundant with IsAccountLocked -- that method
+            // already consults RiskGuardAddOn.Instance, but this site wants the distinct message.
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
-                return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard." };
-            if (IsAccountLocked(account.Name))
-                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
+                return new { error = "Order blocked: Account " + account.Name + " is locked out by Risk Guard. A bracketed order is refused even when its entry would reduce the position; use a plain order to exit, or nt_close_position to flatten." };
+            var ocoLockout = BridgeLockoutGate.Evaluate(
+                IsAccountLocked(account.Name), true, null, 0, 0, true, account.Name);
+            if (!ocoLockout.Allowed)
+                return new { error = ocoLockout.Reason };
 
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
             var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
@@ -4624,8 +4652,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!isSim && !confirmLive)
                 return new { error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" };
 
-            if (IsAccountLocked(account.Name))
-                return new { error = "Order blocked: Account " + account.Name + " is locked out." };
+            // P1-106. ATM attaches a bracket, so the same asymmetry as the OCO path applies.
+            var atmLockout = BridgeLockoutGate.Evaluate(
+                IsAccountLocked(account.Name), true, null, 0, 0, true, account.Name);
+            if (!atmLockout.Allowed)
+                return new { error = atmLockout.Reason };
 
             int quantity = req["quantity"]?.Value<int>() ?? 1;
             double tickSize = instrument.MasterInstrument.TickSize;

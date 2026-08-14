@@ -34,6 +34,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # ⚠️ Session 38 fixed the INSTANCE -- two unwired batteries -- by adding two steps
+      # by hand, which leaves a third free to arrive unwired for just as long. This is
+      # the class: it globs mutation/ and fails if any battery is not run exactly once.
+      # Ported from the core, where it has existed since session 20; it is per-repo by
+      # construction, so it could never have seen this side. Watched failing on a
+      # battery described in a comment but not run.
+      - name: CI runs every mutation battery
+        run: python tools/check_ci_runs_every_battery.py
+
       - name: Harness
         run: dotnet run --project tests/BridgeTests.csproj
 
@@ -51,6 +60,9 @@ jobs:
 
       - name: Mutation P0-104 (the emergency flatten's cancel set)
         run: python mutation/mutate_p0104.py
+
+      - name: Mutation P1-106 (the lockout that trapped you in the position)
+        run: python mutation/mutate_p1106.py
 
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.

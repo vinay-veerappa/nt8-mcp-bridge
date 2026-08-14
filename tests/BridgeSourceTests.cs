@@ -463,11 +463,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP0_104_ABracketLegThatBecomesActiveIsAResidualNotANewOrder();
             TestP0_104_TheCallReportsWhatItPutOnTheBook();
             TestP0_104_TheEndpointDoesNotClaimAnUnobservedFlatten();
+            TestP1_106_AnOrderThatCLOSESThePositionIsAdmittedUnderLockout();
+            TestP1_106_AnEntryOnAFlatAccountIsStillRefused();
+            TestP1_106_AnOrderThatADDSToThePositionIsRefused();
+            TestP1_106_AReversalIsRefusedBecauseItOpensTheOtherSide();
+            TestP1_106_TheShortSideWorksToo();
+            TestP1_106_AnUnlockedAccountIsNotFlaggedAsReducing();
+            TestP1_106_ABracketedOrderStaysRefused();
+            TestP1_106_TheThreeOrderPathsAllConsultTheGate();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 18;
+            const int declared = 26;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -827,6 +835,205 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(Regex.IsMatch(code, @"bool success = errors\.Count == 0 && accountsStillOpen\.Count == 0"),
                 "a panic flatten that left a position open is not a success, whatever it cancelled");
         }
+
+        // ================================================================================
+        // P1-106. A lockout must stop you OPENING risk, never stop you CLOSING it.
+        //
+        // The three bridge order paths refused every order on a locked account, so an operator
+        // holding a position could not place the exit -- the lockout trapped them in the risk it
+        // exists to limit. Measured during P0-104's reproduction: Sim101 long 11, locked by the
+        // panic switch, Sell refused.
+        //
+        // A test asserting only that a locked account refuses an ENTRY passes under the defect
+        // AND under a gate deleted entirely. The discriminating case is the EXIT, and the
+        // negative controls below are what stop "always allow" from passing.
+        // ================================================================================
+
+        private static void TestP1_106_AnOrderThatCLOSESThePositionIsAdmittedUnderLockout()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: a locked account may still close its position");
+
+            // Sim101 long 11, locked, selling 11. This is the live reproduction verbatim.
+            var d = BridgeLockoutGate.Evaluate(true, false, "Long", 11, 11, false, "Sim101");
+
+            Assert(d.Allowed,
+                "THE DEFECT: a lockout refused the order that would CLOSE the position it was "
+                + "locking the operator out of. Refused reason was: " + d.Reason);
+            Assert(d.AllowedAsReducing,
+                "and it is flagged as reducing, so the admission is logged rather than silent -- "
+                + "an exit slipping through a lockout unremarked is indistinguishable from the "
+                + "gate being off");
+
+            // A PARTIAL exit is the same question with a smaller answer.
+            var partial = BridgeLockoutGate.Evaluate(true, false, "Long", 11, 4, false, "Sim101");
+            Assert(partial.Allowed && partial.AllowedAsReducing,
+                "and a partial exit (4 of a long 11) is admitted too");
+        }
+
+        private static void TestP1_106_AnEntryOnAFlatAccountIsStillRefused()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: NEGATIVE CONTROL -- an entry on a locked flat account is refused");
+
+            // Without this, `return Allowed = true` passes the test above and every other
+            // positive case. For a gate, the negative test is the one that proves it works.
+            var flat = BridgeLockoutGate.Evaluate(true, false, null, 0, 5, false, "Sim101");
+            Assert(!flat.Allowed,
+                "a locked account that is FLAT has nothing to close, so this order can only open risk");
+
+            var flatText = BridgeLockoutGate.Evaluate(true, true, "Flat", 0, 5, false, "Sim101");
+            Assert(!flatText.Allowed,
+                "and MarketPosition.Flat arrives as the string Flat, not as null -- both mean flat");
+        }
+
+        private static void TestP1_106_AnOrderThatADDSToThePositionIsRefused()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: NEGATIVE CONTROL -- scaling INTO a position under lockout is refused");
+
+            var d = BridgeLockoutGate.Evaluate(true, true, "Long", 11, 5, false, "Sim101");
+            Assert(!d.Allowed,
+                "buying MORE of a long position on a locked account opens risk, which is the one "
+                + "thing a lockout exists to stop");
+            Assert(d.Reason.Contains("ADDS"),
+                "and the refusal says why, rather than repeating the generic lockout text");
+        }
+
+        private static void TestP1_106_AReversalIsRefusedBecauseItOpensTheOtherSide()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: the quantity clamp -- a Sell 20 against a long 11 is refused");
+
+            // THE LOAD-BEARING CASE. NT8 nets a Sell 20 against a long 11 into ONE order and the
+            // operator sees an "exit". It is an exit AND a new short 9. Admitting it under a
+            // lockout opens 9 contracts of fresh risk. Same arithmetic as P0-6's exit clamp and
+            // P1-99's delta clamp: the clamp goes on what is NEW, not on the total.
+            var d = BridgeLockoutGate.Evaluate(true, false, "Long", 11, 20, false, "Sim101");
+
+            Assert(!d.Allowed,
+                "a Sell 20 against a long 11 is an exit AND a new short 9, so it must not be "
+                + "admitted under a lockout");
+            Assert(d.Reason.Contains("9"),
+                "and the refusal names the 9 that would be opened, plus the quantity that would "
+                + "work -- a refusal the operator cannot act on is one they will retry blind");
+
+            // The boundary itself is admitted: exactly flat, nothing opened.
+            var exact = BridgeLockoutGate.Evaluate(true, false, "Long", 11, 11, false, "Sim101");
+            Assert(exact.Allowed, "and quantity == |position| is a clean exit, not a reversal");
+        }
+
+        private static void TestP1_106_TheShortSideWorksToo()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: covering a SHORT is an exit (P0-96's family)");
+
+            // P0-96 was exactly this blind spot one component over: 1311 green tests, every one
+            // of them long-side, and the copier answered a leader's short-cover with a Sell that
+            // DOUBLED the follower's short. NT8's Position.Quantity is ABSOLUTE -- the side is
+            // MarketPosition -- so a short 11 arrives as ("Short", 11) and NEVER as -11.
+            var cover = BridgeLockoutGate.Evaluate(true, true, "Short", 11, 11, false, "Sim101");
+            Assert(cover.Allowed && cover.AllowedAsReducing,
+                "buying to cover a short 11 on a locked account is an EXIT and must be admitted");
+
+            var addShort = BridgeLockoutGate.Evaluate(true, false, "Short", 11, 5, false, "Sim101");
+            Assert(!addShort.Allowed,
+                "and selling MORE against a short is scaling in, which stays refused");
+
+            var overCover = BridgeLockoutGate.Evaluate(true, true, "Short", 11, 20, false, "Sim101");
+            Assert(!overCover.Allowed,
+                "and over-covering a short 11 with 20 opens a long 9, refused like the long side");
+
+            // DEFENCE IN DEPTH, and the mutation battery is why it is here. NT8 does not emit a
+            // negative Quantity -- but the copier's P0-96 read the SIGN of that field anyway, and
+            // 1311 green tests passed over it. If a caller ever hands this gate a signed -11, the
+            // magnitude is what must be compared: without Math.Abs, `11 > -11` refuses the cover
+            // and P1-106 is BACK, on the short side only, which is exactly how P0-96 hid.
+            var signed = BridgeLockoutGate.Evaluate(true, true, "Short", -11, 11, false, "Sim101");
+            Assert(signed.Allowed && signed.AllowedAsReducing,
+                "a signed position quantity must not turn a legitimate cover into a refusal -- the "
+                + "side comes from MarketPosition, so the quantity is compared as a magnitude");
+        }
+
+        private static void TestP1_106_AnUnlockedAccountIsNotFlaggedAsReducing()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: an UNLOCKED account is allowed without the reducing flag");
+
+            // If AllowedAsReducing were set whenever the order reduces, the "admitted under
+            // lockout" warning would fire on every ordinary exit on every account -- and an
+            // alarm that is always on is off. This repo has six instances of that already.
+            var d = BridgeLockoutGate.Evaluate(false, false, "Long", 11, 11, false, "Sim101");
+            Assert(d.Allowed, "an unlocked account places orders normally");
+            Assert(!d.AllowedAsReducing,
+                "and it is NOT flagged as a lockout-time reduction, or the log line fires on every "
+                + "ordinary exit and stops meaning anything");
+            Assert(d.Reason.Length == 0,
+                "and it carries no operator-facing reason, because nothing happened worth saying");
+
+            // Not locked, and an order that would be refused if it were: still allowed.
+            var entry = BridgeLockoutGate.Evaluate(false, true, "Long", 11, 50, false, "Sim101");
+            Assert(entry.Allowed,
+                "and an unlocked account is NOT subject to the reducing-only rule at all -- this "
+                + "gate must not become a position limit by accident");
+        }
+
+        private static void TestP1_106_ABracketedOrderStaysRefused()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: an OCO/ATM bracket is refused even when its entry would reduce");
+
+            // THE DELIBERATE ASYMMETRY, and it is not an omission. An OCO submits an entry plus
+            // stop and target legs, and those legs take the OPPOSITE side -- so an OCO whose
+            // entry flattens a long leaves a resting stop and target that OPEN a short the moment
+            // either triggers. The bracket cannot be admitted on the strength of its entry.
+            var d = BridgeLockoutGate.Evaluate(true, false, "Long", 11, 11, true, "Sim101");
+
+            Assert(!d.Allowed,
+                "a bracketed order is refused under lockout even though the same entry as a plain "
+                + "order would be admitted");
+            Assert(d.Reason.Contains("nt_close_position") || d.Reason.Contains("plain order"),
+                "and the refusal names a path that DOES work, or the operator is back where "
+                + "P1-106 found them");
+
+            // And an unlocked account still places brackets normally.
+            var unlocked = BridgeLockoutGate.Evaluate(false, true, null, 0, 5, true, "Sim101");
+            Assert(unlocked.Allowed, "brackets are unaffected when the account is not locked");
+        }
+
+        private static void TestP1_106_TheThreeOrderPathsAllConsultTheGate()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-106: PlaceOrder, PlaceOcoOrder and PlaceAtmOrder all route through the gate");
+
+            // EXTRACTION MOVES THE UNTESTED BOUNDARY, IT DOES NOT REMOVE IT -- P0-104's surviving
+            // mutant is the precedent. Every test above executes the predicate; none of them can
+            // see whether McpBridgeAddOn actually CALLS it, or whether it passes the position
+            // rather than a label. That half is source text, and this test says so.
+            string path = BridgeSourcePath();
+            Assert(File.Exists(path), string.Format("The bridge source is readable at {0}", path));
+            // Comments are stripped: this file's own prose quotes the defective pattern verbatim,
+            // and the checks below would match the explanation instead of the code.
+            string code = StripComments(File.ReadAllText(path));
+
+            int calls = Regex.Matches(code, @"BridgeLockoutGate\.Evaluate\(").Count;
+            Assert(calls >= 3,
+                "all three order paths must consult the gate -- found " + calls + ". The defect was "
+                + "three copies of a bare `if (IsAccountLocked(...)) return blocked;`");
+
+            // The bare refusal must be GONE from the order paths. It is still legitimate in the
+            // read-only lockout query, so this asserts the SHAPE that returned an order error.
+            Assert(!Regex.IsMatch(code, @"if \(IsAccountLocked\([^)]*\)\)\s*\r?\n\s*return new \{ error = "),
+                "no order path may still refuse with a bare lockout test -- that is the defect");
+
+            // And the direction fed in must be the REQUEST's, not the resolved OrderAction.
+            // Passing resolvedAction back in would make the gate read a label the caller chose,
+            // which is P1-97 reintroduced one statement after it was fixed.
+            Assert(!Regex.IsMatch(code, @"BridgeLockoutGate\.Evaluate\([^;]*resolvedAction"),
+                "the gate must never be fed the resolved OrderAction label; it takes the request's "
+                + "buy/sell direction and the real position");
+        }
+
 
         public static int Main(string[] args)
         {
