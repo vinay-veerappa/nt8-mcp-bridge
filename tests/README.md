@@ -14,19 +14,38 @@ must not be allowed to bless it, so here is the gap **measured** rather than des
 ## What runs today
 
 ```bash
-dotnet run --project tests/BridgeTests.csproj    # 9 passed / 0 failed
+dotnet run --project tests/BridgeTests.csproj    # 69 passed / 0 failed
 ```
 
-- The three `P2-38` source assertions, migrated out of the core's `TestP2_38` (they were
-  asserting on this file from a repo that no longer contains it, which inverted the
-  dependency direction).
+⚠️ **Re-measured 2026-08-14 (session 35). It was `9 passed` when this file was written**, and
+the shape of what runs has changed as well as the count -- which is the part worth reading.
+
+**EXECUTED** -- real production code, compiled into this project and run:
+
+- **`addons/BridgeAccountResolver.cs`** (`P1-90`). The account resolution that used to fall
+  back to `Sim101`, then to any account at all.
+- **`addons/CopierEnforcementView.cs`** (`P3-34`). What `GET /api/copier/config` REPORTS
+  about a relationship: whether it is enforcing, and if not, why.
+
+Both are their own files for one reason: they name **no NinjaTrader type**, so this project
+compiles and runs them without a stub. That is the cheap, repeatable half of `P2-27` --
+**when logic inside `McpBridgeAddOn.cs` matters, move the part that names no NT8 type out of
+it rather than resigning it to a source-text check.**
+
+**SOURCE-TEXT ONLY** -- these prove the wiring is present, not that it behaves:
+
+- The three `P2-38` assertions, migrated out of the core's `TestP2_38` (they were asserting
+  on this file from a repo that no longer contains it, which inverted the dependency
+  direction).
 - That the vendored core is present -- a missing submodule is a deploy hazard, not an
   inconvenience.
 - That `addons/` carries no copy of a core source (`P2-28`'s shape).
+- `P1-88`'s unknown-action refusal, `UI7`'s refusal-not-a-NullReference, `P1-80`, and
+  `P3-34`'s endpoint wiring.
 - A harness self-check that every declared test was invoked.
 
-These are source-text assertions. They prove less than an execution would, and they prove
-exactly the thing that regressed in `P2-38`.
+Each source-text test says in its own docstring that it is one. **A gate that proves less
+than it appears to is worse than an absent one unless it says so.**
 
 ## The measured gap
 
@@ -53,12 +72,10 @@ namespace shims for `Gui`, `Code`, `Core` and a `Rectangle`.
 
 ## The remedy, in order
 
-1. **In the core**, move the NT8 stub block out of `tests/RiskGuardAddOnTests.cs` into
-   `tests/TestingStubs.cs`. Mechanical, same compilation unit, so it is semantically
-   neutral -- but re-verify 926 tests and both mutation batteries, then cut a new tag and
-   re-pin the submodule here. Do this first: it is the structural fix, and duplicating the
-   stubs on this side instead would give two definitions that drift, which is the exact
-   defect `P2-38` was about.
+1. ~~**In the core**, move the NT8 stub block out of `tests/RiskGuardAddOnTests.cs` into
+   `tests/TestingStubs.cs`.~~ ✅ **DONE** (core §5.24). `vendor/nt8-riskguard/tests/TestingStubs.cs`
+   exists and is consumable from here. Duplicating the stubs on this side was rejected for the
+   reason that still holds: two definitions drift, which is the exact defect `P2-38` was about.
 2. Add the three missing stubs and the namespace shims here.
 3. Expect a member-level tail (`CS1061`) once the types resolve. This is the unbounded
    part -- the 330 figure counts type-level errors only, so treat it as a floor, not an
@@ -66,4 +83,19 @@ namespace shims for `Gui`, `Code`, `Core` and a `Rectangle`.
 4. Then write behavioural tests for the HTTP handlers, and put
    `addons/McpBridgeAddOn.cs` plus the vendored core into `BridgeTests.csproj`.
 
-Until step 4, **do not describe this bridge as tested.**
+Until step 4, **do not describe this bridge as tested.** Two production sources are executed
+and the rest is source text; that is a real improvement on `9 passed` and it is not the same
+thing as coverage of the HTTP handlers.
+
+⚠️ **The cost of the gap, measured rather than argued.** Every defect below was reachable only
+by driving the deployed box, because nothing here could execute the handler:
+
+| | Found how |
+|---|---|
+| `P1-88`/`P1-89` | a copier write reported an unwritten write as persisted |
+| `P1-90` | an order named an unresolvable account and was placed on an arbitrary one |
+| `P3-34`'s `enforcing` | reported a relationship as enforcing while the copier was in `shadow` |
+
+And in the core, the same session: `P0-96` -- a leader covering a **short** sent the follower a
+`Sell`, doubling it -- sat behind **1311 green tests** because no test asserted a short EXIT.
+**Coverage counts are not coverage of the cases that matter.**
