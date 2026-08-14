@@ -216,7 +216,15 @@ test('account stays OPTIONAL where omitting it legitimately means all accounts',
 test('the schemas are still structurally sound after any edit', () => {
   // Cheap structural floor. A patch that corrupts one schema object would
   // otherwise only show up as a tool silently vanishing from tools/list.
-  assert.equal(TOOLS.length, 52, 'tool count unchanged');
+  // 52 -> 54 in P2-103, which added nt_riskguard_inventory and nt_copier_snapshot: the two
+  // read-only surfaces that answer "is the guard actually protecting me", which five of the
+  // core's mutation batteries exist to keep honest and which no tool could reach.
+  //
+  // ⚠️ Bumping this is meant to cost a moment's thought. It is the third exact-count gate to
+  // fire in one session (the addon's ResolveOrRefuse site count, twice) and each time it made
+  // the author state that the addition was deliberate. The `>= N` version of this assertion
+  // let a mutant survive earlier today.
+  assert.equal(TOOLS.length, 54, 'tool count unchanged');
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);

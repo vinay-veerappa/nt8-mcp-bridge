@@ -28,6 +28,7 @@ const MCP_PROTOCOL_VERSION = '2024-11-05';
 
 // ─── Tool Definitions ───────────────────────────────────────────────────
 import { TOOLS } from './lib/tools.js';
+import { summarise, forAccount, accountNames } from './lib/inventory-view.js';
 
 // ─── HTTP Client to NT8 AddOn ──────────────────────────────────────────
 function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000, retries = 3) {
@@ -113,10 +114,26 @@ async function handleToolCall(name, args) {
     case 'nt_health': {
       try {
         const res = await ntFetch('/api/health');
+        // P2-103. /api/riskguard/version had no tool either, and nt_health is where anyone
+        // looks for "what is deployed". Folded in rather than given a tool of its own.
+        //
+        // ⚠️ It is fetched SEPARATELY and allowed to fail on its own. nt_health's job is to
+        // answer whether the bridge is reachable; if the guard were unloaded and this threw,
+        // a health check would report "disconnected" for a bridge that is perfectly fine --
+        // an alarm firing on the wrong subject. A missing guard is reported AS a missing
+        // guard, which is itself the answer someone running nt_health wants.
+        let riskguard = null;
+        try {
+          const v = await ntFetch('/api/riskguard/version');
+          riskguard = v.data;
+        } catch (guardErr) {
+          riskguard = { loaded: false, error: guardErr.message };
+        }
         return {
           status: res.status === 200 ? 'connected' : 'error',
           server_version: SERVER_VERSION,
           nt8_bridge: res.data,
+          riskguard,
           timestamp_utc: new Date().toISOString()
         };
       } catch (err) {
@@ -284,6 +301,54 @@ async function handleToolCall(name, args) {
       if (args.instrument) params.append('instrument', args.instrument);
       const res = await ntFetch(`/api/riskguard/fsm-state?${params}`);
       return res.data;
+    }
+
+    // P2-103. Read-only. The summarising happens HERE rather than in the addon because the
+    // constraint is the CONTEXT WINDOW, not bandwidth: 635KB over localhost costs nothing, and
+    // 635KB into a tool result costs the conversation. Measured on the live box: 635,447 bytes
+    // -> 2,880 bytes of summary, with every number folded out of the same rule rows the
+    // `account` view returns, so the two cannot disagree the way `F-9` did.
+    case 'nt_riskguard_inventory': {
+      const res = await ntFetch('/api/riskguard/inventory');
+      const inv = res.data;
+      if (!inv || !Array.isArray(inv.accounts)) {
+        return { error: 'inventory unavailable', raw: inv };
+      }
+
+      const view = args.view || (args.account ? 'account' : 'summary');
+
+      if (view === 'account' || args.account) {
+        // P1-90 on a read path, which is exactly what P2-109 was: a name that matches nothing
+        // is REFUSED with the available names, never answered about every account.
+        const one = forAccount(inv, args.account);
+        if (!one) {
+          const names = accountNames(inv);
+          return {
+            error: `No account named '${args.account}' in the guard inventory ` +
+                   `(${names.length} available). Refusing to answer about a different account.`,
+            availableSample: names.slice(0, 10),
+          };
+        }
+        return { takenUtc: inv.takenUtc, mode: inv.mode, isArmed: inv.isArmed, account: one };
+      }
+
+      if (view === 'full') return inv;
+      return summarise(inv);
+    }
+
+    case 'nt_copier_snapshot': {
+      const res = await ntFetch('/api/copier/snapshot');
+      const snap = res.data;
+      if (!snap || !Array.isArray(snap.rows)) return { error: 'snapshot unavailable', raw: snap };
+      if (!args.account) return snap;
+
+      // Either side of the relationship: asking about an account you lead from and an account
+      // you copy INTO are the same question -- "what is this account involved in".
+      const want = String(args.account).trim().toLowerCase();
+      const rows = snap.rows.filter(r =>
+        String(r.leaderAccountName || '').trim().toLowerCase() === want ||
+        String(r.followerAccountName || '').trim().toLowerCase() === want);
+      return { ...snap, rows, filteredTo: args.account, matchedRows: rows.length };
     }
 
     case 'nt_copier_config': {

@@ -341,6 +341,57 @@ export const TOOLS = [
       },
     },
   },
+  // P2-103. The two read-only surfaces that answer "is the guard actually protecting me?"
+  // had NO tool at all, while five of the core's mutation batteries (UI1, UI3, UI4, UI5, UI6)
+  // exist to keep exactly these two payloads honest. The honesty was bought and not spent.
+  //
+  // ⚠️ Both are strictly READ-ONLY, which is why they are safe to add here without the
+  // `P1-91` schema risk: there is no field whose default a receiver could merge into stored
+  // config. No `default:` on `account` on either, per the same rule as every tool above.
+  {
+    name: 'nt_riskguard_inventory',
+    description:
+      'Read the per-rule RiskGuard inventory: for every rule, whether it is Enforcing, ' +
+      'EvaluatedNotEnforcing, ConfiguredNotEvaluated, Inert or Disabled, and the limit it ' +
+      'holds you to. This is the surface that answers "is the guard actually protecting me". ' +
+      'Defaults to a SUMMARY: the raw payload is ~635KB across 96 accounts and 2304 rule rows. ' +
+      'ConfiguredNotEvaluated is the state to read first -- it means the config file describes ' +
+      'a protection that nothing computes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: {
+          type: 'string',
+          description: 'Restrict to one account. Required for view="account".',
+        },
+        view: {
+          type: 'string',
+          enum: ['summary', 'account', 'full'],
+          description:
+            'summary (default) = counts by state plus the rules that are configured but ' +
+            'never evaluated; account = every rule row for one named account; full = the raw ' +
+            'payload, which is very large.',
+        },
+      },
+    },
+  },
+  {
+    name: 'nt_copier_snapshot',
+    description:
+      'Read per-relationship trade-copier conformance: leader vs expected vs ACTUAL position ' +
+      'per follower, whether the expected size was clamped, quarantine state and reason, and ' +
+      'measured latency/slippage. This is conformance, not configuration -- nt_copier_config ' +
+      'returns what is configured, this returns what is actually happening.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: {
+          type: 'string',
+          description: 'Restrict to relationships whose leader OR follower is this account.',
+        },
+      },
+    },
+  },
   {
     name: 'nt_copier_config',
     description:
