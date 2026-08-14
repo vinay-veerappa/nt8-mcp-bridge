@@ -47,6 +47,19 @@ jobs:
       - name: CI runs every mutation battery
         run: python tools/check_ci_runs_every_battery.py
 
+      # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
+      # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
+      # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
+      # arithmetic out of BridgeOrderQuery.cs and broke SIX of mutate_p2109.py's anchors; the
+      # only thing that noticed was running the battery by hand, 6/12, minutes spent proving
+      # nothing. In the core repo the same edit fails in the commit that makes it.
+      #
+      # THIRD per-repo gate found missing on this side, after check_ci_runs_every_battery.py and
+      # check_expected_survivors.py. A gate is per-repo: writing one where you found the defect
+      # leaves the other side unguarded. This is a substring count, so it runs before everything.
+      - name: Mutation anchors still match (a stale anchor scores a survivor)
+        run: python tools/check_anchors.py
+
       - name: Harness
         run: dotnet run --project tests/BridgeTests.csproj
 
@@ -102,6 +115,15 @@ jobs:
       # from the source, so a ninth resolver site is covered the moment it is written.
       - name: Mutation P2-109 (the orders filter that filtered nothing)
         run: python mutation/mutate_p2109.py
+
+      # ⚠️ 9/10 first run, and the survivor was the AUTHOR again -- a mutant named "the route
+      # parses at the seam" that passed `query["count"] ?? "100"`, still a string, still handed
+      # to the safe parser. It never expressed the defect, so no test could kill it and none was
+      # missing. The filed defect is now UNREPRESENTABLE: GetBars takes no int, so int.Parse at
+      # the route does not compile. Second instance of P1-99's lesson -- a surviving mutant does
+      # not always mean a missing test.
+      - name: Mutation P3-111 (the bars endpoint that crashed, flooded and ignored its offset)
+        run: python mutation/mutate_p3111.py
 
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.

@@ -75,6 +75,16 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 SCOPE = os.path.join(REPO, 'addons', 'BridgeAccountScope.cs')
 QUERY = os.path.join(REPO, 'addons', 'BridgeOrderQuery.cs')
 BRIDGE = os.path.join(REPO, 'addons', 'McpBridgeAddOn.cs')
+# P3-111 REPOINTED SIX ANCHORS HERE. The parse/clamp/page arithmetic left BridgeOrderQuery when
+# /api/bars turned out to need the identical rules -- a second copy is how P1-90 reached eight
+# sites. The anchors moved WITH it rather than being retired, and the move made them stronger:
+# one mutant to the shared clamp is now evidence about BOTH endpoints, where before it was
+# evidence about orders alone.
+#
+# ⚠️ Nothing caught the break. Six anchors went [SKIP] -- scoring as SURVIVORS, 6/12 -- and this
+# repo had no `check_anchors.py`; it lives in nt8-riskguard and gates are PER-REPO. Same shape as
+# `check_ci_runs_every_battery.py`, which ran nothing on this side until session 41. Ported now.
+VALUE = os.path.join(REPO, 'addons', 'BridgeQueryValue.cs')
 
 # (target file, description, find, replace)
 MUTANTS = [
@@ -90,35 +100,37 @@ MUTANTS = [
      '            if (string.IsNullOrWhiteSpace(requestedAccount)) return true;',
      '            if (string.IsNullOrWhiteSpace(requestedAccount)) return false;'),
 
-    (QUERY,
-     "an UNPARSEABLE limit means zero rather than the default, so limit=abc returns an empty\n"
-     "     list -- indistinguishable from 'nothing is working', which is this defect's shape",
-     '            if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw.Trim(), out value))\n                return DefaultLimit;',
-     '            if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw.Trim(), out value))\n                return 0;'),
+    (VALUE,
+     "an UNPARSEABLE value means zero rather than the default, so limit=abc and count=abc BOTH\n"
+     "     return an empty list -- indistinguishable from 'nothing is working', this defect's shape",
+     '                value = fallback;',
+     '                value = 0;'),
+
+    (VALUE,
+     "the lower clamp is dropped, so limit=0, count=0 and count=-5 all return nothing --\n"
+     "     an empty page and an empty book are indistinguishable to whoever reads the answer",
+     '            if (value < min) return min;',
+     '            if (value < min) return value;'),
+
+    (VALUE,
+     "the upper clamp is dropped, so limit=999999999 serialises every order on 96 accounts and\n"
+     "     count=200000 serialises the 21,285,727 bytes that were MEASURED coming back",
+     '            if (value > max) return max;',
+     '            if (value > max) return value;'),
 
     (QUERY,
-     "the lower clamp is dropped, so limit=0 and limit=-5 return nothing",
-     '            if (value < 1) return 1;',
-     '            if (value < 1) return value;'),
+     "the offset BINDING lets negatives through, so offset=-1 reaches GetRange and throws on a\n"
+     "     read endpoint. The clamp is shared; which numbers it is given is not",
+     '            return BridgeQueryValue.ParseInt(raw, 0, 0, int.MaxValue);',
+     '            return BridgeQueryValue.ParseInt(raw, 0, int.MinValue, int.MaxValue);'),
 
-    (QUERY,
-     "the upper clamp is dropped, so limit=999999999 serialises every order on 96 accounts\n"
-     "     into a single response",
-     '            if (value > MaxLimit) return MaxLimit;',
-     '            if (value > MaxLimit) return value;'),
-
-    (QUERY,
-     "a NEGATIVE offset is passed through to GetRange, which throws on a read endpoint",
-     '            return value < 0 ? 0 : value;',
-     '            return value;'),
-
-    (QUERY,
+    (VALUE,
      "an offset PAST THE END wraps to a full page instead of an empty one, so an agent paging\n"
      "     to the end reads page one forever and never terminates",
-     '            if (offset >= matched) return 0;',
-     '            if (offset >= matched) return limit;'),
+     '            if (offset >= total) return 0;',
+     '            if (offset >= total) return limit;'),
 
-    (QUERY,
+    (VALUE,
      "the last partial page claims the full limit -- an off-by-N that over-reads the list",
      '            return remaining < limit ? remaining : limit;',
      '            return limit;'),

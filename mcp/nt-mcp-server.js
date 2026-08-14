@@ -219,12 +219,16 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_bars': {
+      // P3-111: `??` not `||`. `args.count || 100` turns an explicit count=0 into 100, and
+      // periodValue=0 into 1 -- the wrapper silently answering a different question than the one
+      // asked. Absent and zero are different inputs; the addon clamps zero to 1 and says so,
+      // which is visible, where substituting 100 is not.
       const params = new URLSearchParams({
         symbol: args.symbol,
-        period: args.period || 'Minute',
-        periodValue: String(args.periodValue || 1),
-        count: String(args.count || 100),
-        offset: String(args.offset || 0),
+        period: args.period ?? 'Minute',
+        periodValue: String(args.periodValue ?? 1),
+        count: String(args.count ?? 100),
+        offset: String(args.offset ?? 0),
       });
       const res = await ntFetch(`/api/bars?${params}`);
       return res.data;

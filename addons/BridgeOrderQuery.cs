@@ -33,6 +33,17 @@
 //
 // WHY IT NAMES NO NT8 TYPE: `McpBridgeAddOn.cs` is in no test build (`P2-27`). This takes strings
 // and ints, so `tests/BridgeTests.csproj` compiles and EXECUTES it.
+//
+// ⚠️ P3-111 UPDATE: the three rules above are now KEPT IN `BridgeQueryValue`, and the methods below
+// are thin bindings of the ORDER endpoint's numbers (50 / 500 / 1) to that shared arithmetic. The
+// prediction two paragraphs up came true within hours -- `/api/bars` crashed on `count=abc`,
+// `periodValue=xyz` AND `period=Banana`, served 21MB for `count=200000`, and ignored `offset`
+// exactly as this endpoint had. Writing the same rules a second time for bars is how `P1-90`
+// reached eight sites, so they moved instead.
+//
+// The mutation anchors moved WITH them (`P2-109`'s battery now points at `BridgeQueryValue.cs`),
+// which strengthened them rather than merely preserving them: one mutant to the shared clamp is
+// now evidence about BOTH endpoints, where before it was evidence about orders alone.
 namespace NinjaTrader.NinjaScript.AddOns
 {
     public static class BridgeOrderQuery
@@ -52,12 +63,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static int ParseLimit(string raw)
         {
-            int value;
-            if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw.Trim(), out value))
-                return DefaultLimit;
-            if (value < 1) return 1;
-            if (value > MaxLimit) return MaxLimit;
-            return value;
+            return BridgeQueryValue.ParseInt(raw, DefaultLimit, 1, MaxLimit);
         }
 
         /// <summary>
@@ -66,10 +72,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static int ParseOffset(string raw)
         {
-            int value;
-            if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw.Trim(), out value))
-                return 0;
-            return value < 0 ? 0 : value;
+            return BridgeQueryValue.ParseInt(raw, 0, 0, int.MaxValue);
         }
 
         /// <summary>
@@ -80,10 +83,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static int PageSize(int matched, int limit, int offset)
         {
-            if (matched <= 0 || limit <= 0) return 0;
-            if (offset >= matched) return 0;
-            int remaining = matched - offset;
-            return remaining < limit ? remaining : limit;
+            return BridgeQueryValue.PageSize(matched, limit, offset);
         }
 
         /// <summary>

@@ -16,43 +16,27 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="BridgeSourceTests.cs" />
-    <!-- P1-90's resolver. The FIRST bridge production source this project executes rather
-         than greps: it takes account names as strings and names no NT8 type, so it needs
-         no stub. Anything else extracted from McpBridgeAddOn.cs on those terms belongs
-         here too; that is P2-27's cheapest available step. -->
-    <Compile Include="../addons/BridgeAccountResolver.cs" />
-    <!-- P3-34's read surface. Same terms as the resolver: it takes primitives and names no
-         NT8 type, so what the endpoint REPORTS about a relationship is executed here rather
-         than grepped. The predicate deciding what an acting mode IS stays in the core's
-         TradeCopierEngine (one definition, passed in), so this cannot drift from the gate. -->
-    <Compile Include="../addons/CopierEnforcementView.cs" />
-    <!-- P1-97. Same terms again: strings in, strings out, no NT8 type named. -->
-    <Compile Include="../addons/BridgeOrderAction.cs" />
-    <!-- P0-104. The order-set arithmetic behind the emergency flatten's second cancel pass,
-         which used to cancel the Close order the flatten itself had just submitted. Generic
-         over T : class and names no NT8 type, so the panic path's one piece of real logic is
-         EXECUTED here instead of grepped. -->
-    <Compile Include="../addons/BridgeFlattenPlan.cs" />
-    <!-- P1-106. Whether a lockout may admit an order. Takes the request's direction and
-         the real position as a side string plus an absolute magnitude, so it names no NT8
-         type and there is no sign here to misread (P0-96). The three call sites are pinned
-         by source text in the same test file, because extraction moves the untested
-         boundary rather than removing it. -->
-    <Compile Include="../addons/BridgeLockoutGate.cs" />
-    <!-- P1-105. Which positions a close request is about, and what the handler may claim
-         about them. Strings and ints only, so it is EXECUTED here; the two source gates in
-         BridgeSourceTests.cs cover what stays in McpBridgeAddOn.cs: how the handler builds
-         these arguments, and that the acting and observing passes share this predicate. -->
-    <Compile Include="../addons/BridgeClosePlan.cs" />
-    <!-- P2-109. The ONE definition of "this request is about account X", shared by the close
-         path and the orders read. It moved out of BridgeClosePlan when nt_orders needed the
-         same question answered and the alternative was a second copy, which is how P1-90
-         reached six sites. -->
-    <Compile Include="../addons/BridgeAccountScope.cs" />
-    <!-- P2-109. Paging for the orders read. `nt_orders` advertised limit and offset and
-         implemented neither; the parsing is the part worth executing, because absent and
-         unparseable are different inputs and the route next door considers only one of them. -->
-    <Compile Include="../addons/BridgeOrderQuery.cs" />
+    <!--
+      P3-111. This WAS a hand-typed list of eight addon files, each with its own comment.
+      It is now a glob with one exclusion, for the reason `tools/check_bridge_parses.py`
+      stopped being a hand-typed list of two in the same session: a maintained inventory of
+      "the files we look at" drifts silently the moment someone adds a ninth, and the symptom
+      is a green run that inspected less than it claimed. Adding BridgeBarsQuery.cs and
+      BridgeQueryValue.cs by hand here would have been the third instance in one day.
+
+      The glob is the P2-27 rule stated mechanically: EVERY addon source that names no
+      NinjaTrader type is EXECUTED by this project, automatically, from the moment it exists.
+      McpBridgeAddOn.cs is the one exclusion, because NinjaTrader's type surface is what
+      still blocks compiling it (tests/README.md records the measurement and the remedy);
+      when that changes, delete the Exclude rather than adding an Include.
+
+      ⚠️ If a newly added addon file DOES name an NT8 type, this build breaks. That is the
+      intended failure and it is the loud one: the alternative is the file quietly sitting
+      outside every test the repo has, which is the condition P2-27 exists to end.
+
+      Why each file is here is recorded in its own header, which is where it stays true.
+    -->
+    <Compile Include="../addons/*.cs" Exclude="../addons/McpBridgeAddOn.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

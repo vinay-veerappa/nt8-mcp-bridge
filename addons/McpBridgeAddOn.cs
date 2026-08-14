@@ -548,9 +548,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/orders":
                     return GetOrders(query["account"], query["limit"], query["offset"]);
                 case "/api/quote":              return GetQuote(query["symbol"]);
+                // P3-111: this read `int.Parse(query["periodValue"] ?? "1"), int.Parse(query["count"]
+                // ?? "100")`. The `??` handled the parameter being ABSENT; nothing handled it being
+                // PRESENT AND UNPARSEABLE, and those are different inputs -- `count=abc` was an
+                // unhandled FormatException, i.e. HTTP 500 + a stack trace, from a caller typo. The
+                // raw strings now go through, and every parse/clamp/refusal decision lives in
+                // BridgeBarsQuery where tests can EXECUTE it. `offset` was advertised and dropped,
+                // which is P2-109 at a second endpoint.
                 case "/api/bars":
-                    return GetBars(query["symbol"], query["period"] ?? "Minute",
-                        int.Parse(query["periodValue"] ?? "1"), int.Parse(query["count"] ?? "100"));
+                    return GetBars(query["symbol"], query["period"], query["periodValue"],
+                        query["count"], query["offset"]);
                 case "/api/search":             return SearchInstruments(query["query"]);
                 case "/api/bars/export":        return Post(method, () => ExportBars(body));
                 case "/api/export":             return ReadExportFile(query["name"]);
@@ -3051,20 +3058,42 @@ namespace NinjaTrader.NinjaScript.AddOns
             catch (Exception ex) { return new { symbol, error = $"no market data: {ex.Message}" }; }
         }
 
-        private object GetBars(string symbol, string periodStr, int periodValue, int count)
+        // P3-111. Every parameter here arrives as a string from outside the process, and before this
+        // rewrite three of the four crashed the endpoint on a typo while the fourth was ignored.
+        // The parsing, clamping and refusal decisions live in BridgeBarsQuery (which names no NT8
+        // type, so tests EXECUTE them); this method does the NT8 work and nothing else.
+        private object GetBars(string symbol, string periodStr, string periodValueRaw,
+                               string countRaw, string offsetRaw)
         {
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
 
-            var periodType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), periodStr, true);
+            // `period=Banana` was `Enum.Parse` throwing -- int.Parse's defect wearing a different
+            // type. The valid set comes from the PLATFORM's enum rather than a list here, so it
+            // cannot drift the way the wrapper's hand-typed enum did in P1-72.
+            string refusal;
+            var periodName = BridgeBarsQuery.ResolvePeriod(
+                periodStr, Enum.GetNames(typeof(BarsPeriodType)), out refusal);
+            if (periodName == null) return new { symbol, error = refusal };
+
+            int periodValue = BridgeBarsQuery.ParsePeriodValue(periodValueRaw);
+            int count = BridgeBarsQuery.ParseCount(countRaw);
+            int offset = BridgeBarsQuery.ParseOffset(offsetRaw);
+
+            var periodType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), periodName, true);
             var barsPeriod = new BarsPeriod { BarsPeriodType = periodType, Value = periodValue };
+
+            // Paging reads BACKWARDS from the right edge of the series, so a page at `offset` needs
+            // everything newer than it fetched as well. The REQUEST grows with the offset; the
+            // RESPONSE stays capped at MaxCount, which is the bound that matters for memory.
+            int requestSize = BridgeBarsQuery.RequestSize(count, offset);
 
             // NT8.1: historical bars are fetched asynchronously via BarsRequest.
             string status = null;
             var done = new ManualResetEventSlim(false);
             Bars bars = null;
-            using (var request = new BarsRequest(instrument, count) { BarsPeriod = barsPeriod })
+            using (var request = new BarsRequest(instrument, requestSize) { BarsPeriod = barsPeriod })
             {
                 request.Request((req, code, msg) =>
                 {
@@ -3075,17 +3104,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!done.Wait(TimeSpan.FromSeconds(30)))
                     return new { symbol, error = "bars request timed out" };
 
-                if (bars == null || bars.Count == 0)
-                    return new { symbol, period = periodStr, periodValue, status, bars = new List<object>() };
+                int available = bars == null ? 0 : bars.Count;
+                int start, take;
+                if (!BridgeQueryValue.BarWindow(available, count, offset, out start, out take))
+                    return new
+                    {
+                        symbol, period = periodName, periodValue, offset, status,
+                        count = 0, available, hasMore = false, bars = new List<object>(),
+                    };
 
                 var result = new List<object>();
-                for (int i = Math.Max(0, bars.Count - count); i < bars.Count; i++)
+                for (int i = start; i < start + take; i++)
                     result.Add(new
                     {
                         time = bars.GetTime(i), open = bars.GetOpen(i), high = bars.GetHigh(i),
                         low = bars.GetLow(i), close = bars.GetClose(i), volume = bars.GetVolume(i),
                     });
-                return new { symbol, period = periodStr, periodValue, count = result.Count, bars = result };
+                return new
+                {
+                    symbol, period = periodName, periodValue, offset, status,
+                    count = result.Count, available,
+                    // Whether paging further back can yield anything. ⚠️ NOT `start > 0`: when NT8
+                    // returns exactly what was asked for, `start` is 0 and older history still
+                    // exists, so that test would tell an agent to stop one page early -- silent
+                    // truncation, which is the same family of lie as the silent widening this
+                    // ticket fixes. What is actually knowable is whether the fetch was
+                    // HISTORY-LIMITED: fewer bars than requested means the series ran out.
+                    hasMore = available >= requestSize,
+                    bars = result,
+                };
             }
         }
 
@@ -3107,7 +3154,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
-            var periodType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), periodStr, true);
+            // P3-111 at a SECOND reader of the same parameter. `/api/bars/export` takes the same
+            // `period` string and threw on the same typo -- and the sharpest part is ten lines
+            // below: `merge` has ALWAYS used Enum.TryParse with a fallback. One method, two enum
+            // parameters from the same caller, and only one of them was ever considered hostile.
+            // Nothing compared them, which is the shape of P1-100 and P1-105 both.
+            string periodRefusal;
+            var periodName = BridgeBarsQuery.ResolvePeriod(
+                periodStr, Enum.GetNames(typeof(BarsPeriodType)), out periodRefusal);
+            if (periodName == null) return new { symbol, error = periodRefusal };
+
+            var periodType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), periodName, true);
             var bp = new BarsPeriod { BarsPeriodType = periodType, Value = periodValue };
 
             int pv = Math.Max(1, periodValue);
@@ -3125,7 +3182,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             var done = new ManualResetEventSlim(false);
             var ci = System.Globalization.CultureInfo.InvariantCulture;
             var safe = System.Text.RegularExpressions.Regex.Replace(symbol, "[^A-Za-z0-9]", "_");
-            var name = $"mcp_bars_{safe}_{periodStr}{pv}.csv";
+            // periodName, not periodStr: the resolved name is trimmed, so a caller sending "  "
+            // cannot put whitespace into a filename on disk.
+            var name = $"mcp_bars_{safe}_{periodName}{pv}.csv";
             var path = Path.Combine(Globals.UserDataDir, name);
 
             // Direct DATE-RANGE request (from/to are local time). This downloads exactly the window
@@ -3153,7 +3212,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 return new
                 {
-                    symbol = instrument.FullName, period = periodStr, periodValue = pv,
+                    symbol = instrument.FullName, period = periodName, periodValue = pv,
                     merge = merge.ToString(),
                     rows = bars.Count,
                     first = bars.GetTime(0), last = bars.GetTime(bars.Count - 1),
@@ -5668,7 +5727,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int count = req["count"] != null ? (int)req["count"] : 1440;
 
             double basePrice = 20000.0;
-            var barsRes = GetBars(symbol, "Minute", 1, 10);
+            var barsRes = GetBars(symbol, "Minute", "1", "10", null);
             var barsObj = JObject.FromObject(barsRes);
             var barsArr = barsObj["bars"] as JArray;
             if (barsArr != null && barsArr.Count > 0 && barsArr.Last["close"] != null)
@@ -5747,7 +5806,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!entryRule.Equals("sma_crossover", StringComparison.OrdinalIgnoreCase))
                 return new { error = $"entryRule '{entryRule}' is not supported. Only 'sma_crossover' is implemented." };
 
-            var barsResult = GetBars(symbol, "Minute", 5, 500);
+            var barsResult = GetBars(symbol, "Minute", "5", "500", null);
             var barsJObj = JObject.FromObject(barsResult);
             var barsArr = barsJObj["bars"] as JArray;
             if (barsArr == null || barsArr.Count < 50) return new { error = "insufficient bar data for signal backtest (minimum 50 bars required)" };

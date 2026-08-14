@@ -194,15 +194,26 @@ export const TOOLS = [
   },
   {
     name: 'nt_bars',
-    description: 'Fetch historical OHLCV bars (Minute, Day, Tick, Volume, Range) with pagination (max 5,000 rows)',
+    // P3-111. This description promised "max 5,000 rows" and "pagination" while the addon
+    // enforced NO bound (count=200000 was measured returning 21,285,727 bytes) and IGNORED
+    // `offset` entirely (offset=0 and offset=500 returned byte-identical payloads). Both halves
+    // are now true at the receiver, so the promise is kept rather than reworded.
+    //
+    // ⚠️ THE `period` ENUM WAS REMOVED, NOT EXTENDED. It listed five names; NT8's BarsPeriodType
+    // has more (Second, Week, Month, Year, Renko, ...), so this schema FORBADE values the addon
+    // serves happily -- a hand-typed enum disagreeing with the receiver's real whitelist, which
+    // is `P1-72` verbatim and the reason that ticket's fix pins the enum to the addon's own list.
+    // Here the addon derives the valid set from `Enum.GetNames(typeof(BarsPeriodType))` and its
+    // refusal NAMES them, so a second copy of the list is pure drift surface with nothing to buy.
+    description: 'Fetch historical OHLCV bars with pagination (max 5,000 rows per call; page further back with offset)',
     inputSchema: {
       type: 'object',
       properties: {
         symbol:      { type: 'string', description: 'Ticker' },
-        period:      { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Volume', 'Range'], description: 'Period', default: 'Minute' },
+        period:      { type: 'string', description: 'Bar type: Minute, Day, Tick, Volume, Range, Second, Week, Month, ... (any NT8 BarsPeriodType; an unknown value is refused with the full list)', default: 'Minute' },
         periodValue: { type: 'number', description: 'Period value (e.g. 5 for 5m)', default: 1 },
-        count:       { type: 'number', description: 'Number of bars (max 5,000)', default: 100 },
-        offset:      { type: 'number', description: 'Pagination offset', default: 0 },
+        count:       { type: 'number', minimum: 1, maximum: 5000, description: 'Bars per call, 1-5000 (clamped, never rejected)', default: 100 },
+        offset:      { type: 'number', minimum: 0, description: 'Bars to skip, counting back from the most recent. offset=100 with count=100 is the 100 bars BEFORE the latest 100', default: 0 },
       },
       required: ['symbol'],
     },

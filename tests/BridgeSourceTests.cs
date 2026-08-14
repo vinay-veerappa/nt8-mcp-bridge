@@ -506,12 +506,22 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2_109_TheOffsetIsParsedSafely();
             TestP2_109_ThePageArithmetic();
             TestP2_109_TheRouteActuallyPassesTheQueryThrough();
+            TestP3_111_TheFiledDefectExactly();
+            TestP3_111_TheAdvertisedCapIsActuallyEnforced();
+            TestP3_111_AnUnknownPeriodIsRefusedAndNotGUESSED();
+            TestP3_111_BarsArePagedFromTheRIGHTEdge();
+            TestP3_111_PagingPastTheStartIsEmptyNotWrapped();
+            TestP3_111_TheREQUESTGrowsWithTheOffsetButTheRESPONSEDoesNot();
+            TestP3_111_TheOrdersAndBarsPathsShareONEDefinition();
+            TestP3_111_TheBarsRouteHandsTheRawStringsThrough();
+            TestP3_111_NoBarsPathParsesAPeriodWithoutResolvingItFirst();
+            TestP3_111_HasMoreIsNotStartGreaterThanZero();
             TestEveryResolverSiteACTSOnTheRefusal();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 46;
+            const int declared = 56;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -1434,11 +1444,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(BridgeOrderQuery.ParseLimit(null) == BridgeOrderQuery.DefaultLimit, "absent gives the default");
             Assert(BridgeOrderQuery.ParseLimit("") == BridgeOrderQuery.DefaultLimit, "blank gives the default");
             Assert(BridgeOrderQuery.ParseLimit("   ") == BridgeOrderQuery.DefaultLimit, "whitespace gives the default");
-            // /api/bars on the next line does int.Parse(query["count"] ?? "100"), which handles
-            // ABSENT and throws FormatException on a typo. This must not.
+            // This comment used to end "-- the route next door still throws a FormatException on
+            // a caller typo", naming /api/bars. It did, it was measured doing it (HTTP 500 + a
+            // stack trace on count=abc), and P3-111 fixed it hours later. Kept as history rather
+            // than deleted: the prediction was written down before the measurement, and both
+            // routes now go through the same BridgeQueryValue.ParseInt.
             Assert(BridgeOrderQuery.ParseLimit("abc") == BridgeOrderQuery.DefaultLimit,
-                "and an UNPARSEABLE value gives the default rather than throwing -- the route "
-                + "next door still throws a FormatException on a caller typo");
+                "and an UNPARSEABLE value gives the default rather than throwing");
             Assert(BridgeOrderQuery.ParseLimit("10") == 10, "a real value is honoured");
             Assert(BridgeOrderQuery.ParseLimit(" 20 ") == 20, "trimmed");
             Assert(BridgeOrderQuery.ParseLimit("0") == 1,
@@ -1557,6 +1569,313 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "`if` to `if (false)` is a one-word edit that leaves the call, and the whole "
                 + "point of P1-90 is the refusal, not the computation",
                 unused.Count == 0 ? "none" : string.Join(", ", unused.ToArray())));
+        }
+
+        // ================================================================================
+        // P3-111. `/api/bars` was filed as one line -- "int.Parse(query["count"] ?? "100"):
+        // absent is handled, unparseable throws". Probing the live box first found FOUR defects
+        // on one endpoint, and the parse crash was the least of them.
+        //
+        // Everything below is EXECUTED: BridgeBarsQuery and BridgeQueryValue name no NT8 type
+        // (P2-27), so this project compiles and runs them.
+        // ================================================================================
+
+        private static void TestP3_111_TheFiledDefectExactly()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: count=abc is a caller typo, not an HTTP 500");
+
+            // Measured on the live box: GET /api/bars?symbol=MNQ 09-26&count=abc returned an
+            // HTTP 500 carrying a .NET stack trace. The `?? "100"` handled the parameter being
+            // ABSENT; nothing handled it being PRESENT AND UNPARSEABLE. Different inputs.
+            Assert(BridgeBarsQuery.ParseCount("abc") == BridgeBarsQuery.DefaultCount,
+                "an unparseable count gives the default rather than throwing");
+            Assert(BridgeBarsQuery.ParsePeriodValue("xyz") == BridgeBarsQuery.DefaultPeriodValue,
+                "and so does an unparseable periodValue -- the SECOND of the three crashes");
+            Assert(BridgeBarsQuery.ParseOffset("!!") == 0, "and an unparseable offset");
+
+            Assert(BridgeBarsQuery.ParseCount(null) == BridgeBarsQuery.DefaultCount, "absent gives the default");
+            Assert(BridgeBarsQuery.ParseCount("") == BridgeBarsQuery.DefaultCount, "blank gives the default");
+            Assert(BridgeBarsQuery.ParseCount("   ") == BridgeBarsQuery.DefaultCount, "whitespace gives the default");
+            Assert(BridgeBarsQuery.ParseCount("250") == 250, "and a real value is honoured");
+            Assert(BridgeBarsQuery.ParseCount(" 250 ") == 250, "trimmed");
+        }
+
+        private static void TestP3_111_TheAdvertisedCapIsActuallyEnforced()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: the schema promised max 5,000 and the addon enforced nothing");
+
+            // Measured: count=200000 returned 21,285,727 bytes and count=1000000 returned a
+            // million bars, while the MCP tool schema advertised "max 5,000 rows" in TWO places.
+            // Advertised-and-not-implemented is P1-72's shape, here on a size promise.
+            Assert(BridgeBarsQuery.MaxCount == 5000,
+                "the cap is the number the schema already advertised -- raising the code to meet "
+                + "an existing written promise, not lowering the promise to meet the code");
+            Assert(BridgeBarsQuery.ParseCount("200000") == BridgeBarsQuery.MaxCount,
+                "the 21MB response clamps to the cap");
+            Assert(BridgeBarsQuery.ParseCount("1000000") == BridgeBarsQuery.MaxCount, "and so does a million");
+            Assert(BridgeBarsQuery.ParseCount("5000") == 5000, "exactly the cap is allowed through");
+
+            // The lower end is the SILENT half and the more expensive lie: count=0 measured 0
+            // bars, which reads as "this instrument has no data" rather than as a clamp.
+            Assert(BridgeBarsQuery.ParseCount("0") == 1,
+                "count=0 clamps to 1 -- an empty result on a read path reads as a fact about the "
+                + "market, and that one is not true");
+            Assert(BridgeBarsQuery.ParseCount("-5") == 1, "and so does a negative");
+
+            Assert(BridgeBarsQuery.ParsePeriodValue("0") == 1, "periodValue is clamped at 1 too");
+            Assert(BridgeBarsQuery.ParsePeriodValue("99999999") == BridgeBarsQuery.MaxPeriodValue,
+                "and bounded above, so nonsense cannot reach NT8's BarsPeriod");
+        }
+
+        private static void TestP3_111_AnUnknownPeriodIsRefusedAndNotGUESSED()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: period=Banana -- Enum.Parse is int.Parse for names");
+
+            var valid = new[] { "Minute", "Day", "Tick", "Volume", "Range", "Second", "Week", "Month" };
+            string refusal;
+
+            Assert(BridgeBarsQuery.ResolvePeriod(null, valid, out refusal) == BridgeBarsQuery.DefaultPeriod
+                   && refusal == null, "absent gives the default with no refusal");
+            Assert(BridgeBarsQuery.ResolvePeriod("  ", valid, out refusal) == BridgeBarsQuery.DefaultPeriod,
+                "and so does blank");
+            Assert(BridgeBarsQuery.ResolvePeriod("Day", valid, out refusal) == "Day" && refusal == null,
+                "a known name passes through");
+            Assert(BridgeBarsQuery.ResolvePeriod("day", valid, out refusal) == "day",
+                "case-insensitively, as Enum.Parse was");
+            Assert(BridgeBarsQuery.ResolvePeriod(" Tick ", valid, out refusal) == "Tick", "trimmed");
+
+            // ⚠️ The refusal is the point. Coercing Banana to Minute would answer a question the
+            // caller did not ask, with bars they would then reason over -- the guessing that
+            // P1-90 exists to forbid, on a read path.
+            var resolved = BridgeBarsQuery.ResolvePeriod("Banana", valid, out refusal);
+            Assert(resolved == null, "an unknown name resolves to NOTHING rather than to Minute");
+            Assert(refusal != null && refusal.Contains("Banana"),
+                "the refusal quotes what the caller actually sent");
+            Assert(refusal != null && refusal.Contains("Minute") && refusal.Contains("Week"),
+                "and LISTS what would have worked -- a refusal that does not is another round "
+                + "trip, and a stack trace says nothing at all");
+
+            // Every period name the WRAPPER used to hard-code must survive, or removing its enum
+            // would have traded one drift for a regression.
+            foreach (var p in new[] { "Minute", "Day", "Tick", "Volume", "Range" })
+                Assert(BridgeBarsQuery.ResolvePeriod(p, valid, out refusal) == p,
+                    string.Format("the wrapper's old enum value '{0}' still resolves", p));
+        }
+
+        private static void TestP3_111_BarsArePagedFromTheRIGHTEdge()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: offset was advertised, sent, and dropped -- P2-109 at a second endpoint");
+
+            int start, take;
+
+            // offset=0: the most recent `count` bars. What every caller means by "the last 100".
+            Assert(BridgeQueryValue.BarWindow(1000, 100, 0, out start, out take) && start == 900 && take == 100,
+                "offset=0 takes the newest 100 of 1000 -- bars 900..999, not 0..99");
+
+            // ⚠️ THE P2-109-SHAPED ASSERTION. Measured on the live box: offset=0 and offset=500
+            // returned BYTE-IDENTICAL payloads. "The offset returns some bars" passes under that
+            // defect. The two answers must DIFFER.
+            int s0, t0, s5, t5;
+            BridgeQueryValue.BarWindow(1000, 100, 0, out s0, out t0);
+            BridgeQueryValue.BarWindow(1000, 100, 500, out s5, out t5);
+            Assert(s0 != s5,
+                "and a page at offset=500 is a DIFFERENT window from offset=0 -- the defect was "
+                + "measured returning byte-identical payloads, which any 'returns a subset' "
+                + "assertion passes under");
+            Assert(s5 == 400 && t5 == 100, "specifically the 100 bars before the newest 500");
+
+            // Contiguity: page 0 and page 1 must abut, or paging silently skips or repeats bars.
+            int sA, tA, sB, tB;
+            BridgeQueryValue.BarWindow(1000, 100, 0, out sA, out tA);
+            BridgeQueryValue.BarWindow(1000, 100, 100, out sB, out tB);
+            Assert(sB + tB == sA,
+                "consecutive pages abut exactly -- a gap loses bars and an overlap double-counts "
+                + "them, and neither is visible to whoever reads the series");
+        }
+
+        private static void TestP3_111_PagingPastTheStartIsEmptyNotWrapped()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: the end of history terminates the pager");
+
+            int start, take;
+            Assert(!BridgeQueryValue.BarWindow(100, 50, 100, out start, out take) && take == 0,
+                "an offset AT the start of the series is an empty page");
+            Assert(!BridgeQueryValue.BarWindow(100, 50, 500, out start, out take) && take == 0,
+                "and past it -- not a wrapped-around full page, which would make an agent page "
+                + "forever believing it was still reading new bars");
+            Assert(!BridgeQueryValue.BarWindow(0, 50, 0, out start, out take), "no bars at all is empty");
+            Assert(!BridgeQueryValue.BarWindow(100, 0, 0, out start, out take), "and a zero count is empty");
+
+            // Fewer bars exist than were asked for: give what there is, starting at 0.
+            Assert(BridgeQueryValue.BarWindow(30, 100, 0, out start, out take) && start == 0 && take == 30,
+                "asking for more bars than exist returns all of them rather than throwing");
+            Assert(BridgeQueryValue.BarWindow(100, 50, 80, out start, out take) && start == 0 && take == 20,
+                "and a page straddling the start of history is truncated to what exists");
+            Assert(!BridgeQueryValue.BarWindow(100, 50, -1, out start, out take) || start == 50,
+                "a negative offset is 0, never an index from the end");
+        }
+
+        private static void TestP3_111_TheREQUESTGrowsWithTheOffsetButTheRESPONSEDoesNot()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: the cap bounds the response, not what is knowable");
+
+            // A page at offset needs everything newer than it FETCHED, because the series is
+            // windowed from its right edge. If the request were capped at MaxCount too, offset
+            // would silently do nothing past the first page -- the defect restored.
+            Assert(BridgeBarsQuery.RequestSize(100, 0) == 100, "the first page asks for exactly a page");
+            Assert(BridgeBarsQuery.RequestSize(100, 900) == 1000,
+                "and a page 900 bars back asks NT8 for 1000, or offset could never reach it");
+            Assert(BridgeBarsQuery.RequestSize(5000, 50000) == 55000,
+                "so the 5,000 cap bounds one RESPONSE and not the reachable history");
+
+            Assert(BridgeBarsQuery.RequestSize(100, int.MaxValue) == int.MaxValue,
+                "and an absurd offset saturates rather than OVERFLOWING to a negative request "
+                + "size, which would be this ticket's defect wearing a new hat");
+            Assert(BridgeBarsQuery.RequestSize(0, 0) == 1, "a zero count still asks for at least one bar");
+            Assert(BridgeBarsQuery.RequestSize(10, -5) == 10, "and a negative offset contributes nothing");
+        }
+
+        private static void TestP3_111_TheOrdersAndBarsPathsShareONEDefinition()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: one definition of 'parse a query parameter safely'");
+
+            // Both endpoints route through BridgeQueryValue.ParseInt. Asserted BEHAVIOURALLY --
+            // identical rules must produce identical answers -- rather than by grepping for a
+            // delegation, because a source gate that a value is COMPUTED is not a gate that it
+            // is USED (the survivor that got through twice in the P1-105 and P2-109 batteries).
+            Assert(BridgeOrderQuery.ParseLimit("abc") == BridgeQueryValue.ParseInt("abc", BridgeOrderQuery.DefaultLimit, 1, BridgeOrderQuery.MaxLimit),
+                "the order limit is the shared arithmetic bound to the order endpoint's numbers");
+            Assert(BridgeBarsQuery.ParseCount("abc") == BridgeQueryValue.ParseInt("abc", BridgeBarsQuery.DefaultCount, 1, BridgeBarsQuery.MaxCount),
+                "and the bar count is the same arithmetic bound to different numbers");
+            Assert(BridgeOrderQuery.ParseOffset("-3") == BridgeBarsQuery.ParseOffset("-3"),
+                "the two offsets agree, because there is only one of them");
+            Assert(BridgeOrderQuery.PageSize(10, 5, 3) == BridgeQueryValue.PageSize(10, 5, 3),
+                "and so does the page arithmetic");
+
+            // The guard on the shared helper's own contract: an inside-out range is a bug at the
+            // CALL site, and inventing an answer for it would hide the caller's mistake.
+            bool threw = false;
+            try { BridgeQueryValue.ParseInt("5", 1, 100, 10); }
+            catch (ArgumentException) { threw = true; }
+            Assert(threw, "an inside-out [min, max] is refused rather than silently resolved");
+        }
+
+        private static void TestP3_111_TheBarsRouteHandsTheRawStringsThrough()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: the shipped defect at the seam (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // The defect verbatim: the route parsed at the seam, so an unparseable value threw
+            // before any handler could decide what to do about it.
+            Assert(!Regex.IsMatch(code, @"int\.Parse\(query\["),
+                "no route calls int.Parse on a query value -- absent and unparseable are "
+                + "different inputs and int.Parse only distinguishes one of them");
+
+            var route = Regex.Match(code,
+                @"case ""/api/bars"":\s*return\s+GetBars\(([^;]*)\);", RegexOptions.Singleline);
+            Assert(route.Success, "the /api/bars route is locatable");
+            if (route.Success)
+            {
+                var args = route.Groups[1].Value;
+                foreach (var p in new[] { "symbol", "period", "periodValue", "count", "offset" })
+                    Assert(args.Contains("query[\"" + p + "\"]"), string.Format(
+                        "the route passes query[\"{0}\"] through to the handler", p));
+            }
+
+            // The handler must take strings. An int parameter means SOMEONE parsed it earlier,
+            // and the only place earlier is the seam this ticket is about.
+            var sig = Regex.Match(code, @"private object GetBars\(([^)]*)\)");
+            Assert(sig.Success && !Regex.IsMatch(sig.Groups[1].Value, @"\bint\b"),
+                "and GetBars takes no int, so nothing can have parsed before it");
+        }
+
+        private static void TestP3_111_NoBarsPathParsesAPeriodWithoutResolvingItFirst()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: BOTH readers of the period parameter, not just the filed one");
+
+            // ⚠️ /api/bars and /api/bars/export take the SAME `period` string and BOTH threw on
+            // the same typo. Fixing only the filed one is the pattern that produced P1-100,
+            // P2-98/P1-99 and P1-105 -- a second reader that was never told. So this is derived:
+            // every Enum.Parse of a BarsPeriodType must operate on a name that ResolvePeriod
+            // already vetted, and a third site added tomorrow is covered when it is written.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            var parses = Regex.Matches(code, @"Enum\.Parse\(typeof\(BarsPeriodType\),\s*(\w+)\s*,");
+            Assert(parses.Count >= 2, string.Format(
+                "both BarsPeriodType parse sites are found (found {0})", parses.Count));
+
+            var unvetted = new List<string>();
+            foreach (Match m in parses)
+            {
+                var arg = m.Groups[1].Value;
+                // The variable must be the RESULT of a ResolvePeriod call, and that result must
+                // have been checked for null and returned on -- computing it is not using it.
+                var vetted = Regex.IsMatch(code,
+                        @"var\s+" + Regex.Escape(arg) + @"\s*=\s*BridgeBarsQuery\.ResolvePeriod\b")
+                    && Regex.IsMatch(code,
+                        Regex.Escape(arg) + @"\s*==\s*null\s*\)\s*return\b");
+                if (!vetted) unvetted.Add(arg);
+            }
+            Assert(unvetted.Count == 0, string.Format(
+                "and every one parses a RESOLVED name, refusing before it gets there (offenders: {0})",
+                unvetted.Count == 0 ? "none" : string.Join(", ", unvetted.ToArray())));
+
+            Assert(Regex.Matches(code, @"BridgeBarsQuery\.ResolvePeriod\b").Count == 2,
+                "exactly two sites resolve a period -- an exact count, because a `>=` gate is a "
+                + "slow leak that a seventh site silently weakens");
+        }
+
+        private static void TestP3_111_HasMoreIsNotStartGreaterThanZero()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-111: the pager's termination signal");
+
+            // ⚠️ This was nearly shipped as `hasMore = start > 0`, which is wrong in the ordinary
+            // case: when NT8 returns exactly what was asked for, start is 0 and older history
+            // still exists, so an agent stops one page early believing it read everything.
+            // Silent truncation -- the same family of lie as this ticket's silent widening.
+            // What is knowable is whether the fetch was HISTORY-LIMITED.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // ⚠️ Read EVERY assignment, not the first. Written as Regex.Match this failed on its
+            // own first run, because the first `hasMore` in the file is the empty-window branch's
+            // constant `false` -- correct there, and nothing to do with the arithmetic being
+            // gated. A gate that inspects a region it did not state is the failure mode four of
+            // this project's own checks have already been caught in.
+            var assignments = Regex.Matches(code, @"hasMore\s*=\s*([^,]+),")
+                .Cast<Match>().Select(x => x.Groups[1].Value.Trim()).ToList();
+            Assert(assignments.Count == 2, string.Format(
+                "both hasMore assignments are found -- the empty-window branch and the real one "
+                + "(found {0})", assignments.Count));
+
+            foreach (var expr in assignments)
+                Assert(!Regex.IsMatch(expr, @"\bstart\s*>\s*0"), string.Format(
+                    "no branch computes it as `start > 0`, which reports 'no more' whenever the "
+                    + "request was exactly filled (found: {0})", expr));
+
+            var derived = assignments.Where(e => e != "false").ToList();
+            Assert(derived.Count == 1, "exactly one branch derives it rather than stating it");
+            Assert(derived.Count == 1 && derived[0].Contains("available") && derived[0].Contains("requestSize"),
+                string.Format("and it compares what NT8 returned against what was asked for "
+                    + "(found: {0})", derived.Count == 1 ? derived[0] : "n/a"));
+            Assert(assignments.Contains("false"),
+                "while the empty-window branch states it, because there is nothing to derive from");
+
+            // The arithmetic it rests on, executed: a full request means more may exist, a short
+            // one means the series ran out.
+            Assert(BridgeBarsQuery.RequestSize(100, 0) == 100,
+                "so `available >= requestSize` is a real test -- 1000 available against a 100 "
+                + "request means history remains");
         }
 
         public static int Main(string[] args)
