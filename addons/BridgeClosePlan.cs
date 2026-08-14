@@ -118,18 +118,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         /// <summary>
-        /// Whether an account is one this request named. An empty request means every account
-        /// -- the handler's long-standing contract, kept deliberately. ⚠️ The CALLER is expected
-        /// to have already refused an account name that resolves to nothing
-        /// (`BridgeAccountResolver`, `P1-90`): a typo reaching here matches no account, and
-        /// "matched nothing" is a far worse answer than "there is no account called that".
+        /// Whether an account is one this request named. See <see cref="BridgeAccountScope"/> for
+        /// the rule and for why it lives there.
         /// </summary>
+        /// <remarks>
+        /// ⚠️ The body MOVED to `BridgeAccountScope` in `P2-109`, when `nt_orders` needed the same
+        /// question answered and the alternative was a second copy. That is how `P1-90` reached
+        /// six sites. This stays as a named entry point because `InScope` and the close handler's
+        /// two passes read better for it, but there is exactly ONE definition and it is not here.
+        /// </remarks>
         public static bool MatchesAccount(string accountName, string requestedAccount)
         {
-            if (string.IsNullOrWhiteSpace(requestedAccount)) return true;
-            if (string.IsNullOrWhiteSpace(accountName)) return false;
-            return string.Equals(accountName.Trim(), requestedAccount.Trim(),
-                                 StringComparison.OrdinalIgnoreCase);
+            return BridgeAccountScope.Matches(accountName, requestedAccount);
         }
 
         /// <summary>

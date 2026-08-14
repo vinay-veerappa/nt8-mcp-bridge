@@ -541,7 +541,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // - Phase 1 (account / trading / data) -
                 case "/api/account":            return GetAccountInfo();
                 case "/api/positions":          return GetPositions();
-                case "/api/orders":             return GetOrders();
+                // P2-109: this read `GetOrders()` -- taking NOTHING -- while the routes either
+                // side of it were already passing `query[...]`. The MCP wrapper builds and sends
+                // all three parameters; this line discarded them, so `account` filtered nothing
+                // and `limit`/`offset` paged nothing.
+                case "/api/orders":
+                    return GetOrders(query["account"], query["limit"], query["offset"]);
                 case "/api/quote":              return GetQuote(query["symbol"]);
                 case "/api/bars":
                     return GetBars(query["symbol"], query["period"] ?? "Minute",
@@ -1789,10 +1794,28 @@ namespace NinjaTrader.NinjaScript.AddOns
             return positions;
         }
 
-        private object GetOrders()
+        private object GetOrders(string requestedAccount, string limitRaw, string offsetRaw)
         {
+            // P1-90 on a READ path. An account name that resolves to nothing used to be ignored
+            // along with the rest of the query, so `nt_orders(account="Sim1O1")` answered about
+            // every account at once. Answering "no orders" for an account that does not exist is
+            // worse than either -- it reads as reassurance. Only a SUPPLIED name is resolved;
+            // omitting the field has always meant every account here.
+            if (!string.IsNullOrWhiteSpace(requestedAccount))
+            {
+                var ordersResolution = BridgeAccountResolver.ResolveOrRefuse(
+                    requestedAccount, Account.All.Select(a => a.Name), "list orders");
+                if (ordersResolution.Refused) return new { error = ordersResolution.Error };
+                requestedAccount = ordersResolution.Name;
+            }
+
+            int limit = BridgeOrderQuery.ParseLimit(limitRaw);
+            int offset = BridgeOrderQuery.ParseOffset(offsetRaw);
+
             var orders = new List<object>();
             foreach (Account account in Account.All)
+            {
+                if (!BridgeAccountScope.Matches(account.Name, requestedAccount)) continue;
                 foreach (Order order in account.Orders)
                 {
                     if (order.OrderState == OrderState.Filled || order.OrderState == OrderState.Cancelled) continue;
@@ -1810,7 +1833,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                         oco = order.Oco ?? "",
                     });
                 }
-            return orders;
+            }
+
+            // The page is sliced from the MATCHED set, and every number reported here is derived
+            // from the same three values the slice is, so the report cannot disagree with what
+            // was returned. `matched` is deliberately the pre-page total: without it a caller
+            // cannot tell an empty page from an empty book, which is the shape of this defect.
+            int pageSize = BridgeOrderQuery.PageSize(orders.Count, limit, offset);
+            var page = pageSize > 0 ? orders.GetRange(offset, pageSize) : new List<object>();
+
+            // ⚠️ The response stays a BARE ARRAY. The MCP wrapper returns `res.data` straight to
+            // the caller and 43 wrapper tests plus every existing consumer expect a list; wrapping
+            // it in an envelope here would be a silent breaking change to every reader in order to
+            // report paging metadata nobody has asked for yet. The counts go in the log line, and
+            // the envelope belongs with the wrapper change that would consume it.
+            Log($"[ORDERS] Account={requestedAccount ?? "ALL"} Matched={orders.Count} "
+                + $"Limit={limit} Offset={offset} Returned={page.Count} "
+                + $"HasMore={BridgeOrderQuery.HasMore(orders.Count, limit, offset)}");
+            return page;
         }
 
         // Read-only inventory of the strategies NT8 currently runs on an account

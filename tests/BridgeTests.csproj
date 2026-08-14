@@ -44,6 +44,15 @@
          BridgeSourceTests.cs cover what stays in McpBridgeAddOn.cs: how the handler builds
          these arguments, and that the acting and observing passes share this predicate. -->
     <Compile Include="../addons/BridgeClosePlan.cs" />
+    <!-- P2-109. The ONE definition of "this request is about account X", shared by the close
+         path and the orders read. It moved out of BridgeClosePlan when nt_orders needed the
+         same question answered and the alternative was a second copy, which is how P1-90
+         reached six sites. -->
+    <Compile Include="../addons/BridgeAccountScope.cs" />
+    <!-- P2-109. Paging for the orders read. `nt_orders` advertised limit and offset and
+         implemented neither; the parsing is the part worth executing, because absent and
+         unparseable are different inputs and the route next door considers only one of them. -->
+    <Compile Include="../addons/BridgeOrderQuery.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

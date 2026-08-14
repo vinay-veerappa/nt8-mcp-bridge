@@ -89,6 +89,11 @@ import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 PLAN = os.path.join(REPO, 'addons', 'BridgeClosePlan.cs')
+# P2-109 moved the account predicate out of BridgeClosePlan into its ONE home, because nt_orders
+# needed the same question answered and the alternative was a second copy. Mutants 9 and 10 were
+# REPOINTED here rather than retired -- an anchor that stops matching prints [SKIP] and scores a
+# SURVIVOR, so a moved predicate with stale anchors is a battery quietly proving nothing.
+SCOPE = os.path.join(REPO, 'addons', 'BridgeAccountScope.cs')
 BRIDGE = os.path.join(REPO, 'addons', 'McpBridgeAddOn.cs')
 
 # (target file, description, find, replace)
@@ -138,13 +143,13 @@ MUTANTS = [
      '            if (want.Length == 0 || have.Length == 0) return false;',
      '            if (false) return false;'),
 
-    (PLAN,
-     "MatchesAccount ignores the name, so a request naming ONE account closes positions on all\n"
-     "     96 -- the funded one included",
+    (SCOPE,
+     "the account predicate ignores the name, so a request naming ONE account closes positions\n"
+     "     on all 96 -- the funded one included -- and makes nt_orders answer about every account",
      '            if (string.IsNullOrWhiteSpace(requestedAccount)) return true;\n            if (string.IsNullOrWhiteSpace(accountName)) return false;',
      '            return true;\n#pragma warning disable 0162\n            if (string.IsNullOrWhiteSpace(accountName)) return false;'),
 
-    (PLAN,
+    (SCOPE,
      "an omitted account matches NOTHING rather than every account, breaking the handler's\n"
      "     contract in the safe-looking direction",
      '            if (string.IsNullOrWhiteSpace(requestedAccount)) return true;',

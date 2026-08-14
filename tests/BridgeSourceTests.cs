@@ -429,9 +429,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             // So: adding an eighth resolution site must bump this number in the same commit.
             // That is a deliberate speed bump, not an oversight -- it makes the author of a new
             // site look at what this gate is protecting.
+            // ⚠️ 7 -> 8 in P2-109, which added GetOrders. The bump is the gate WORKING: it
+            // fired on the very next change after the >= 6 leak was closed, and made this
+            // author state that the new site is a deliberate addition rather than let it
+            // quietly restore the slack that let a mutant survive.
             int routed = Regex.Matches(code, @"ResolveOrRefuse\(").Count;
-            Assert(routed == 7, string.Format(
-                "and all SEVEN account-resolution sites route through the tested resolver "
+            Assert(routed == 8, string.Format(
+                "and all EIGHT account-resolution sites route through the tested resolver "
                 + "(found {0}). If you added a site, raise this number; if you removed one, "
                 + "say which and why", routed));
 
@@ -495,11 +499,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1_105_ScopeIsBothHalvesAndNothingElse();
             TestP1_105_TheEndpointObservesRatherThanClaiming();
             TestP1_105_BothPassesUseTheSameScopePredicate();
+            TestP2_109_TheFilteredAndUNfilteredAnswersMustDIFFER();
+            TestP2_109_AnOmittedAccountStillMeansEveryAccount();
+            TestP2_109_TheCloseAndOrdersPathsShareONEDefinition();
+            TestP2_109_TheLimitIsParsedSafelyAndClamped();
+            TestP2_109_TheOffsetIsParsedSafely();
+            TestP2_109_ThePageArithmetic();
+            TestP2_109_TheRouteActuallyPassesTheQueryThrough();
+            TestEveryResolverSiteACTSOnTheRefusal();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 38;
+            const int declared = 46;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -1333,6 +1345,218 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(!Regex.IsMatch(code, @"cancelledOrdersCount \+= toCancel\.Count"),
                 "the cancel count credits what was SENT, not the length of the list it tried -- "
                 + "the old expression reported every order as cancelled when the call threw");
+        }
+
+        // ================================================================================
+        // P2-109. `nt_orders` advertised account/limit/offset and implemented NONE of them,
+        // because the route was `case "/api/orders": return GetOrders();` -- taking no
+        // parameters at all, between two routes that were already passing `query[...]`.
+        // ================================================================================
+
+        private static void TestP2_109_TheFilteredAndUNfilteredAnswersMustDIFFER()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: filtering by account changes the answer (the live measurement)");
+
+            // The defect, measured 2026-08-14 20:10Z: nt_orders(account="Sim101") and nt_orders()
+            // returned BYTE-IDENTICAL payloads, and the single order in them was on a FUNDED
+            // TakeProfit account. Sim101 had no working orders, so the honest answer was empty.
+            //
+            // ⚠️ Note the shape of this assertion. "The filter returns a subset" PASSES UNDER THE
+            // DEFECT -- every set is a subset of itself. The regression test has to be that the
+            // two answers are DIFFERENT.
+            var accountsWithOrders = new[] { "TAKEPROFITPRO524207503" };
+
+            int unfiltered = 0, filteredToSim101 = 0;
+            foreach (var acct in accountsWithOrders)
+            {
+                if (BridgeAccountScope.Matches(acct, null)) unfiltered++;
+                if (BridgeAccountScope.Matches(acct, "Sim101")) filteredToSim101++;
+            }
+
+            Assert(unfiltered == 1, "unfiltered, the funded account's order is in scope");
+            Assert(filteredToSim101 == 0,
+                "and asking for Sim101 returns NOTHING -- not the funded account's order");
+            Assert(unfiltered != filteredToSim101,
+                "the two answers DIFFER. A 'the filter returns a subset' assertion would pass "
+                + "under the defect, because every set is a subset of itself");
+        }
+
+        private static void TestP2_109_AnOmittedAccountStillMeansEveryAccount()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: an omitted account still means every account (NEGATIVE test)");
+
+            // For a filter, the negative test is the one that proves it is a filter and not an
+            // outage: a predicate that returned false for everything would satisfy the test above.
+            Assert(BridgeAccountScope.Matches("Sim101", null), "a null request matches");
+            Assert(BridgeAccountScope.Matches("TAKEPROFITPRO524207503", ""), "an empty one matches");
+            Assert(BridgeAccountScope.Matches("Sim101", "   "), "and a blank one matches");
+            Assert(BridgeAccountScope.Matches("Sim101", "Sim101"), "an exact name matches its own account");
+            Assert(BridgeAccountScope.Matches("Sim101", "sim101"), "case-insensitively");
+            Assert(BridgeAccountScope.Matches("Sim101", " Sim101 "), "and trimmed");
+            Assert(!BridgeAccountScope.Matches("Sim101", "Sim1O1"),
+                "but a typo matches nothing -- which is why the HANDLER resolves the name first "
+                + "(P1-90): on a READ path, 'no orders' for a nonexistent account reads as "
+                + "reassurance, and reassurance is the whole damage");
+            Assert(!BridgeAccountScope.Matches(null, "Sim101"), "and a nameless account is not the named one");
+        }
+
+        private static void TestP2_109_TheCloseAndOrdersPathsShareONEDefinition()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: the close path and the orders read agree by construction");
+
+            // BridgeClosePlan.MatchesAccount delegates. If someone re-inlines a copy, these drift
+            // and only one of them gets the next fix -- which is P1-90 (six sites) and P1-100
+            // (three readers of one flag) in miniature.
+            var cases = new string[][]
+            {
+                new string[] { "Sim101", "Sim101" }, new string[] { "Sim101", "sim101" },
+                new string[] { "Sim101", "Sim1O1" }, new string[] { "Sim101", null },
+                new string[] { null, "Sim101" },     new string[] { null, null },
+                new string[] { "Sim101", "   " },    new string[] { "  Sim101  ", "Sim101" },
+            };
+            bool allAgree = true;
+            foreach (var c in cases)
+                if (BridgeClosePlan.MatchesAccount(c[0], c[1]) != BridgeAccountScope.Matches(c[0], c[1]))
+                    allAgree = false;
+
+            Assert(allAgree, string.Format(
+                "all {0} cases give the same answer through both entry points", cases.Length));
+        }
+
+        private static void TestP2_109_TheLimitIsParsedSafelyAndClamped()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: limit parsing -- absent and unparseable are different inputs");
+
+            Assert(BridgeOrderQuery.ParseLimit(null) == BridgeOrderQuery.DefaultLimit, "absent gives the default");
+            Assert(BridgeOrderQuery.ParseLimit("") == BridgeOrderQuery.DefaultLimit, "blank gives the default");
+            Assert(BridgeOrderQuery.ParseLimit("   ") == BridgeOrderQuery.DefaultLimit, "whitespace gives the default");
+            // /api/bars on the next line does int.Parse(query["count"] ?? "100"), which handles
+            // ABSENT and throws FormatException on a typo. This must not.
+            Assert(BridgeOrderQuery.ParseLimit("abc") == BridgeOrderQuery.DefaultLimit,
+                "and an UNPARSEABLE value gives the default rather than throwing -- the route "
+                + "next door still throws a FormatException on a caller typo");
+            Assert(BridgeOrderQuery.ParseLimit("10") == 10, "a real value is honoured");
+            Assert(BridgeOrderQuery.ParseLimit(" 20 ") == 20, "trimmed");
+            Assert(BridgeOrderQuery.ParseLimit("0") == 1,
+                "0 clamps to 1 -- an empty page and an empty book are indistinguishable to the "
+                + "reader, and that confusion IS this defect");
+            Assert(BridgeOrderQuery.ParseLimit("-5") == 1, "and so does a negative");
+            Assert(BridgeOrderQuery.ParseLimit("999999999") == BridgeOrderQuery.MaxLimit,
+                "a huge value clamps to MaxLimit -- this bounds a response this process builds "
+                + "in memory, not just the caller's convenience");
+        }
+
+        private static void TestP2_109_TheOffsetIsParsedSafely()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: offset parsing");
+
+            Assert(BridgeOrderQuery.ParseOffset(null) == 0, "absent is 0");
+            Assert(BridgeOrderQuery.ParseOffset("abc") == 0, "unparseable is 0, not an exception");
+            Assert(BridgeOrderQuery.ParseOffset("7") == 7, "a real value is honoured");
+            Assert(BridgeOrderQuery.ParseOffset("-1") == 0,
+                "and a NEGATIVE offset is 0, never an index from the end -- Python's semantics "
+                + "here would silently return the last page while looking like a caller error");
+        }
+
+        private static void TestP2_109_ThePageArithmetic()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: page size and hasMore are derived from the same three numbers");
+
+            Assert(BridgeOrderQuery.PageSize(0, 50, 0) == 0, "an empty book gives an empty page");
+            Assert(BridgeOrderQuery.PageSize(10, 50, 0) == 10, "a limit above the total returns everything");
+            Assert(BridgeOrderQuery.PageSize(10, 3, 0) == 3, "a full page is the limit");
+            Assert(BridgeOrderQuery.PageSize(10, 3, 9) == 1, "the last page is the remainder, not the limit");
+            Assert(BridgeOrderQuery.PageSize(10, 3, 10) == 0, "an offset AT the end is an empty page");
+            Assert(BridgeOrderQuery.PageSize(10, 3, 25) == 0,
+                "and an offset past the end is an empty page -- not an error, and not wrapped");
+
+            Assert(BridgeOrderQuery.HasMore(10, 3, 0), "more remains after a full first page");
+            Assert(!BridgeOrderQuery.HasMore(10, 50, 0), "nothing remains when everything fit");
+            Assert(!BridgeOrderQuery.HasMore(10, 3, 9), "nothing remains after the last partial page");
+            Assert(!BridgeOrderQuery.HasMore(0, 50, 0), "and an empty book never claims more");
+        }
+
+        private static void TestP2_109_TheRouteActuallyPassesTheQueryThrough()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-109: the route passes the query to the handler (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // ⚠️ THE WHOLE DEFECT WAS ONE LINE: `case "/api/orders": return GetOrders();`. Every
+            // other layer was correct -- the schema advertised the parameters, the MCP wrapper
+            // built the query string and sent them, and the handler was a clean read. Nothing was
+            // wrong with any component; the contract between them was never connected.
+            Assert(!Regex.IsMatch(code, @"return GetOrders\(\s*\)"),
+                "the no-argument call is GONE -- that single line discarded all three parameters");
+            Assert(Regex.IsMatch(code, @"GetOrders\(\s*query\[""account""\]"),
+                "and the route passes the account through, as the routes either side of it "
+                + "already did");
+            Assert(Regex.IsMatch(code, @"GetOrders\([^)]*query\[""limit""\][^)]*query\[""offset""\]"),
+                "along with limit and offset, which the tool description has always promised as "
+                + "'cursor pagination'");
+
+            Assert(Regex.IsMatch(code, @"ResolveOrRefuse\([\s\S]{0,140}""list orders"""),
+                "a supplied account name is RESOLVED, not ignored -- P1-90 on a read path, where "
+                + "answering 'no orders' about an account that does not exist reads as reassurance");
+            Assert(Regex.IsMatch(code, @"BridgeAccountScope\.Matches\(account\.Name, requestedAccount\)"),
+                "and the orders loop filters through the SHARED predicate, not a second copy");
+            Assert(Regex.IsMatch(code, @"BridgeOrderQuery\.PageSize"),
+                "the page is sliced by the tested arithmetic rather than an inline expression");
+        }
+
+        private static void TestEveryResolverSiteACTSOnTheRefusal()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] every ResolveOrRefuse site RETURNS on a refusal, not just computes one");
+
+            // ⚠️ WHY THIS IS A SWEEP AND NOT ANOTHER PER-SITE ASSERTION.
+            //
+            // P1-105 shipped a gate asserting `ResolveOrRefuse(... "close a position")` appears in
+            // the source. A mutant neutered `if (closeResolution.Refused)` to `if (false)`, left
+            // the call in place, and THE GATE STILL PASSED. A gate that a value is COMPUTED is not
+            // a gate that it is USED.
+            //
+            // Hours later, writing P2-109's GetOrders, I wrote the identical incomplete gate and
+            // its battery caught the identical survivor. That is this repo's own "second reader"
+            // pattern (P1-100, P1-105) with me as the second reader: the lesson was learned at one
+            // site and not carried to the next one written.
+            //
+            // So the check is derived from the source rather than enumerated: find EVERY
+            // `x = BridgeAccountResolver.ResolveOrRefuse(...)` and require that same `x` to be
+            // tested for `.Refused` and RETURNED on. A ninth site added tomorrow is covered the
+            // moment it is written, without anyone remembering this exists.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            var assigned = Regex.Matches(code, @"(\w+)\s*=\s*BridgeAccountResolver\.ResolveOrRefuse\s*\(");
+            Assert(assigned.Count >= 8, string.Format(
+                "every resolver call assigns its result to a named variable (found {0} of the 8 "
+                + "known sites). A call whose result is not even stored cannot be acted on", assigned.Count));
+
+            var unused = new List<string>();
+            var seen = new HashSet<string>();
+            foreach (Match m in assigned)
+            {
+                var name = m.Groups[1].Value;
+                if (!seen.Add(name)) continue;
+                // The refusal must be tested AND must leave the method. `if (x.Refused) { }` and
+                // a bare `x.Refused;` both compute it and neither refuses anything.
+                var acts = Regex.IsMatch(code,
+                    Regex.Escape(name) + @"\.Refused\s*\)\s*(?:\{\s*)?return\b");
+                if (!acts) unused.Add(name);
+            }
+
+            Assert(unused.Count == 0, string.Format(
+                "and every one of them RETURNS on the refusal (offenders: {0}). Neutering the "
+                + "`if` to `if (false)` is a one-word edit that leaves the call, and the whole "
+                + "point of P1-90 is the refusal, not the computation",
+                unused.Count == 0 ? "none" : string.Join(", ", unused.ToArray())));
         }
 
         public static int Main(string[] args)

@@ -96,6 +96,13 @@ jobs:
       - name: Mutation P1-105 (the close that reported an outcome it never observed)
         run: python mutation/mutate_p1105.py
 
+      # ⚠️ 11/12 first run, and the survivor was the SAME gate weakness P1-105's battery had
+      # found hours earlier -- a source assertion that the resolver is CALLED, which passes
+      # when the refusal is neutered to `if (false)`. Fixed by a sweep that derives the check
+      # from the source, so a ninth resolver site is covered the moment it is written.
+      - name: Mutation P2-109 (the orders filter that filtered nothing)
+        run: python mutation/mutate_p2109.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core
