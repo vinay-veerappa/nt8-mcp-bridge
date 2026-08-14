@@ -3649,7 +3649,22 @@ namespace NinjaTrader.NinjaScript.AddOns
             var errors = new List<string>();
             int cancelled = 0;
             int residualCancelled = 0;
-            int flattened = 0;
+
+            // P0-104: the old counter incremented on the CALL to acc.Flatten, not on any outcome,
+            // and the response field carried the word "flattened" in its name. acc.Flatten is
+            // asynchronous, so at the moment it was incremented nothing had closed -- and in the
+            // run that found this, nothing ever did. The names now say what they measure: how many
+            // accounts a flatten was REQUESTED for, and how many orders that request actually put
+            // on the book. Neither is a claim that a position is flat; `accountsStillOpen`, read
+            // after the pass, is.
+            //
+            // ⚠️ The source gate for this asserts the OLD field name is absent from this file, so
+            // do not write it in a comment here -- a gate that greps cannot tell prose from code.
+            // That is the CI-matrix lesson (a comment read as a gate) in the other direction, and
+            // it caught this comment on the first run.
+            int flattenSubmitted = 0;
+            int flattenOrdersSubmitted = 0;
+            var accountsStillOpen = new List<string>();
 
             var activeStates = new[]
             {
@@ -3666,7 +3681,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (dispatcher == null)
                 {
                     errors.Add("No UI dispatcher available.");
-                    return new { success = false, actionId = key, cancelledOrders = 0, residualCancelled = 0, flattenedAccounts = 0, lockoutMinutes, errors };
+                    // Same field names as the success path, so a caller parsing this does not have
+                    // to know which branch it came from. P0-104 renamed them.
+                    return new { success = false, actionId = key, cancelledOrders = 0, residualCancelled = 0,
+                                 flattenRequestedAccounts = 0, flattenOrdersSubmitted = 0,
+                                 accountsStillOpen = new List<string>(), lockoutMinutes, errors };
                 }
 
                 dispatcher.Invoke(() =>
@@ -3712,6 +3731,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                             catch (Exception cex) { errors.Add($"[{acc.Name}] Cancel order {ord.OrderId}: {cex.Message}"); }
                         }
 
+                        // P0-104. EVERY order on the account before the flatten -- deliberately not
+                        // filtered by state, see BridgeFlattenPlan's header. Step 4 subtracts this
+                        // to find what step 3 submitted.
+                        var knownBeforeFlatten = acc.Orders.ToList();
+
                         // 3. Close open positions (Snapshot positions)
                         var positions = acc.Positions.ToList();
                         if (positions.Count > 0)
@@ -3719,13 +3743,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                             try
                             {
                                 acc.Flatten(positions.Select(p => p.Instrument).ToList());
-                                flattened++;
+                                flattenSubmitted++;
                             }
                             catch (Exception fex) { errors.Add($"[{acc.Name}] Flatten failed: {fex.Message}"); }
                         }
 
-                        // 4. Second cancel pass for residual bracket/OCO orders
-                        var residualOrders = acc.Orders.Where(o => activeStates.Contains(o.OrderState)).ToList();
+                        // 4. Second cancel pass for residual bracket/OCO orders.
+                        //
+                        // P0-104: this used to cancel every active order it could see, which
+                        // included the `Close` order `acc.Flatten` had just submitted -- the panic
+                        // button cancelling its own flatten, reporting success, and then locking
+                        // the account so the operator could not exit by hand. It now cancels only
+                        // orders that were already on the account when this call began.
+                        var activeAfterFlatten = acc.Orders.Where(o => activeStates.Contains(o.OrderState)).ToList();
+                        var residualOrders = BridgeFlattenPlan.ResidualCancelSet(knownBeforeFlatten, activeAfterFlatten);
+                        flattenOrdersSubmitted += BridgeFlattenPlan
+                            .SubmittedByThisCall(knownBeforeFlatten, activeAfterFlatten).Count;
                         foreach (Order ord in residualOrders)
                         {
                             try
@@ -3747,11 +3780,58 @@ namespace NinjaTrader.NinjaScript.AddOns
                 errors.Add($"Dispatcher invocation failed: {dex.Message}");
             }
 
-            int totalCancelled = cancelled + residualCancelled;
-            bool success = errors.Count == 0 || (totalCancelled + flattened) > 0;
-            var level = errors.Count > 0 ? LogLevel.Error : LogLevel.Warning;
+            // P0-104, second half: OBSERVE the outcome. Everything above this line records what
+            // was requested. acc.Flatten is asynchronous, so a read taken immediately would say
+            // "still open" on every healthy flatten -- hence a bounded settle poll rather than a
+            // single read. It stops as soon as everything is flat, so the healthy path pays one
+            // iteration.
+            //
+            // ⚠️ This blocks the calling HTTP thread for up to ~1.5s in the failing case, and it
+            // uses the wall clock directly. Handover section 5.39 lists the other two Thread.Sleep
+            // sites here and the injectable-clock work they need; this is the third. It is on the
+            // panic path deliberately: a caller pressing this wants the truth more than the
+            // millisecond.
+            const int settlePolls = 10;
+            const int settleStepMs = 150;
+            for (int attempt = 0; attempt < settlePolls; attempt++)
+            {
+                accountsStillOpen.Clear();
+                try
+                {
+                    var dispatcher = System.Windows.Application.Current?.Dispatcher;
+                    if (dispatcher == null) break;
+                    dispatcher.Invoke(() =>
+                    {
+                        foreach (Account acc in Account.All.ToList())
+                        {
+                            if (!string.IsNullOrEmpty(accountFilter)
+                                && !acc.Name.Equals(accountFilter, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            if (acc.Positions.Any(pp => pp.MarketPosition != MarketPosition.Flat))
+                                accountsStillOpen.Add(acc.Name);
+                        }
+                    });
+                }
+                catch (Exception pex)
+                {
+                    errors.Add($"Position re-read failed: {pex.Message}");
+                    break;
+                }
+                if (accountsStillOpen.Count == 0) break;
+                if (attempt < settlePolls - 1) System.Threading.Thread.Sleep(settleStepMs);
+            }
 
-            Log($"[EMERGENCY FLATTEN AUDIT-NT8-001] Key={key} Cancelled={totalCancelled} Flattened={flattened} Lockout={lockoutMinutes}m Errors={errors.Count}", level);
+            int totalCancelled = cancelled + residualCancelled;
+
+            // A panic flatten that left a position open is NOT a success, whatever it cancelled
+            // along the way. The old expression could not express that, because nothing here had
+            // ever looked at a position.
+            bool success = errors.Count == 0 && accountsStillOpen.Count == 0;
+            var level = (errors.Count > 0 || accountsStillOpen.Count > 0) ? LogLevel.Error : LogLevel.Warning;
+
+            Log($"[EMERGENCY FLATTEN AUDIT-NT8-001] Key={key} Cancelled={totalCancelled} "
+                + $"FlattenSubmitted={flattenSubmitted} FlattenOrders={flattenOrdersSubmitted} "
+                + $"StillOpen={accountsStillOpen.Count} Lockout={lockoutMinutes}m Errors={errors.Count}", level);
             return new
             {
                 success,
@@ -3759,7 +3839,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 cancelledOrders = totalCancelled,
                 firstPassCancelled = cancelled,
                 residualCancelled,
-                flattenedAccounts = flattened,
+                // P0-104: the field these replace claimed an outcome. These two say what was
+                // REQUESTED and what reached the book; `accountsStillOpen` is the only field here
+                // that reports an observed position, and it is the one to read.
+                flattenRequestedAccounts = flattenSubmitted,
+                flattenOrdersSubmitted,
+                accountsStillOpen,
                 lockoutMinutes,
                 errors
             };

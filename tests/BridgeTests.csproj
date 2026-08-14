@@ -28,6 +28,11 @@
     <Compile Include="../addons/CopierEnforcementView.cs" />
     <!-- P1-97. Same terms again: strings in, strings out, no NT8 type named. -->
     <Compile Include="../addons/BridgeOrderAction.cs" />
+    <!-- P0-104. The order-set arithmetic behind the emergency flatten's second cancel pass,
+         which used to cancel the Close order the flatten itself had just submitted. Generic
+         over T : class and names no NT8 type, so the panic path's one piece of real logic is
+         EXECUTED here instead of grepped. -->
+    <Compile Include="../addons/BridgeFlattenPlan.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

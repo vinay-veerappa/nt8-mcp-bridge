@@ -13,6 +13,7 @@
 // P2-38: that no sim/live gate keys on an account NAME, and that all four gates route
 // through the one shared classifier.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -457,11 +458,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP334_TheEndpointExposesAndCanSetTheMode();
             TestP1_97_TheOrderActionIsResolvedFromThePosition();
             TestP1_97_TheEndpointResolvesRatherThanHardcoding();
+            TestP0_104_TheFlattensOwnOrderIsNotCancelled();
+            TestP0_104_ARealResidualIsStillCancelled();
+            TestP0_104_ABracketLegThatBecomesActiveIsAResidualNotANewOrder();
+            TestP0_104_TheCallReportsWhatItPutOnTheBook();
+            TestP0_104_TheEndpointDoesNotClaimAnUnobservedFlatten();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 13;
+            const int declared = 18;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -671,6 +677,155 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(!Regex.IsMatch(code, @"orderAction = actionStr\.Equals\(""buy"".*\? OrderAction\.Buy : OrderAction\.Sell"),
                 "and the unconditional buy/sell mapping is GONE -- that exact expression is the "
                 + "defect, and it is the thing a later refactor would most naturally restore");
+        }
+
+
+        // ================================================================================
+        // P0-104. The panic kill-switch cancelled its own flatten order.
+        //
+        // EmergencyFlatten: cancel working orders -> acc.Flatten (ASYNCHRONOUS: it SUBMITS a
+        // `Close` order) -> "second cancel pass for residual bracket/OCO orders" -> lockout.
+        // The second pass enumerated every active order and cancelled all of it, including the
+        // Close order the flatten had just put on the book.
+        //
+        // Measured on Sim101 2026-08-14, long 11 MNQ with one resting limit:
+        //   firstPassCancelled: 1  (the limit -- correct)
+        //   residualCancelled:  1  (the FLATTEN)
+        //   flattenedAccounts:  1, success: true, position: STILL LONG 11
+        // and then the lockout landed, so nt_place_order refused the exit the operator would
+        // have placed by hand.
+        //
+        // BridgeFlattenPlan is the set arithmetic, executed here. Plain objects stand in for
+        // orders on purpose: identity is the whole question, and NT8's OrderId is not stable.
+        // ================================================================================
+
+        private static void TestP0_104_TheFlattensOwnOrderIsNotCancelled()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P0-104: the flatten's own order is not in the residual cancel set");
+
+            var restingLimit = new object();
+            var flattenClose = new object();          // created by acc.Flatten during the call
+
+            var before = new List<object> { restingLimit };
+            var activeAfter = new List<object> { restingLimit, flattenClose };
+
+            var residual = BridgeFlattenPlan.ResidualCancelSet(before, activeAfter);
+
+            Assert(!residual.Contains(flattenClose),
+                "THE DEFECT: the Close order acc.Flatten submitted during this call must never be "
+                + "cancelled by the cleanup pass that follows it. Cancelling it leaves the position "
+                + "open, and step 5 then locks the account so nobody can exit by hand.");
+            Assert(residual.Count == 1 && residual[0] == restingLimit,
+                "and the order that was already there is still cancelled -- got " + residual.Count);
+        }
+
+        private static void TestP0_104_ARealResidualIsStillCancelled()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P0-104: a genuine residual bracket leg is still cancelled");
+
+            // The negative control, and the one that matters: the second pass exists for OCO legs
+            // that survive the flatten. Fixing the defect by deleting the pass would pass every
+            // assertion in the test above.
+            var stopLeg = new object();
+            var targetLeg = new object();
+            var flattenClose = new object();
+
+            var before = new List<object> { stopLeg, targetLeg };
+            var activeAfter = new List<object> { stopLeg, targetLeg, flattenClose };
+
+            var residual = BridgeFlattenPlan.ResidualCancelSet(before, activeAfter);
+
+            Assert(residual.Count == 2 && residual.Contains(stopLeg) && residual.Contains(targetLeg),
+                "both pre-existing bracket legs are still cancelled -- got " + residual.Count);
+            Assert(!residual.Contains(flattenClose), "and still not the flatten");
+        }
+
+        private static void TestP0_104_ABracketLegThatBecomesActiveIsAResidualNotANewOrder()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P0-104: a leg that was known but inactive is a residual, not a new order");
+
+            // This is why the "before" snapshot is acc.Orders UNFILTERED. A leg sitting in a
+            // non-active state before the flatten and reaching Working after it is exactly what
+            // the residual pass is for -- filtering "before" by state would classify it as new
+            // and let it survive, which is this defect in the opposite direction.
+            var inactiveLegBefore = new object();
+            var flattenClose = new object();
+
+            var beforeUnfiltered = new List<object> { inactiveLegBefore };
+            var activeAfter = new List<object> { inactiveLegBefore, flattenClose };
+
+            var residual = BridgeFlattenPlan.ResidualCancelSet(beforeUnfiltered, activeAfter);
+
+            Assert(residual.Contains(inactiveLegBefore),
+                "a pre-existing leg that only NOW became active is a residual and must be cancelled");
+            Assert(!residual.Contains(flattenClose), "the flatten is still ours");
+        }
+
+        private static void TestP0_104_TheCallReportsWhatItPutOnTheBook()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P0-104: the call can name the orders it submitted");
+
+            var restingLimit = new object();
+            var flattenClose = new object();
+
+            var mine = BridgeFlattenPlan.SubmittedByThisCall(
+                new List<object> { restingLimit },
+                new List<object> { restingLimit, flattenClose });
+
+            Assert(mine.Count == 1 && mine[0] == flattenClose,
+                "the flatten order is identified as this call's own -- the report used to count "
+                + "the CALL to acc.Flatten and never looked at the book at all");
+
+            // Nothing submitted: the account was already flat, so acc.Flatten put nothing on.
+            var none = BridgeFlattenPlan.SubmittedByThisCall(
+                new List<object> { restingLimit },
+                new List<object> { restingLimit });
+            Assert(none.Count == 0, "and an account that needed no flatten reports none");
+
+            // Null tolerance: an account with no orders at all must not throw on the panic path.
+            Assert(BridgeFlattenPlan.ResidualCancelSet<object>(null, null).Count == 0,
+                "empty in, empty out -- this runs on every account in a panic, including flat ones");
+            Assert(BridgeFlattenPlan.SubmittedByThisCall<object>(null, null).Count == 0,
+                "same for the submitted set");
+        }
+
+        /// <summary>
+        /// SOURCE gate -- proves the wiring, not the behaviour. The behaviour is the four tests
+        /// above; the call site is in McpBridgeAddOn.cs, which no test build reaches (P2-27).
+        /// </summary>
+        private static void TestP0_104_TheEndpointDoesNotClaimAnUnobservedFlatten()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P0-104: the endpoint uses the plan and reports an observed position (SOURCE gate)");
+
+            string code = File.ReadAllText(BridgeSourcePath());
+
+            Assert(Regex.IsMatch(code, @"BridgeFlattenPlan\.ResidualCancelSet"),
+                "the residual pass goes through the plan");
+            // ⚠️ This assertion exists because a mutant SURVIVED the first run of
+            // mutation/mutate_p0104.py. Extracting the arithmetic made the LOGIC executable; how
+            // the caller BUILDS its arguments stayed in this file, and filtering the "before"
+            // snapshot by order state reintroduces the defect in the opposite direction -- a
+            // bracket leg that was inactive before the flatten and active after it reads as a new
+            // order and survives the cleanup the pass exists for. Extraction moves the untested
+            // boundary; it does not remove it.
+            Assert(Regex.IsMatch(code, @"knownBeforeFlatten = acc\.Orders\.ToList\(\)"),
+                "and the 'before' snapshot is EVERY order on the account, not just the active "
+                + "ones -- see BridgeFlattenPlan's header for why that asymmetry is deliberate");
+            Assert(!Regex.IsMatch(code, @"var residualOrders = acc\.Orders\.Where\(o => activeStates\.Contains"),
+                "and the unfiltered enumeration is GONE -- that exact expression is the defect, "
+                + "and it is what a later refactor would most naturally restore");
+            Assert(!Regex.IsMatch(code, @"flattenedAccounts"),
+                "the field that claimed an outcome nobody observed is gone. It counted the CALL to "
+                + "acc.Flatten, which is asynchronous, so it was true before anything could close");
+            Assert(Regex.IsMatch(code, @"accountsStillOpen"),
+                "and the response carries a position read taken AFTER the pass");
+            Assert(Regex.IsMatch(code, @"bool success = errors\.Count == 0 && accountsStillOpen\.Count == 0"),
+                "a panic flatten that left a position open is not a success, whatever it cancelled");
         }
 
         public static int Main(string[] args)

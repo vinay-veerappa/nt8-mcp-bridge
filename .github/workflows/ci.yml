@@ -37,6 +37,21 @@ jobs:
       - name: Harness
         run: dotnet run --project tests/BridgeTests.csproj
 
+      # ⚠️ Added 2026-08-14 (session 38). This repo has had a mutation battery since
+      # P1-90 and CI RAN NONE OF THEM -- the core's check_ci_runs_every_battery.py
+      # only knows about the core's, so nothing was watching this side. A battery
+      # nobody runs is a file, and this is the same class as the two batteries that
+      # were unpassable for 10 pushes (nt8-riskguard handover 5.38).
+      #
+      # They are cheap here in a way they are not in the core: the harness is a small
+      # project, so a mutant costs seconds rather than a full addon recompile. Listed
+      # one step per battery so a failure names which one.
+      - name: Mutation P1-90 (the account resolver)
+        run: python mutation/mutate_p190.py
+
+      - name: Mutation P0-104 (the emergency flatten's cancel set)
+        run: python mutation/mutate_p0104.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core
