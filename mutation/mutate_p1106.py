@@ -129,7 +129,13 @@ def restore():
 def run():
     res = subprocess.run(
         ['dotnet', 'run', '--project', os.path.join('tests', 'BridgeTests.csproj')],
-        cwd=REPO, capture_output=True, text=True)
+        cwd=REPO, capture_output=True, text=True,
+        # encoding pinned: the default on Windows is cp1252, and a single non-ASCII
+        # character in a test's message (the suite uses them) makes capture_output
+        # raise UnicodeDecodeError on a reader THREAD -- res.stdout comes back None and
+        # the battery dies before its first mutant. A battery that cannot run is not a
+        # battery that passed.
+        encoding='utf-8', errors='replace')
     if 'error CS' in (res.stdout + res.stderr):
         return 'BUILD FAILED'
     m = re.search(r'Passed = \d+, Failed = \d+', res.stdout)

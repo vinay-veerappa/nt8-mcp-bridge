@@ -2787,62 +2787,187 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { status = "cancelled", count };
         }
 
+        // P1-105. The one definition of "an order that can still be cancelled", shared with
+        // `EmergencyFlatten`. ⚠️ `OrderState.TriggerPending` is deliberately NOT in it, because
+        // it was not in the list this path has been observing since `P0-104` and widening the
+        // panic path's cancel set is a separate change with its own live validation to do --
+        // see the handover, filed as its own item rather than smuggled in here.
+        private static readonly OrderState[] ActiveOrderStates = new[]
+        {
+            OrderState.Working,
+            OrderState.Submitted,
+            OrderState.Accepted,
+            OrderState.ChangePending,
+            OrderState.PartFilled
+        };
+
         private object ClosePosition(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new Dictionary<string, object>() : (JsonConvert.DeserializeObject<Dictionary<string, object>>(body) ?? new Dictionary<string, object>());
             var symbol = req.GetValueOrDefault("symbol")?.ToString();
-            if (string.IsNullOrEmpty(symbol)) symbol = "ALL";
+            if (string.IsNullOrEmpty(symbol)) symbol = BridgeClosePlan.EverySymbol;
 
             var reqAccount = req.GetValueOrDefault("account")?.ToString();
 
+            // P1-90 at a seventh site the six-site sweep did not reach, because this handler
+            // FILTERS by account name instead of resolving one: a typo matched no account, and
+            // the report then called that a successful close. Only a name that was SUPPLIED is
+            // resolved -- omitting the field has always meant "every account" here, and that
+            // contract is not this defect's business to change.
+            if (!string.IsNullOrWhiteSpace(reqAccount))
+            {
+                var closeResolution = BridgeAccountResolver.ResolveOrRefuse(
+                    reqAccount, Account.All.Select(a => a.Name), "close a position");
+                if (closeResolution.Refused) return new { error = closeResolution.Error };
+                reqAccount = closeResolution.Name;
+            }
+
             int cancelledOrdersCount = 0;
-            bool positionClosed = false;
+            int flattenRequested = 0;
+            int flattenOrdersSubmitted = 0;
+            int positionsMatched = 0;
+            var errors = new List<string>();
+            var positionsStillOpen = new List<string>();
 
             var dispatcher = System.Windows.Application.Current?.Dispatcher;
             if (dispatcher == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
             dispatcher.Invoke(() =>
             {
-                foreach (Account account in Account.All)
+                foreach (Account account in Account.All.ToList())
                 {
-                    if (!string.IsNullOrEmpty(reqAccount) && !account.Name.Equals(reqAccount, StringComparison.OrdinalIgnoreCase))
-                        continue;
+                    if (!BridgeClosePlan.MatchesAccount(account.Name, reqAccount)) continue;
 
-                    string rootSymbol = symbol.Equals("ALL", StringComparison.OrdinalIgnoreCase) ? "" : symbol.Split(' ')[0];
-                    bool filterBySymbol = !string.IsNullOrEmpty(rootSymbol);
-
-                    // 1. Cancel working orders for the requested symbol only
+                    // 1. Cancel working orders in scope. State semantics are unchanged from
+                    //    before this fix on purpose -- narrowing what a close path cancels is a
+                    //    behaviour change, and this ticket is about the REPORT.
                     var toCancel = account.Orders
                         .Where(o => o.OrderState != OrderState.Filled && o.OrderState != OrderState.Cancelled
-                                    && (!filterBySymbol || (o.Instrument != null && o.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase))))
+                                    && BridgeClosePlan.MatchesSymbol(
+                                           o.Instrument == null ? null : o.Instrument.FullName, symbol))
                         .ToList();
-                    if (toCancel.Count > 0)
+                    foreach (Order ord in toCancel)
                     {
-                        try { account.Cancel(toCancel); } catch {}
-                        cancelledOrdersCount += toCancel.Count;
+                        // Credit what was SENT, one at a time. The old loop cancelled the whole
+                        // list inside `try { } catch {}` and then added `toCancel.Count`
+                        // unconditionally, so a throw on the first order reported every order in
+                        // the list as cancelled -- `P1-99`'s rule at a second site.
+                        try { account.Cancel(new[] { ord }); cancelledOrdersCount++; }
+                        catch (Exception cex) { errors.Add($"[{account.Name}] Cancel order {ord.OrderId}: {cex.Message}"); }
                     }
 
-                    // 2. Flatten active positions for the requested symbol only
-                    foreach (Position pos in account.Positions)
+                    // P0-104's snapshot, reused: EVERY order on the account, not filtered by
+                    // state. Subtracting it below is what says whether the flatten reached the
+                    // book. See BridgeFlattenPlan's header for why the "before" set is unfiltered.
+                    var knownBeforeFlatten = account.Orders.ToList();
+
+                    // 2. Flatten positions in scope.
+                    var inScope = account.Positions
+                        .Where(p => p.Instrument != null && p.MarketPosition != MarketPosition.Flat
+                                    && BridgeClosePlan.MatchesSymbol(p.Instrument.FullName, symbol))
+                        .ToList();
+                    positionsMatched += inScope.Count;
+                    foreach (Position pos in inScope)
                     {
-                        if (pos.Instrument == null || pos.MarketPosition == MarketPosition.Flat) continue;
-                        if (filterBySymbol && !pos.Instrument.FullName.StartsWith(rootSymbol, StringComparison.OrdinalIgnoreCase)) continue;
                         try
                         {
                             account.Flatten(new[] { pos.Instrument });
-                            positionClosed = true;
+                            flattenRequested++;
                         }
-                        catch
+                        catch (Exception fex)
                         {
-                            var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
-                            var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
-                            account.Submit(new[] { closeOrder });
-                            positionClosed = true;
+                            // Fallback: an explicit closing order. Side comes from
+                            // MarketPosition, never from Quantity, which NT8 reports as an
+                            // ABSOLUTE value (P0-96).
+                            try
+                            {
+                                var closeAction = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.BuyToCover;
+                                var closeOrder = account.CreateOrder(pos.Instrument, closeAction, OrderType.Market, TimeInForce.Day, pos.Quantity, 0, 0, string.Empty, "McpClosePosition", null);
+                                account.Submit(new[] { closeOrder });
+                                flattenRequested++;
+                            }
+                            catch (Exception sex)
+                            {
+                                errors.Add($"[{account.Name}] Flatten failed ({fex.Message}) and the fallback close order failed: {sex.Message}");
+                            }
                         }
                     }
+
+                    // What actually reached the book, per account. `flattenRequested` counts
+                    // calls that returned; this counts orders that exist.
+                    var activeAfterFlatten = account.Orders.Where(o => ActiveOrderStates.Contains(o.OrderState)).ToList();
+                    flattenOrdersSubmitted += BridgeFlattenPlan
+                        .SubmittedByThisCall(knownBeforeFlatten, activeAfterFlatten).Count;
                 }
             });
 
-            return new { status = "flattened", symbol, positionClosed, cancelledOrdersCount };
+            // P1-105, the half that was missing entirely: OBSERVE the outcome. Everything above
+            // records what was REQUESTED. `account.Flatten` is asynchronous, so a single read
+            // taken here would say "still open" on every healthy close -- hence a bounded settle
+            // poll, which stops the moment everything in scope is flat, so the healthy path pays
+            // one iteration and no sleep.
+            //
+            // ⚠️ Fourth `Thread.Sleep` site in this file (handover section 5.39 lists the other
+            // three and the injectable-clock work they want). Worst case ~1.35s, and only when
+            // the close did NOT land -- which is the case where the caller most needs the truth.
+            //
+            // The scope predicate here is the same `BridgeClosePlan` call the acting pass used.
+            // If these two disagreed the report would be true about a set the caller never named.
+            const int settlePolls = 10;
+            const int settleStepMs = 150;
+            for (int attempt = 0; attempt < settlePolls; attempt++)
+            {
+                positionsStillOpen.Clear();
+                try
+                {
+                    dispatcher.Invoke(() =>
+                    {
+                        foreach (Account acc in Account.All.ToList())
+                        {
+                            if (!BridgeClosePlan.MatchesAccount(acc.Name, reqAccount)) continue;
+                            foreach (Position pp in acc.Positions)
+                            {
+                                if (pp.Instrument == null || pp.MarketPosition == MarketPosition.Flat) continue;
+                                if (!BridgeClosePlan.MatchesSymbol(pp.Instrument.FullName, symbol)) continue;
+                                positionsStillOpen.Add($"{acc.Name} {pp.Instrument.FullName} {pp.MarketPosition} {pp.Quantity}");
+                            }
+                        }
+                    });
+                }
+                catch (Exception pex)
+                {
+                    errors.Add($"Position re-read failed: {pex.Message}");
+                    break;
+                }
+                if (positionsStillOpen.Count == 0) break;
+                if (attempt < settlePolls - 1) System.Threading.Thread.Sleep(settleStepMs);
+            }
+
+            // Both derived from observations. `status` used to be the constant "flattened" and
+            // `positionClosed` used to mean "control reached the line after Flatten".
+            bool positionClosed = BridgeClosePlan.PositionClosed(positionsMatched, positionsStillOpen.Count);
+            string status = BridgeClosePlan.StatusFor(positionsMatched, positionsStillOpen.Count, flattenOrdersSubmitted);
+
+            Log($"[CLOSE POSITION] Account={reqAccount ?? "ALL"} Symbol={symbol} Matched={positionsMatched} "
+                + $"FlattenRequested={flattenRequested} FlattenOrders={flattenOrdersSubmitted} "
+                + $"Cancelled={cancelledOrdersCount} StillOpen={positionsStillOpen.Count} Errors={errors.Count} "
+                + $"Status={status}",
+                positionClosed ? LogLevel.Information : LogLevel.Warning);
+
+            return new
+            {
+                status,
+                symbol,
+                account = reqAccount,
+                positionClosed,
+                positionsMatched,
+                // The only two fields here that report an OBSERVATION rather than a request --
+                // `positionsStillOpen` is the one to read.
+                positionsStillOpen,
+                flattenOrdersSubmitted,
+                flattenRequested,
+                cancelledOrdersCount,
+                errors
+            };
         }
 
         private static readonly HashSet<string> _subscribedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -3694,14 +3819,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             int flattenOrdersSubmitted = 0;
             var accountsStillOpen = new List<string>();
 
-            var activeStates = new[]
-            {
-                OrderState.Working,
-                OrderState.Submitted,
-                OrderState.Accepted,
-                OrderState.ChangePending,
-                OrderState.PartFilled
-            };
+            // P1-105: hoisted to a single definition (`ActiveOrderStates`) now that
+            // `ClosePosition` observes the same thing. The local name is kept so this path's
+            // `P0-104` mutation anchors still point at real lines.
+            var activeStates = ActiveOrderStates;
 
             try
             {

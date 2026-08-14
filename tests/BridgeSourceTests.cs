@@ -471,11 +471,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1_106_AnUnlockedAccountIsNotFlaggedAsReducing();
             TestP1_106_ABracketedOrderStaysRefused();
             TestP1_106_TheThreeOrderPathsAllConsultTheGate();
+            TestP1_105_TheFiledDefectExactly();
+            TestP1_105_NothingMatchedIsNotAClose();
+            TestP1_105_AClosedPositionIsReportedClosed();
+            TestP1_105_SubmittedButUnconfirmedIsItsOwnAnswer();
+            TestP1_105_ASymbolPrefixIsNotAMatch();
+            TestP1_105_TheSymbolRootMatchesHoweverItWasSpelled();
+            TestP1_105_EverySymbolMeansEverySymbol();
+            TestP1_105_AnUnnameableInstrumentIsOutOfScope();
+            TestP1_105_TheAccountFilterIsExactOrEverything();
+            TestP1_105_ScopeIsBothHalvesAndNothingElse();
+            TestP1_105_TheEndpointObservesRatherThanClaiming();
+            TestP1_105_BothPassesUseTheSameScopePredicate();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 26;
+            const int declared = 38;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -1034,6 +1046,282 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "buy/sell direction and the real position");
         }
 
+
+        // ================================================================================
+        // P1-105. `nt_close_position` returned `positionClosed: true` having submitted
+        // nothing. EXECUTED, not grepped -- BridgeClosePlan takes strings and ints and
+        // names no NT8 type. The two SOURCE gates at the end cover what stays in
+        // McpBridgeAddOn.cs: how the handler builds these arguments and what it reports.
+        // ================================================================================
+
+        private static void TestP1_105_TheFiledDefectExactly()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: the live measurement -- one position matched, nothing submitted, still open");
+
+            // Sim101 2026-08-14 13:46:33Z: long 11 MNQ, Flatten called, NO order reached the
+            // book (no ORDER_UPDATE in interventions.jsonl), position still long 11. The old
+            // handler answered {"status": "flattened", "positionClosed": true}.
+            Assert(!BridgeClosePlan.PositionClosed(positionsMatched: 1, positionsStillOpen: 1),
+                "a matched position that is still open is NOT closed -- this is the exact live case");
+            Assert(BridgeClosePlan.StatusFor(1, 1, 0) == "close_not_submitted",
+                "and the status says nothing reached the book, which is what the operator needed to know");
+            Assert(BridgeClosePlan.StatusFor(1, 1, 0) != "flattened",
+                "the constant string this replaced was 'flattened' regardless of any of it");
+        }
+
+        private static void TestP1_105_NothingMatchedIsNotAClose()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: matching no position is not a successful close");
+
+            Assert(!BridgeClosePlan.PositionClosed(positionsMatched: 0, positionsStillOpen: 0),
+                "zero matched positions is not a close, however flat the account looks afterwards");
+            Assert(BridgeClosePlan.StatusFor(0, 0, 0) == "nothing_to_close",
+                "and it says so -- a typo'd symbol lands here, and reporting it as a close is the "
+                + "defect coming back wearing new fields");
+        }
+
+        private static void TestP1_105_AClosedPositionIsReportedClosed()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: the healthy path still reports success (NEGATIVE test)");
+
+            // For a detector, the negative test is the one that proves it works: a rule that
+            // never says "closed" passes every test above.
+            Assert(BridgeClosePlan.PositionClosed(positionsMatched: 1, positionsStillOpen: 0),
+                "a matched position observed flat IS closed");
+            Assert(BridgeClosePlan.StatusFor(1, 0, 1) == "flattened",
+                "and the status is 'flattened' when it actually flattened");
+            Assert(BridgeClosePlan.StatusFor(3, 0, 0) == "flattened",
+                "observed flat wins over the order count -- a position closed by something else "
+                + "between the two passes is still closed, and claiming otherwise would send the "
+                + "operator to place a duplicate exit by hand");
+        }
+
+        private static void TestP1_105_SubmittedButUnconfirmedIsItsOwnAnswer()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: 'submitted but not confirmed' is distinct from 'not submitted'");
+
+            Assert(BridgeClosePlan.StatusFor(1, 1, 1) == "close_submitted_not_confirmed",
+                "an order on the book with the position still open is a slow fill, not a failure");
+            Assert(BridgeClosePlan.StatusFor(1, 1, 0) == "close_not_submitted",
+                "no order on the book with the position still open is the failure");
+            Assert(BridgeClosePlan.StatusFor(1, 1, 1) != BridgeClosePlan.StatusFor(1, 1, 0),
+                "and the two are never the same string -- collapsing them loses the whole signal");
+        }
+
+        private static void TestP1_105_ASymbolPrefixIsNotAMatch()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: the symbol filter compares ROOTS, not prefixes");
+
+            // The old filter was FullName.StartsWith(root), so `symbol: "M"` was a request to
+            // close MNQ, MES, MCL and MGC together.
+            Assert(!BridgeClosePlan.MatchesSymbol("MNQ 09-26", "M"),
+                "'M' does not match MNQ -- a prefix test on a path that CLOSES POSITIONS is "
+                + "unbounded by construction");
+            Assert(!BridgeClosePlan.MatchesSymbol("MES 09-26", "ES"),
+                "'ES' does not match MES");
+            Assert(!BridgeClosePlan.MatchesSymbol("MNQ 09-26", "MN"),
+                "and a partial root is not a root");
+        }
+
+        private static void TestP1_105_TheSymbolRootMatchesHoweverItWasSpelled()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: root matching accepts the request either way (NEGATIVE test)");
+
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 09-26", "MNQ 09-26"),
+                "a full contract name matches its own position");
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 09-26", "MNQ"),
+                "and so does the bare root -- both spellings are the same request");
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 09-26", "mnq"),
+                "case-insensitively");
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 09-26", "  MNQ  "),
+                "and whitespace in a JSON field has exactly one possible intent");
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 12-26", "MNQ 09-26"),
+                "⚠️ the EXPIRY is deliberately not compared -- unchanged from before the fix, and "
+                + "recorded as a known limit in BridgeClosePlan's header rather than guessed at");
+        }
+
+        private static void TestP1_105_EverySymbolMeansEverySymbol()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: an omitted symbol and 'ALL' are the same request");
+
+            Assert(BridgeClosePlan.WantsEverySymbol("ALL"), "'ALL' means every instrument");
+            Assert(BridgeClosePlan.WantsEverySymbol("all"), "case-insensitively");
+            Assert(BridgeClosePlan.WantsEverySymbol(" ALL "), "and trimmed");
+            Assert(BridgeClosePlan.MatchesSymbol("MNQ 09-26", "ALL"), "so everything is in scope");
+            Assert(!BridgeClosePlan.WantsEverySymbol("MNQ"),
+                "but a named instrument is NOT every instrument -- this is the branch that makes "
+                + "the filter mean anything");
+            // ⚠️ These two started as the opposite assertion and the test won. Turning absence
+            // into "ALL" is the HANDLER's job, in one greppable line; a blank string arriving
+            // here is a caller bug, and reading it as a wildcard would liquidate the account.
+            Assert(!BridgeClosePlan.WantsEverySymbol(null),
+                "a null symbol is NOT a wildcard -- the handler defaults an absent field to 'ALL' "
+                + "before this is reached, so a null here is a caller bug, not a request");
+            Assert(!BridgeClosePlan.WantsEverySymbol("   "),
+                "and neither is whitespace: {\"symbol\": \"   \"} is a template that interpolated "
+                + "an empty variable, and the two failure directions are not symmetric -- matching "
+                + "nothing wastes a call, matching everything is an unrequested liquidation");
+        }
+
+        private static void TestP1_105_AnUnnameableInstrumentIsOutOfScope()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: in doubt means OUT of scope on a closing path");
+
+            Assert(!BridgeClosePlan.MatchesSymbol(null, "MNQ"),
+                "an instrument with no name cannot be shown to be what the caller asked for");
+            Assert(!BridgeClosePlan.MatchesSymbol("", "MNQ"), "nor an empty one");
+            Assert(!BridgeClosePlan.MatchesSymbol("MNQ 09-26", "   "),
+                "⚠️ and a whitespace-only symbol is not a wildcard here -- closing every position "
+                + "because a field held a space is the wrong way to be wrong");
+            Assert(!BridgeClosePlan.MatchesSymbol("MNQ 09-26", null),
+                "nor is a null one");
+            // ⚠️ Added because a mutant SURVIVED: dropping the empty-root guard leaves
+            // string.Equals("", ""), so a nameless instrument matches a nameless request and
+            // BOTH sides being unknown reads as a match. The handler passes a null FullName for
+            // an order with no instrument, so this pair is reachable.
+            Assert(!BridgeClosePlan.MatchesSymbol(null, "   "),
+                "and two unknowns are NOT a match -- an unnamed instrument does not answer an "
+                + "unnamed request just because the two empty strings are equal");
+            Assert(!BridgeClosePlan.MatchesSymbol("", ""),
+                "in either spelling");
+            Assert(BridgeClosePlan.RootOf(null) == "",
+                "RootOf never throws on a path that closes positions");
+            Assert(BridgeClosePlan.RootOf("MNQ 09-26") == "MNQ", "and it takes the leading token");
+            Assert(BridgeClosePlan.RootOf("AAPL") == "AAPL",
+                "including when there is no expiry to strip");
+        }
+
+        private static void TestP1_105_TheAccountFilterIsExactOrEverything()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: the account filter");
+
+            Assert(BridgeClosePlan.MatchesAccount("Sim101", "Sim101"), "an exact name matches");
+            Assert(BridgeClosePlan.MatchesAccount("Sim101", "sim101"), "case-insensitively");
+            Assert(BridgeClosePlan.MatchesAccount("Sim101", " Sim101 "), "and trimmed");
+            Assert(!BridgeClosePlan.MatchesAccount("Sim101", "Sim1O1"),
+                "a typo matches nothing -- ⚠️ which is why the HANDLER resolves the name through "
+                + "BridgeAccountResolver first (P1-90): 'matched nothing' is a far worse answer "
+                + "than 'there is no account called that'");
+            Assert(BridgeClosePlan.MatchesAccount("Sim101", null),
+                "an omitted account means every account, the handler's long-standing contract");
+            Assert(!BridgeClosePlan.MatchesAccount(null, "Sim101"),
+                "but a nameless account is not the named one");
+        }
+
+        private static void TestP1_105_ScopeIsBothHalvesAndNothingElse()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: InScope is exactly account AND symbol, over the whole matrix");
+
+            // The acting pass and the observing pass call InScope. If it were not exactly the
+            // conjunction, the report would be true about a set the caller never named.
+            var accounts = new[] { "Sim101", "Sim102", null };
+            var instruments = new[] { "MNQ 09-26", "ES 09-26", null };
+            var reqAccounts = new[] { "Sim101", null, "Nope" };
+            var reqSymbols = new[] { "MNQ", "ALL", null, "ZZZ" };
+
+            int checkedPairs = 0;
+            bool consistent = true;
+            bool sawTrue = false, sawFalse = false;
+            foreach (var a in accounts)
+                foreach (var i in instruments)
+                    foreach (var ra in reqAccounts)
+                        foreach (var rs in reqSymbols)
+                        {
+                            bool expected = BridgeClosePlan.MatchesAccount(a, ra)
+                                         && BridgeClosePlan.MatchesSymbol(i, rs);
+                            bool actual = BridgeClosePlan.InScope(a, i, ra, rs);
+                            if (expected != actual) consistent = false;
+                            if (actual) sawTrue = true; else sawFalse = true;
+                            checkedPairs++;
+                        }
+
+            Assert(checkedPairs == 108,
+                string.Format("all 108 combinations were driven (drove {0})", checkedPairs));
+            Assert(consistent, "InScope agrees with its two halves on every one of them");
+            Assert(sawTrue && sawFalse,
+                "and the matrix contains both answers -- a predicate that is constant would "
+                + "satisfy 'consistent' with a matching constant on the other side");
+        }
+
+        private static void TestP1_105_TheEndpointObservesRatherThanClaiming()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: the close endpoint reports an observed position (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            Assert(!Regex.IsMatch(code, @"positionClosed\s*=\s*true"),
+                "the unconditional assignment is GONE -- `positionClosed = true` on the line after "
+                + "an asynchronous Flatten recorded that control reached that line");
+            Assert(!Regex.IsMatch(code, @"status\s*=\s*""flattened"""),
+                "and so is the constant status string, which was returned whatever happened");
+            Assert(Regex.IsMatch(code, @"BridgeClosePlan\.PositionClosed"),
+                "positionClosed is derived from the plan");
+            Assert(Regex.IsMatch(code, @"BridgeClosePlan\.StatusFor"),
+                "and so is the status");
+            Assert(Regex.IsMatch(code, @"positionsStillOpen"),
+                "the response carries a position read taken AFTER the flatten pass");
+            // ⚠️ Added because a mutant SURVIVED: replacing the poll's exit condition with a bare
+            // `break` leaves a single immediate read, and Flatten is ASYNCHRONOUS -- so every
+            // HEALTHY close would report "submitted but not confirmed". An alarm that is always
+            // on is off, and the mutant that does it is a one-word edit.
+            Assert(Regex.IsMatch(code, @"if \(positionsStillOpen\.Count == 0\) break;"),
+                "and the re-read is a poll that stops when the positions are actually flat, not a "
+                + "single read taken before an asynchronous Flatten could possibly have landed");
+            Assert(Regex.IsMatch(code, @"BridgeFlattenPlan\s*\.?\s*\n?\s*\.SubmittedByThisCall")
+                   || Regex.IsMatch(code, @"BridgeFlattenPlan[\s\S]{0,40}SubmittedByThisCall"),
+                "and it reuses P0-104's observation of what actually reached the book, rather than "
+                + "growing a second dialect for the same question");
+            Assert(!Regex.IsMatch(code, @"o\.Instrument\.FullName\.StartsWith\(rootSymbol"),
+                "the prefix filter is gone -- that exact expression made `symbol: \"M\"` a request "
+                + "to close MNQ, MES, MCL and MGC");
+        }
+
+        private static void TestP1_105_BothPassesUseTheSameScopePredicate()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-105: acting and observing share one scope predicate (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // ⚠️ Counted, not merely present. The whole point of the extraction is that the pass
+            // that ACTS and the pass that OBSERVES cannot disagree about which positions the
+            // request was about; one call site satisfies "the plan is used" while leaving the
+            // other pass with a hand-rolled filter, which is this defect in a new place.
+            int symbolCalls = Regex.Matches(code, @"BridgeClosePlan\.MatchesSymbol").Count;
+            int accountCalls = Regex.Matches(code, @"BridgeClosePlan\.MatchesAccount").Count;
+            Assert(symbolCalls >= 3,
+                string.Format("the symbol predicate is used by the cancel pass, the flatten pass "
+                    + "and the re-read (found {0})", symbolCalls));
+            Assert(accountCalls >= 2,
+                string.Format("and the account predicate by both the acting and observing loops "
+                    + "(found {0})", accountCalls));
+
+            Assert(Regex.IsMatch(code, @"ResolveOrRefuse\([\s\S]{0,120}""close a position"""),
+                "a supplied account name is RESOLVED, not filtered on -- P1-90 at a seventh site, "
+                + "where a typo used to match nothing and be reported as a successful close");
+            // ⚠️ Added because a mutant SURVIVED. The assertion above only proved the resolver is
+            // CALLED; neutering the refusal to `if (false)` left the call in place and the gate
+            // still passed. A source gate that a value is computed is not a gate that it is
+            // USED -- P2-24's class ("dead safety machinery is invisible") reaching the gates
+            // themselves. Every "is X called" assertion in this file deserves the same question.
+            Assert(Regex.IsMatch(code, @"closeResolution\.Refused\)\s*return new \{ error = closeResolution\.Error \}"),
+                "and the refusal is RETURNED, not merely computed and dropped");
+
+            Assert(!Regex.IsMatch(code, @"cancelledOrdersCount \+= toCancel\.Count"),
+                "the cancel count credits what was SENT, not the length of the list it tried -- "
+                + "the old expression reported every order as cancelled when the call threw");
+        }
 
         public static int Main(string[] args)
         {

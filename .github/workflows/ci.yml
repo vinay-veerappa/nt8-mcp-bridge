@@ -79,6 +79,15 @@ jobs:
       - name: Mutation P1-106 (the lockout that trapped you in the position)
         run: python mutation/mutate_p1106.py
 
+      # ⚠️ 15/18 on its first run, and all three survivors were real. Two of them were
+      # SOURCE gates that passed under the mutant because they asserted a value is
+      # COMPUTED rather than USED -- neutering `if (closeResolution.Refused)` to
+      # `if (false)` left the ResolveOrRefuse call in place and the gate still said ok.
+      # Do not read a clean first run here as a strong result; read it as the moment to
+      # add a mutant you expect to survive.
+      - name: Mutation P1-105 (the close that reported an outcome it never observed)
+        run: python mutation/mutate_p1105.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core

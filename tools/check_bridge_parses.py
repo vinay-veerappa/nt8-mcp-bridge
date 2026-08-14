@@ -36,10 +36,25 @@ import tempfile
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
-# Every bridge-owned addon source. The resolver is here as well as in the test
-# build on purpose: the test build targets net8.0 and NT8 compiles net48, and this
-# check is the cheaper of the two places to notice a syntax regression.
-TARGETS = ['McpBridgeAddOn.cs', 'BridgeAccountResolver.cs']
+# Every bridge-owned addon source, DISCOVERED rather than listed.
+#
+# ⚠️ This was a hand-typed pair -- `['McpBridgeAddOn.cs', 'BridgeAccountResolver.cs']` -- under a
+# comment that said "every bridge-owned addon source". By the time P1-105 looked, `addons/` held
+# SIX files and this gate parsed two of them: BridgeFlattenPlan, BridgeLockoutGate,
+# BridgeOrderAction and CopierEnforcementView had all been added since, each with the comment
+# still claiming full coverage. Nothing failed, because a list that does not grow cannot report
+# what it is not looking at. That is the `state-the-region-a-gate-inspects` habit again, in its
+# cheapest form: the region was a literal, and the literal aged.
+#
+# `tools/deploy.py` globs `addons/*.cs` to decide what SHIPS, so this now globs the same
+# directory to decide what is CHECKED -- the two sets are the same set by construction.
+#
+# The extracted classes are parsed here as well as compiled in the test build on purpose: the
+# test build targets net8.0 and NT8 compiles net48, and this is the cheaper of the two places to
+# notice a syntax regression.
+TARGETS = sorted(f for f in os.listdir(os.path.join(REPO, 'addons')) if f.endswith('.cs'))
+if not TARGETS:
+    raise SystemExit('check_bridge_parses.py: no addons/*.cs found -- refusing to pass vacuously')
 
 PROJECT = """<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
