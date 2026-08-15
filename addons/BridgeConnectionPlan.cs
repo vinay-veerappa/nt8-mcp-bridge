@@ -100,15 +100,39 @@ namespace NinjaTrader.NinjaScript.AddOns
             return true;
         }
 
+        /// <summary>
+        /// ⚠️ DEDUPLICATES, and that is not cosmetic. Found by driving the live tool rather than
+        /// by any test: the refusal read `Available: Playback, TPT, TPT.` because the route feeds
+        /// this list from a PROVIDER-grained array -- one entry per provider on a connection,
+        /// which is correct for the feed predicate and wrong for a list of connections. A caller
+        /// reading a name twice reasonably concludes there are two connections sharing it, which
+        /// is precisely the confusion F-17 exists to remove.
+        ///
+        /// Fixed at the call site too. It is deduplicated HERE as well because a refusal is read
+        /// by a human, and this class cannot know what grain its caller built.
+        /// </summary>
         private static string Available(string[] available)
         {
             if (available == null || available.Length == 0)
                 return "No connections are configured.";
-            var sb = new StringBuilder("Available: ");
+
+            var seen = new List<string>();
             for (int i = 0; i < available.Length; i++)
             {
+                if (string.IsNullOrWhiteSpace(available[i])) continue;
+                bool dup = false;
+                for (int k = 0; k < seen.Count; k++)
+                    if (string.Equals(seen[k], available[i], StringComparison.OrdinalIgnoreCase))
+                    { dup = true; break; }
+                if (!dup) seen.Add(available[i]);
+            }
+            if (seen.Count == 0) return "No connections are configured.";
+
+            var sb = new StringBuilder("Available: ");
+            for (int i = 0; i < seen.Count; i++)
+            {
                 if (i > 0) sb.Append(", ");
-                sb.Append(available[i]);
+                sb.Append(seen[i]);
             }
             sb.Append('.');
             return sb.ToString();

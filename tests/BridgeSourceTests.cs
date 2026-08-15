@@ -751,6 +751,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert((string)hit[1] == "Provider31",
                 "and it returns the CANONICAL spelling, because that string is what gets passed "
                 + "to the platform and printed in the audit line");
+
+            // ⚠️ FOUND BY DRIVING THE TOOL, NOT BY THE TESTS. The live refusal read
+            // "Available: Playback, TPT, TPT." -- the caller is handed a list of connections in
+            // which one appears twice, which reads as two connections sharing a name and is
+            // exactly the confusion `F-17` exists to remove. The route feeds this list from a
+            // PROVIDER-grained array (one entry per provider on a connection, which is right for
+            // the feed predicate and wrong for a list of connections). Deduplicated here as well
+            // as at the call site, because a refusal is read by a human and this class cannot
+            // know what grain its caller built.
+            var dupes = F17Resolve("nope", new[] { "Playback", "TPT", "TPT" });
+            var text = dupes[2] == null ? "" : dupes[2].ToString();
+            int firstTpt = text.IndexOf("TPT", StringComparison.Ordinal);
+            Assert(firstTpt >= 0 && text.IndexOf("TPT", firstTpt + 1, StringComparison.Ordinal) < 0,
+                "a connection appearing twice in the available list is named ONCE in the refusal. "
+                + "Got: " + text);
         }
 
         /// <summary>
