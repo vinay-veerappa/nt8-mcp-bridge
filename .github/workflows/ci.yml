@@ -125,6 +125,22 @@ jobs:
       - name: Mutation P3-111 (the bars endpoint that crashed, flooded and ignored its offset)
         run: python mutation/mutate_p3111.py
 
+      # P2-115. `/api/health`'s feedConnected was `Account.All.Count > 0` -- true on every running
+      # NT8, forever. Measured reading `true` against a DORMANT Playback connection with no
+      # tradeable market at all, and `true` again an hour later with a real broker: it did not
+      # change value when the thing it names changed completely.
+      # ⚠️ 5/10 ON THE FIRST RUN, and four of the five were gaps in tests written the same hour:
+      # null arrays vs EMPTY arrays (an empty array is not a null one), a blank provider, ragged
+      # arrays, and a source gate asserting the class is MENTIONED rather than that its answer is
+      # ASSIGNED -- the third time that exact gap has been found here after P1-105 and P2-109.
+      # The fifth was the author's: a case-SENSITIVE Contains("Connected") mutant, which
+      # "Disconnected" does not match, so it never expressed its own defect.
+      # ⚠️ Mutant 5 is the one to know: a bare `return false`. Every requirement in this ticket is
+      # about a TRUE that cannot become false, so a constant false satisfies all of them and would
+      # ship a permanent-outage report on a working box. The positive control is what bans it.
+      - name: Mutation P2-115 (a health flag that could never be false)
+        run: python mutation/mutate_p2115.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core

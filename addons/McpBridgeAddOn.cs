@@ -443,12 +443,47 @@ namespace NinjaTrader.NinjaScript.AddOns
                     bool connectedToFeed = false;
                     try
                     {
-                        accountCount = Account.All != null ? Account.All.Count : 0;
-                        connectedToFeed = accountCount > 0;
-
-
+                        // P2-115: the old expression Account.All.Count > 0 could not be false on a running NT8
+                        // because Simulator accounts are always present. It was measured reading true against a
+                        // dormant Playback connection with no replay running and no tradeable market on 2026-08-15.
+                        var accounts = Account.All;
+                        int snapshotCount = accounts != null ? accounts.Count : 0;
+                        accountCount = snapshotCount;
+                        if (snapshotCount > 0)
+                        {
+                            string[] names = new string[snapshotCount];
+                            string[] providers = new string[snapshotCount];
+                            string[] statuses = new string[snapshotCount];
+                            for (int i = 0; i < snapshotCount; i++)
+                            {
+                                if (i >= accounts.Count)
+                                    break;
+                                Account a = accounts[i];
+                                if (a == null) continue;
+                                names[i] = a.Name;
+                                // ⚠️ NO `?.` HERE. `Provider` and `ConnectionStatus` are ENUMS -- value
+                                // types -- so `a.Provider?.ToString()` is CS0023 and will not compile.
+                                // The addon already writes it this way at :1771 and :4590. `Connection`
+                                // IS a reference type, so it gets an explicit null check instead.
+                                providers[i] = a.Provider.ToString();
+                                statuses[i] = a.Connection == null ? null : a.Connection.Status.ToString();
+                            }
+                            connectedToFeed = BridgeFeedStatus.IsMarketDataConnected(names, providers, statuses);
+                        }
                     }
-                    catch {}
+                    catch (Exception ex)
+                    {
+                        // Still swallowed -- health must answer even when this throws -- but no longer
+                        // silent. `Output.Process` is this file's convention; `Print` is NinjaScriptBase's
+                        // and is not what anything else here calls.
+                        try
+                        {
+                            NinjaTrader.Code.Output.Process(
+                                "[McpBridge] /api/health could not evaluate feedConnected: " + ex.Message,
+                                PrintTo.OutputTab1);
+                        }
+                        catch { }
+                    }
                     return new
                     {
                         status = "ok",

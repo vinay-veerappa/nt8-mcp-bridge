@@ -585,6 +585,60 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "and no connections at all is FALSE rather than vacuously true -- `All` over an "
                 + "empty sequence is true, which is how the last instance of a class disarms its "
                 + "own gate");
+
+            // ⚠️ ADDED AFTER THE MUTATION BATTERY. A mutant turning the null-argument guard from
+            // `return false` into `return true` SURVIVED, because every assertion above passes a
+            // real array -- AN EMPTY ARRAY IS NOT A NULL ONE, and only the empty case had ever
+            // been exercised. That mutant is the shipped defect in its purest form: always true.
+            var nulls = P2115Ask(null, null, null);
+            Assert(nulls == false,
+                "null arrays are FALSE, not true. A caller that could not build the snapshot has "
+                + "said nothing about the feed, and 'I do not know' must never read as 'connected'");
+
+            // ⚠️ ALSO FROM THE BATTERY. A blank provider is not positively identified as real, so
+            // it must not count toward a live feed. Every assertion above passes a NAMED provider,
+            // so the mutant that admitted blanks changed no outcome.
+            var blankProvider = P2115Ask(
+                new[] { "Mystery" }, new[] { "   " }, new[] { "Connected" });
+            Assert(blankProvider == false,
+                "a CONNECTED account whose provider is blank is still FALSE -- anything not "
+                + "positively identified as a real provider fails closed, the same rule P2-38 "
+                + "established for account names");
+
+            // ⚠️ AND THE RAGGED CASE. The route builds all three arrays in one loop so it cannot
+            // produce this today, but the class is public and the next caller is the one that
+            // will. The mutant that removed the shortest-length clamp survived because nothing
+            // in the suite was ragged.
+            // ⚠️ STATUSES MUST BE STRICTLY THE SHORTEST ARRAY, and getting that wrong is why the
+            // first version of this test did not kill its mutant. With names=3, providers=1,
+            // statuses=2 the length is pinned to 1 by the PROVIDERS clamp, so removing the
+            // STATUSES clamp changes nothing and the mutant survives. Each clamp needs the array
+            // it guards to be the one that would overrun.
+            bool threw = false;
+            bool? ragged = null;
+            try
+            {
+                ragged = P2115Ask(
+                    new[] { "A", "B" },
+                    new[] { "Provider31", "Provider31" },
+                    new[] { "Disconnected" });
+            }
+            catch (Exception) { threw = true; }
+            Assert(!threw,
+                "ragged arrays do not throw -- a health endpoint that raises is worse than one "
+                + "that answers conservatively, and without the statuses clamp index 1 overruns");
+            Assert(ragged == false,
+                "and the answer comes from the entries that DO line up: the only status present "
+                + "is Disconnected, so this is FALSE");
+
+            // The mirror, so the clamp cannot be 'fixed' by always returning false: a shorter
+            // statuses array that IS connected still reports true.
+            var raggedTrue = P2115Ask(
+                new[] { "A", "B" },
+                new[] { "Provider31", "Provider31" },
+                new[] { "Connected" });
+            Assert(raggedTrue == true,
+                "a connected first entry still reports TRUE when later entries have no status");
         }
 
         /// <summary>
@@ -613,10 +667,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(!code.Contains("connectedToFeed = accountCount > 0"),
                 "the health route no longer computes `feedConnected` from the account count");
 
-            Assert(code.Contains("BridgeFeedStatus"),
-                "and it USES BridgeFeedStatus. Asserting only that the old expression is gone would "
-                + "pass if the field had simply been hardcoded to true, which is the defect with "
-                + "the arithmetic removed.");
+            // ⚠️ THIS ASSERTION WAS `code.Contains("BridgeFeedStatus")` AND A MUTANT WALKED
+            // STRAIGHT THROUGH IT: keep the call, throw the answer away, hardcode the flag true.
+            // The comment below it already SAID that a value which is computed is not a value
+            // that is used -- I wrote the warning and then shipped the weaker check anyway. It is
+            // the third time this repo has found the same gap (P1-105, P2-109, now here), so the
+            // assertion is now on the ASSIGNMENT, not the mention.
+            Assert(code.Contains("connectedToFeed = BridgeFeedStatus.IsMarketDataConnected("),
+                "and the flag is ASSIGNED from BridgeFeedStatus, not merely computed beside it. "
+                + "Asserting only that the class is named passes when the call is present and its "
+                + "answer discarded -- a value that is COMPUTED is not a value that is USED.");
         }
 
         public static int Run()
