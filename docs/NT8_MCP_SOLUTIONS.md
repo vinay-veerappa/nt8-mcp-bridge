@@ -70,6 +70,13 @@ This document details technical solutions for existing constraints (**`nt_deploy
 
 ## 2. Solutions for `execute_script` (`ScriptExecute`)
 
+> **RESOLVED 2026-08-15**: the ad-hoc executor is **removed**. `nt_script_execute`
+> now refuses with `error: "NOT_IMPLEMENTED"` — the measured ECONNRESET (flaw #1
+> below, the assembly hot-swap resetting HTTP sockets) made it unusable, and
+> recompiling the live Custom assembly from a background HTTP thread is destructive
+> regardless. Use the specific tools (`nt_compile`, `nt_strategy_source`,
+> `nt_inspect_strategy`) instead. The analysis below is kept for the record.
+
 ### Core Flaws & Risks Identified
 1. **Heavy Compilation Overhead & Connection Resets**:
    - Generates a temporary `_ScriptEval_XXXXXX.cs` file in `bin\Custom\Strategies`.

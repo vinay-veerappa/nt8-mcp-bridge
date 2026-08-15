@@ -4833,21 +4833,34 @@ namespace NinjaTrader.NinjaScript.AddOns
             string[] names, providers, statuses;
             SnapshotConnections(out names, out providers, out statuses);
 
-            string resolved, refusal;
-            if (!BridgeConnectionPlan.TryResolve(req.Str("name"), names, out resolved, out refusal))
+            // ⚠️ RESOLVE TO AN INDEX, NOT A NAME. `TPT` is two different connections on this box,
+            // so a name alone cannot identify one and `provider` is the disambiguator. Resolving
+            // to a string and then re-searching by that string is how the ambiguity came back at
+            // the second lookup.
+            int connIndex; string refusal;
+            if (!BridgeConnectionPlan.TryResolveOne(req.Str("name"), req.Str("provider"),
+                                                    names, providers, out connIndex, out refusal))
                 return new { success = false, action, refused = true,
                              error = "UNRESOLVED_CONNECTION", message = refusal };
+            string resolved = names[connIndex];
+            string resolvedProvider = providers != null && connIndex < providers.Length
+                ? providers[connIndex] : null;
 
             // Same source as the read, for the same reason: `Connection.Connections` yields
             // nothing from this thread, and an account's own `Connection` reference is the object
             // the platform actually uses.
+            // Match on name AND provider, so the object picked is the one the index identified.
             Connection target = null;
             int openPositions = 0, workingOrders = 0;
             foreach (Account a in Account.All)
             {
                 if (a == null || a.Connection == null || a.Connection.Options == null) continue;
-                if (string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
-                { target = a.Connection; break; }
+                if (!string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!string.IsNullOrEmpty(resolvedProvider)
+                    && !string.Equals(a.Provider.ToString(), resolvedProvider, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                target = a.Connection; break;
             }
             if (target == null)
             {
@@ -5823,71 +5836,18 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private object ScriptExecute(string body)
         {
-            if (!DevMode)
+            return new
             {
-                return new { error = "ScriptExecute is disabled. Enable DevMode by setting env var NT8_MCP_DEV=1 or creating mcp_dev.on in UserDataDir." };
-            }
-
-            if (string.IsNullOrEmpty(ServerToken))
-            {
-                return new { error = "ScriptExecute blocked: Requires an explicit NT8_MCP_TOKEN to be configured for security." };
-            }
-
-            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var snippet = req.Str("codeSnippet");
-            if (string.IsNullOrWhiteSpace(snippet)) return new { error = "codeSnippet required" };
-
-            Log("[ScriptExecute] Compiling and running C# snippet: " + snippet);
-
-            try
-            {
-                string scriptClassName = "_ScriptEval_" + Math.Abs(Guid.NewGuid().GetHashCode());
-                string scriptCode = $@"
-using System;
-using System.Linq;
-using System.Collections.Generic;
-using NinjaTrader.Cbi;
-using NinjaTrader.Data;
-using NinjaTrader.NinjaScript;
-
-namespace NinjaTrader.NinjaScript.Strategies
-{{
-    public class {scriptClassName} : Strategy
-    {{
-        public static object Run()
-        {{
-            {snippet}
-        }}
-    }}
-}}";
-                string tmpPath = Path.Combine(StrategiesDir, scriptClassName + ".cs");
-                Directory.CreateDirectory(StrategiesDir);
-                File.WriteAllText(tmpPath, scriptCode, new UTF8Encoding(false));
-
-                var compileResult = CompileCore(false);
-                var compJObj = JObject.FromObject(compileResult);
-                bool compileSuccess = compJObj.Bool("success", false);
-
-                if (!compileSuccess)
-                {
-                    try { File.Delete(tmpPath); } catch {}
-                    return new { success = false, status = "compile_failed", errors = compJObj["errors"] };
-                }
-
-                var stratType = FindStrategyType(scriptClassName);
-                object result = null;
-                if (stratType != null)
-                {
-                    result = InvokeStaticM(stratType, "Run");
-                }
-
-                try { File.Delete(tmpPath); } catch {}
-                return new { success = true, status = "executed", snippet, result = result?.ToString() ?? "null" };
-            }
-            catch (Exception ex)
-            {
-                return new { success = false, status = "execution_error", error = ex.Message, stack = ex.StackTrace };
-            }
+                success = false,
+                error = "NOT_IMPLEMENTED",
+                message = "nt_script_execute is intentionally not implemented. The former "
+                        + "implementation wrote a throwaway _ScriptEval_ strategy into the live "
+                        + "Custom assembly and recompiled it from a background HTTP thread, which "
+                        + "was measured failing (ECONNRESET) on 2026-08-15; recompiling the live "
+                        + "assembly from an HTTP thread is destructive. Refusing explicitly beats "
+                        + "advertising an executor that cannot run -- use the specific tools "
+                        + "(nt_compile, nt_strategy_source, nt_inspect_strategy) instead."
+            };
         }
 
         private void HandleSseStream(HttpListenerContext ctx)

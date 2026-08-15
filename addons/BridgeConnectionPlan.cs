@@ -49,6 +49,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return false;
             }
 
+            // ⚠️ AMBIGUITY IS A REFUSAL, NOT A PICK. Measured on this box: `TPT` is the name of
+            // TWO DISTINCT connections -- one `Simulator` with 5 accounts, one `Provider31` with
+            // 1. An earlier version of this method returned the first match, which on a path that
+            // connects and disconnects brokers means acting on an arbitrary one of them. That is
+            // `P1-90` verbatim: guessing a target instead of refusing.
+            //
+            // ⚠️ And the first "fix" made it WORSE. The live refusal read
+            // `Available: Playback, TPT, TPT.`, I read the repetition as a display artefact of the
+            // provider-grained array the route builds for the feed predicate, and deduplicated it
+            // -- which left the display tidy and the ambiguity invisible. **A duplicate you cannot
+            // explain is evidence, not noise.**
+            int matches = 0;
+            string first = null;
             if (available != null)
             {
                 for (int i = 0; i < available.Length; i++)
@@ -57,17 +70,112 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (string.Equals(available[i], requested.Trim(),
                                       StringComparison.OrdinalIgnoreCase))
                     {
+                        matches++;
                         // The CANONICAL spelling, not the caller's. This string is handed to the
                         // platform and printed in the audit line, and `BridgeAccountResolver`
                         // established the same rule for account names.
-                        resolved = available[i];
-                        return true;
+                        if (first == null) first = available[i];
                     }
                 }
             }
 
+            if (matches > 1)
+            {
+                refusal = "the name '" + requested + "' is AMBIGUOUS: " + matches + " connections "
+                        + "carry it, and they are different objects with different accounts and "
+                        + "possibly different statuses. Refusing rather than picking one -- on a "
+                        + "connect/disconnect path that would act on an arbitrary broker. Read "
+                        + "action 'status' and disambiguate by provider. " + Available(available);
+                return false;
+            }
+
+            if (matches == 1)
+            {
+                resolved = first;
+                return true;
+            }
+
             refusal = "no connection named '" + requested + "' exists on this platform. "
                     + Available(available);
+            return false;
+        }
+
+        /// <summary>
+        /// Resolves to ONE connection by name plus an optional provider, and returns its INDEX so
+        /// the caller can act on the right object rather than on a string.
+        ///
+        /// ⚠️ THE PROVIDER IS THE DISAMBIGUATOR, and it exists because refusing ambiguity is only
+        /// half an answer. Measured on this box, `TPT` is two connections -- a `Simulator` one
+        /// with 5 accounts and a `Provider31` one with 1 -- so `TryResolve` correctly refuses the
+        /// bare name, and that leaves the operator unable to connect the very broker they meant.
+        /// A refusal that cannot be satisfied is a wall, not a gate: it has to say what would work
+        /// AND that thing has to exist.
+        ///
+        /// Provider is optional so the unambiguous case stays a one-word call.
+        /// </summary>
+        public static bool TryResolveOne(string requestedName, string requestedProvider,
+                                         string[] names, string[] providers,
+                                         out int index, out string refusal)
+        {
+            index = -1;
+            refusal = null;
+
+            if (string.IsNullOrWhiteSpace(requestedName))
+            {
+                refusal = "no connection was named. This is deliberately NOT a wildcard: on a "
+                        + "disconnect that would sever every connection on the platform. "
+                        + Available(names);
+                return false;
+            }
+            if (names == null || names.Length == 0)
+            {
+                refusal = "No connections are configured.";
+                return false;
+            }
+
+            var hits = new List<int>();
+            for (int i = 0; i < names.Length; i++)
+            {
+                if (names[i] == null) continue;
+                if (!string.Equals(names[i], requestedName.Trim(), StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!string.IsNullOrWhiteSpace(requestedProvider))
+                {
+                    string p = providers != null && i < providers.Length ? providers[i] : null;
+                    if (p == null || !string.Equals(p, requestedProvider.Trim(),
+                                                    StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+                hits.Add(i);
+            }
+
+            if (hits.Count == 1) { index = hits[0]; return true; }
+
+            if (hits.Count == 0)
+            {
+                refusal = string.IsNullOrWhiteSpace(requestedProvider)
+                    ? "no connection named '" + requestedName + "' exists on this platform. " + Available(names)
+                    : "no connection named '" + requestedName + "' with provider '" + requestedProvider
+                      + "' exists. " + Available(names);
+                return false;
+            }
+
+            // Still ambiguous. Name the providers that would separate them -- a refusal has to
+            // hand back the thing that satisfies it.
+            var sb = new StringBuilder("the name '").Append(requestedName).Append("' is AMBIGUOUS: ")
+                .Append(hits.Count).Append(" connections carry it");
+            if (!string.IsNullOrWhiteSpace(requestedProvider))
+                sb.Append(" even with provider '").Append(requestedProvider).Append('\'');
+            sb.Append(". Refusing rather than picking one -- on a connect/disconnect path that "
+                    + "would act on an arbitrary broker. Disambiguate with provider: ");
+            for (int k = 0; k < hits.Count; k++)
+            {
+                if (k > 0) sb.Append(", ");
+                string p = providers != null && hits[k] < providers.Length ? providers[hits[k]] : null;
+                sb.Append(string.IsNullOrEmpty(p) ? "(unknown)" : p);
+            }
+            sb.Append('.');
+            refusal = sb.ToString();
             return false;
         }
 
@@ -101,15 +209,17 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         /// <summary>
-        /// ⚠️ DEDUPLICATES, and that is not cosmetic. Found by driving the live tool rather than
-        /// by any test: the refusal read `Available: Playback, TPT, TPT.` because the route feeds
-        /// this list from a PROVIDER-grained array -- one entry per provider on a connection,
-        /// which is correct for the feed predicate and wrong for a list of connections. A caller
-        /// reading a name twice reasonably concludes there are two connections sharing it, which
-        /// is precisely the confusion F-17 exists to remove.
+        /// Collapses repeats but COUNTS them: `TPT (x2)` rather than either `TPT, TPT` or a bare
+        /// `TPT`.
         ///
-        /// Fixed at the call site too. It is deduplicated HERE as well because a refusal is read
-        /// by a human, and this class cannot know what grain its caller built.
+        /// ⚠️ THIS WENT THROUGH BOTH WRONG ANSWERS FIRST, in one session. The live refusal read
+        /// `Available: Playback, TPT, TPT.`; I judged the repeat a display artefact of the
+        /// provider-grained array the route builds for the feed predicate, and deduplicated it. A
+        /// later live read showed `TPT` is genuinely TWO connections -- one Simulator with 5
+        /// accounts, one Provider31 with 1 -- so the repeat was real and deduplicating had hidden
+        /// it. Printing it raw was confusing; hiding it was dangerous.
+        ///
+        /// **A duplicate you cannot explain is evidence, not noise.** Say how many.
         /// </summary>
         private static string Available(string[] available)
         {
@@ -117,14 +227,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return "No connections are configured.";
 
             var seen = new List<string>();
+            var times = new List<int>();
             for (int i = 0; i < available.Length; i++)
             {
                 if (string.IsNullOrWhiteSpace(available[i])) continue;
-                bool dup = false;
+                int at = -1;
                 for (int k = 0; k < seen.Count; k++)
                     if (string.Equals(seen[k], available[i], StringComparison.OrdinalIgnoreCase))
-                    { dup = true; break; }
-                if (!dup) seen.Add(available[i]);
+                    { at = k; break; }
+                if (at < 0) { seen.Add(available[i]); times.Add(1); }
+                else times[at]++;
             }
             if (seen.Count == 0) return "No connections are configured.";
 
@@ -133,6 +245,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (i > 0) sb.Append(", ");
                 sb.Append(seen[i]);
+                if (times[i] > 1) sb.Append(" (x").Append(times[i]).Append(')');
             }
             sb.Append('.');
             return sb.ToString();

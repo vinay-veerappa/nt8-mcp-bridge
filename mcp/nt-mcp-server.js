@@ -327,6 +327,7 @@ async function handleToolCall(name, args) {
       const res = await ntFetch('/api/connection', 'POST', {
         action: args.action,
         name: args.name,
+        provider: args.provider,
         confirmDisruptive: args.confirmDisruptive,
       });
       return res.data;

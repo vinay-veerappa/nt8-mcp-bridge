@@ -189,7 +189,7 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_synthetic_data` | `POST /api/data/synthetic` | Generate stress-scenario OHLCV datasets |
 | `nt_trade_journal` | `POST /api/trades/journal` | CRUD + tag + export trade journal entries |
 | `nt_schedule` | `POST /api/schedule/task` | Register cron-based tasks inside NT8 |
-| `nt_script_execute` | `POST /api/script/execute` | Execute sandboxed C# snippet inside NT8 |
+| `nt_script_execute` | `POST /api/script/execute` | NOT IMPLEMENTED — refuses with `error=NOT_IMPLEMENTED` (former ad-hoc executor compiled throwaway classes into the live assembly from an HTTP thread; measured failing, removed) |
 | `nt_alert` | `POST /api/alert/create` | Create persistent price/indicator alerts |
 | `nt_riskguard_state` | `GET /api/riskguard/fsm-state?account=&instrument=` | Read RiskGuard FSM state, drawdown, limits |
 | `nt_riskguard_config` | `POST /api/riskguard/config` | Configure trailing drawdown, vol caps, blackouts |

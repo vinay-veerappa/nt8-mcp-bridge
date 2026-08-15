@@ -402,6 +402,10 @@ export const TOOLS = [
           type: 'string',
           description: 'Connection name, required for connect/disconnect. An unresolvable name is REFUSED naming the real ones, and a blank name is refused rather than treated as "all".',
         },
+        provider: {
+          type: 'string',
+          description: 'Disambiguator, needed when two connections share a name. Measured on this box: TPT is TWO connections, one Simulator and one Provider31. A bare ambiguous name is REFUSED and the refusal lists the providers that separate them.',
+        },
         confirmDisruptive: {
           type: 'boolean',
           description: 'Required to disconnect a connection whose accounts hold open positions or working orders. Without it that disconnect is refused, naming what it would strand.',
@@ -602,7 +606,7 @@ export const TOOLS = [
   },
   {
     name: 'nt_script_execute',
-    description: 'Execute a sandboxed C# utility snippet or pre-approved helper function inside NinjaTrader',
+    description: 'NOT IMPLEMENTED — always refuses with error=NOT_IMPLEMENTED. The former ad-hoc C# executor wrote a throwaway _ScriptEval_ strategy into the live Custom assembly and recompiled it from an HTTP thread, which was measured failing (ECONNRESET) and is destructive. Do not call; use nt_compile, nt_strategy_source or nt_inspect_strategy instead.',
     inputSchema: {
       type: 'object',
       properties: {

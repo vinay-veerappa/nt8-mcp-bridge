@@ -752,20 +752,30 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "and it returns the CANONICAL spelling, because that string is what gets passed "
                 + "to the platform and printed in the audit line");
 
-            // ⚠️ FOUND BY DRIVING THE TOOL, NOT BY THE TESTS. The live refusal read
-            // "Available: Playback, TPT, TPT." -- the caller is handed a list of connections in
-            // which one appears twice, which reads as two connections sharing a name and is
-            // exactly the confusion `F-17` exists to remove. The route feeds this list from a
-            // PROVIDER-grained array (one entry per provider on a connection, which is right for
-            // the feed predicate and wrong for a list of connections). Deduplicated here as well
-            // as at the call site, because a refusal is read by a human and this class cannot
-            // know what grain its caller built.
-            var dupes = F17Resolve("nope", new[] { "Playback", "TPT", "TPT" });
-            var text = dupes[2] == null ? "" : dupes[2].ToString();
-            int firstTpt = text.IndexOf("TPT", StringComparison.Ordinal);
-            Assert(firstTpt >= 0 && text.IndexOf("TPT", firstTpt + 1, StringComparison.Ordinal) < 0,
-                "a connection appearing twice in the available list is named ONCE in the refusal. "
-                + "Got: " + text);
+            // ⚠️ THIS ASSERTION WAS THE OPPOSITE ONE AN HOUR AGO, AND IT WAS WRONG.
+            //
+            // Driving the live tool produced `Available: Playback, TPT, TPT.` and I read the
+            // repetition as a display artefact -- the route builds its arrays PROVIDER-grained for
+            // the feed predicate, so a two-provider connection contributes two entries. I
+            // deduplicated it. Then a later live read showed THREE connections, with `TPT` present
+            // twice as genuinely DISTINCT Connection objects: one Simulator with 5 accounts, one
+            // Provider31 with 1.
+            //
+            // The duplicate was REAL. Deduplicating made the display tidy and the ambiguity
+            // INVISIBLE, which is strictly worse than the cosmetic problem it solved -- and on a
+            // path that connects and disconnects brokers, "whichever one matched first" is
+            // `P1-90`'s defect exactly: acting on an arbitrary target instead of refusing.
+            //
+            // So an ambiguous name is REFUSED, and the refusal has to say what would disambiguate.
+            var ambiguous = F17Resolve("TPT", new[] { "Playback", "TPT", "TPT" });
+            Assert((bool)ambiguous[0] == false,
+                "a name matching MORE THAN ONE connection does not resolve. Two connections really "
+                + "can share a name -- measured on this box -- and picking the first is how a "
+                + "broker switch acts on the wrong one");
+            var text = ambiguous[2] == null ? "" : ambiguous[2].ToString();
+            Assert(text.IndexOf("ambiguous", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and the refusal says it is AMBIGUOUS rather than 'not found', because those are "
+                + "different problems with different fixes. Got: " + text);
         }
 
         /// <summary>
