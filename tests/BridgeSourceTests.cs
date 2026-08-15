@@ -455,6 +455,170 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        // ------------------------------------------------------------------
+        // P2-115. `/api/health` reported `feedConnected = accountCount > 0`. A running NT8 always
+        // reports its Simulator accounts, so the field was `true` on every call, on every box,
+        // forever. It is not a weak measurement of the data feed -- it is not a measurement of the
+        // data feed. Measured live on 2026-08-15 it read `true` while NT8 sat on a DORMANT Playback
+        // connection with no tradeable market at all (three orders placed on Sim101 stalled at
+        // OrderState.Initialized), and read `true` again an hour later with a real broker attached.
+        // IT DID NOT CHANGE VALUE WHEN THE THING IT NAMES CHANGED COMPLETELY.
+        //
+        // These reach BridgeFeedStatus by REFLECTION so they compile before it exists -- the same
+        // technique P2-112 used, and for the same reason: the harness is an exe, so a missing type
+        // is a BUILD failure, and a build failure cannot express a red acceptance test.
+        // ------------------------------------------------------------------
+
+        private static Type P2115Type()
+        {
+            return Type.GetType("NinjaTrader.NinjaScript.AddOns.BridgeFeedStatus, " +
+                                typeof(BridgeSourceTests).Assembly.GetName().Name);
+        }
+
+        /// <summary>
+        /// Calls BridgeFeedStatus.IsMarketDataConnected(names, providers, statuses) -> bool.
+        /// Three parallel string arrays deliberately: this class must name NO NinjaTrader type, or
+        /// it joins McpBridgeAddOn.cs in the set nothing can execute (P2-27).
+        /// </summary>
+        private static bool? P2115Ask(string[] names, string[] providers, string[] statuses)
+        {
+            var t = P2115Type();
+            if (t == null) return null;
+            var m = t.GetMethod("IsMarketDataConnected",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (m == null) return null;
+            return (bool)m.Invoke(null, new object[] { names, providers, statuses });
+        }
+
+        /// <summary>THE defect: the shipped field had exactly one reachable value.</summary>
+        private static void TestP2_115_TheHealthFlagCanBeFalse()
+        {
+            Console.WriteLine("\n[TEST] P2-115: the health flag can be FALSE at all");
+
+            var t = P2115Type();
+            Assert(t != null,
+                "BridgeFeedStatus exists and is reachable, so `feedConnected` is computed from "
+                + "connection state instead of `Account.All.Count > 0` -- an expression that is "
+                + "true on every running NT8 and therefore measures nothing");
+            if (t == null) return;
+
+            var answer = P2115Ask(
+                new[] { "Sim101", "Backtest" },
+                new[] { "Simulator", "Simulator" },
+                new[] { "Connected", "Connected" });
+
+            Assert(answer == false,
+                "with only Simulator connections the answer is FALSE. The shipped expression "
+                + "returned true here, and this is the whole defect: a status field that cannot "
+                + "report the bad state is a constant wearing the name of a measurement.");
+        }
+
+        /// <summary>The exact live observation that found it.</summary>
+        private static void TestP2_115_ADormantPlaybackConnectionIsNotAMarketFeed()
+        {
+            Console.WriteLine("\n[TEST] P2-115: a dormant Playback connection is not a market feed");
+
+            if (P2115Type() == null)
+            {
+                Assert(false, "BridgeFeedStatus exists so the Playback case can be asked at all");
+                return;
+            }
+
+            var answer = P2115Ask(
+                new[] { "Playback101", "Sim101", "TAKEPROFITPRO524207503" },
+                new[] { "Playback", "Simulator", "Provider31" },
+                new[] { "Connected", "Connected", "Disconnected" });
+
+            Assert(answer == false,
+                "Playback connected + broker disconnected reports FALSE. This is the state measured "
+                + "on the box on 2026-08-15: MNQ frozen eight days at volume 0, orders stalling at "
+                + "Initialized, and the health endpoint saying the feed was connected.");
+        }
+
+        /// <summary>
+        /// The negative half, and the one that stops the cheap fix. Returning a constant `false`
+        /// passes both tests above. A detector needs a negative test; so does a status field.
+        /// </summary>
+        private static void TestP2_115_ALiveBrokerConnectionStillReportsTrue()
+        {
+            Console.WriteLine("\n[TEST] P2-115: a live broker connection still reports TRUE");
+
+            if (P2115Type() == null)
+            {
+                Assert(false, "BridgeFeedStatus exists so the connected case can be asked at all");
+                return;
+            }
+
+            var answer = P2115Ask(
+                new[] { "Sim101", "TAKEPROFITPRO524207503" },
+                new[] { "Simulator", "Provider31" },
+                new[] { "Connected", "Connected" });
+
+            Assert(answer == true,
+                "a connected non-simulated provider reports TRUE. Without this a constant `false` "
+                + "would satisfy every other assertion here, which is the same trap P2-112's "
+                + "dispatcher test exists to close.");
+        }
+
+        /// <summary>
+        /// Fail closed. Null, blank and anything not positively identified as connected must not
+        /// read as a working feed -- P2-38's rule, at a reporting surface.
+        /// </summary>
+        private static void TestP2_115_AnUnknownConnectionStateFailsClosed()
+        {
+            Console.WriteLine("\n[TEST] P2-115: an unknown or absent connection state fails CLOSED");
+
+            if (P2115Type() == null)
+            {
+                Assert(false, "BridgeFeedStatus exists so the unknown-state case can be asked");
+                return;
+            }
+
+            var unknown = P2115Ask(
+                new[] { "TAKEPROFITPRO524207503" },
+                new[] { "Provider31" },
+                new[] { (string)null });
+            Assert(unknown == false, "a null connection status is not a connected feed");
+
+            var none = P2115Ask(new string[0], new string[0], new string[0]);
+            Assert(none == false,
+                "and no connections at all is FALSE rather than vacuously true -- `All` over an "
+                + "empty sequence is true, which is how the last instance of a class disarms its "
+                + "own gate");
+        }
+
+        /// <summary>
+        /// A SOURCE gate, labelled one because it proves less. `McpBridgeAddOn.cs` is in no test
+        /// build (P2-27), so the route that CALLS the class above cannot be executed by anything
+        /// here. Presence gates fail loudly; this one asserts the defective expression is gone AND
+        /// that the replacement is actually wired, because a value that is computed is not a value
+        /// that is used -- the weakness P1-105's and P2-109's batteries both found.
+        /// </summary>
+        private static void TestP2_115_TheRouteNoLongerDerivesTheFlagFromTheAccountCount()
+        {
+            Console.WriteLine("\n[TEST] P2-115: /api/health no longer derives the flag from the account count (source gate)");
+
+            var path = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(typeof(BridgeSourceTests).Assembly.Location),
+                "..", "..", "..", "..", "addons", "McpBridgeAddOn.cs"));
+            if (!File.Exists(path))
+                path = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "addons", "McpBridgeAddOn.cs"));
+
+            Assert(File.Exists(path), "McpBridgeAddOn.cs is readable at " + path);
+            if (!File.Exists(path)) return;
+
+            var raw = File.ReadAllText(path);
+            var code = System.Text.RegularExpressions.Regex.Replace(raw, @"//[^\r\n]*", "");
+
+            Assert(!code.Contains("connectedToFeed = accountCount > 0"),
+                "the health route no longer computes `feedConnected` from the account count");
+
+            Assert(code.Contains("BridgeFeedStatus"),
+                "and it USES BridgeFeedStatus. Asserting only that the old expression is gone would "
+                + "pass if the field had simply been hardcoded to true, which is the defect with "
+                + "the arithmetic removed.");
+        }
+
         public static int Run()
         {
             Console.WriteLine("====================================================");
@@ -469,6 +633,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1_80_NoWritePathPersistsRiskConfigNothingReads();
             TestUi7_NoCopierWriteBranchDereferencesARefusal();
             TestP1_88_AnUnrecognisedCopierActionIsNotReportedAsAWrite();
+            TestP2_115_TheHealthFlagCanBeFalse();
+            TestP2_115_ADormantPlaybackConnectionIsNotAMarketFeed();
+            TestP2_115_ALiveBrokerConnectionStillReportsTrue();
+            TestP2_115_AnUnknownConnectionStateFailsClosed();
+            TestP2_115_TheRouteNoLongerDerivesTheFlagFromTheAccountCount();
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();
