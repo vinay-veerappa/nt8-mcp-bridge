@@ -389,7 +389,7 @@ export const TOOLS = [
   // working order, and confirmDisruptive is how you override that deliberately.
   {
     name: 'nt_connection',
-    description: 'List NinjaTrader connections with their live status, or connect/disconnect one. This is the detail behind nt_health\'s feedConnected -- each row carries countsTowardMarketData from the same predicate. ⚠️ disconnect severs the path by which open positions are managed, and is REFUSED while anything on the connection is live unless confirmDisruptive is set.',
+    description: 'List NinjaTrader connections with their live status, or connect/disconnect one. Status now also lists the CONFIGURED-but-not-instantiated connections from Config.xml (each carries configured/present flags) so the operator can see every broker on the box, not just the ones carrying accounts. This is the detail behind nt_health\'s feedConnected -- each row carries countsTowardMarketData from the same predicate. ⚠️ disconnect severs the path by which open positions are managed, and is REFUSED while anything on the connection is live unless confirmDisruptive is set. Connect/Disconnect are marshalled to the NT8 UI thread (the P2-112 family); a configured connection with no live Connection object yet is REFUSED with NOT_INSTANTIATED -- open the Connections window once to materialize it.',
     inputSchema: {
       type: 'object',
       properties: {

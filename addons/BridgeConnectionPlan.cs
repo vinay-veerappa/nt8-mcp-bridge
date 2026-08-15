@@ -64,11 +64,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             string first = null;
             if (available != null)
             {
+                string[] keys = RequestKeys(requested);
                 for (int i = 0; i < available.Length; i++)
                 {
                     if (available[i] == null) continue;
-                    if (string.Equals(available[i], requested.Trim(),
-                                      StringComparison.OrdinalIgnoreCase))
+                    // ⚠️ MATCH ON THE KEY, NOT THE RAW STRING -- see the matching header block
+                    // below. Measured live 2026-08-15, Kinetick's name carries a U+2013 EN DASH
+                    // and callers sent three spellings of it: the exact en dash, an ASCII hyphen,
+                    // and the cp1252 mojibake `â€“` (E2 80 93). Only the exact form resolved.
+                    // All three collapse to one normalized key here.
+                    if (KeyMatches(NormalizeName(RepairMojibake(available[i])), keys))
                     {
                         matches++;
                         // The CANONICAL spelling, not the caller's. This string is handed to the
@@ -134,17 +139,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
 
             var hits = new List<int>();
+            string[] keys = RequestKeys(requestedName);
             for (int i = 0; i < names.Length; i++)
             {
                 if (names[i] == null) continue;
-                if (!string.Equals(names[i], requestedName.Trim(), StringComparison.OrdinalIgnoreCase))
+                if (!KeyMatches(NormalizeName(RepairMojibake(names[i])), keys))
                     continue;
                 if (!string.IsNullOrWhiteSpace(requestedProvider))
                 {
                     string p = providers != null && i < providers.Length ? providers[i] : null;
-                    if (p == null || !string.Equals(p, requestedProvider.Trim(),
-                                                    StringComparison.OrdinalIgnoreCase))
-                        continue;
+                    if (!ProviderMatches(p, requestedProvider)) continue;
                 }
                 hits.Add(i);
             }
@@ -176,6 +180,144 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             sb.Append('.');
             refusal = sb.ToString();
+            return false;
+        }
+
+        // ============================================================================
+        // NORMALIZED NAME MATCHING -- THE FOOLPROOF HALF OF F-17.
+        //
+        // WHY. Measured live 2026-08-15: Kinetick's connection is named with a U+2013 EN
+        // DASH -- `Kinetick – End Of Day (Free)` -- and three spellings of it reached the
+        // tool: the exact en dash, an ASCII hyphen, and the UTF-8-bytes-read-as-cp1252
+        // mojibake `â€“` (E2 80 93). Only the exact form resolved; two of three were
+        // REFUSED. A name is a label a human types, so a comparison that cannot survive
+        // how a human types it is a wall, not a gate -- the P1-90 lesson, one level up.
+        //
+        // ⚠️ COMPARISON IS NORMALIZED; THE ANSWER IS STILL CANONICAL. `first = available[i]`
+        // is untouched -- the platform and the audit line get the available spelling, never
+        // the caller's. Normalization is the KEY, not the value.
+        //
+        // ⚠️ NO FUZZY MATCHING. Dash variants collapse to ASCII `-` and whitespace runs to
+        // one space; a name whose dash was DROPPED entirely still refuses (the negative
+        // control in the harness). Ambiguity is preserved: two connections differing only in
+        // dash style still BOTH match, so the request stays AMBIGUOUS and is refused --
+        // normalization makes a duplicate VISIBLE rather than hiding it.
+        // ============================================================================
+
+        // cp1252 is native on net48 (NT8). On net8.0-windows the test harness registers
+        // CodePagesEncodingProvider explicitly; if it is ever unavailable the mojibake half
+        // quietly degrades and the dash keys still work.
+        private static readonly Encoding Cp1252 = CreateCp1252();
+
+        private static Encoding CreateCp1252()
+        {
+            try
+            {
+                var enc = Encoding.GetEncoding(1252,
+                    EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+                // Sanity-check before trusting it: the en dash must encode as 0x96, the byte
+                // a mojibaked `â€“` decodes to (E2 80 93 in cp1252). Wrong code page, no repair.
+                if (enc.GetBytes("\u2013").Length == 1 && enc.GetBytes("\u2013")[0] == 0x96)
+                    return enc;
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        // The UTF-8 bytes of an en dash, read as cp1252, are `â€“` (U+00E2 U+20AC U+201C).
+        // Repair: encode those characters back to cp1252 bytes, decode as UTF-8. Only accept
+        // the repair when it round-trips cleanly -- no U+FFFD -- so a legitimately non-ASCII
+        // name is left alone.
+        private static string RepairMojibake(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            Encoding enc = Cp1252;
+            if (enc == null) return name;
+            try
+            {
+                byte[] bytes = enc.GetBytes(name);
+                string repaired = Encoding.UTF8.GetString(bytes);
+                if (repaired.IndexOf('\uFFFD') >= 0) return name;
+                if (string.Equals(repaired, name, StringComparison.Ordinal)) return name;
+                return repaired;
+            }
+            catch (Exception) { return name; }
+        }
+
+        // Every dash a connection name can actually carry. Collapsing them to ASCII `-` is a
+        // mapping, not a guess: Kinetick's U+2013 en dash and a caller's U+002D hyphen are the
+        // same separator rendered differently.
+        private static bool IsDash(char c)
+        {
+            return c == '-' || (c >= '\u2010' && c <= '\u2015') || c == '\u2212'
+                || c == '\uFF0D' || c == '\uFE58' || c == '\uFE63';
+        }
+
+        // One canonical key for a name: dash variants -> ASCII `-`, whitespace runs -> one
+        // space, case folded by the caller. Mojibake repaired first so a corrupted spelling
+        // normalizes to the same key as the true one.
+        private static string NormalizeName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            var sb = new StringBuilder(name.Length);
+            bool pendingSpace = false;
+            foreach (char c in name)
+            {
+                if (char.IsWhiteSpace(c)) { pendingSpace = true; continue; }
+                if (pendingSpace && sb.Length > 0) sb.Append(' ');
+                pendingSpace = false;
+                sb.Append(IsDash(c) ? '-' : c);
+            }
+            return sb.ToString();
+        }
+
+        // The caller's name expands into the spellings that legitimately mean it: the
+        // mojibake-repaired form first, then the raw form. Each is a NORMALIZATION of the
+        // caller's string, never a different name.
+        private static string[] RequestKeys(string requested)
+        {
+            var keys = new List<string>(2);
+            AddKey(keys, NormalizeName(RepairMojibake(requested)));
+            AddKey(keys, NormalizeName(requested));
+            return keys.ToArray();
+        }
+
+        private static void AddKey(List<string> keys, string key)
+        {
+            if (key.Length == 0) return;
+            for (int i = 0; i < keys.Count; i++)
+                if (string.Equals(keys[i], key, StringComparison.OrdinalIgnoreCase)) return;
+            keys.Add(key);
+        }
+
+        private static bool KeyMatches(string normalized, string[] keys)
+        {
+            if (normalized == null || keys == null) return false;
+            for (int i = 0; i < keys.Length; i++)
+                if (string.Equals(normalized, keys[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// One connection can carry SEVERAL providers -- measured on this box, the single `TPT`
+        /// Connection object serves six accounts across `Simulator` and `Provider31`, and the
+        /// row reports that as the joined `Simulator+Provider31`.
+        ///
+        /// ⚠️ SO THE DISAMBIGUATOR MATCHES A MEMBER, NOT THE WHOLE STRING. Requiring equality
+        /// would refuse `provider: "Provider31"` against `"Simulator+Provider31"` with *no
+        /// connection ... with provider ... exists*, which is false and unfixable by the caller:
+        /// the only string that would work is one they have no reason to guess. A refusal has to
+        /// hand back something that satisfies it, and every provider the row NAMES qualifies.
+        /// </summary>
+        private static bool ProviderMatches(string rowProvider, string requested)
+        {
+            if (string.IsNullOrWhiteSpace(rowProvider)) return false;
+            string want = requested.Trim();
+            if (string.Equals(rowProvider, want, StringComparison.OrdinalIgnoreCase)) return true;
+            foreach (var part in rowProvider.Split('+'))
+                if (string.Equals(part.Trim(), want, StringComparison.OrdinalIgnoreCase))
+                    return true;
             return false;
         }
 

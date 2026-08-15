@@ -72,13 +72,12 @@ MUTANTS = [
      '            refusal = "no such connection.";'),
 
     (PLAN,
-     "name matching becomes case-SENSITIVE, so the operator's `provider31` stops resolving. Not\n"
-     "     dangerous, but it is the difference between a tool that works and one that is\n"
-     "     abandoned -- and the canonical-spelling contract goes with it",
-     '                    if (string.Equals(available[i], requested.Trim(),\n'
-     '                                      StringComparison.OrdinalIgnoreCase))',
-     '                    if (string.Equals(available[i], requested.Trim(),\n'
-     '                                      StringComparison.Ordinal))'),
+     "name matching becomes case-SENSITIVE on the normalized KEY, so `Kinetick - End Of Day`\n"
+     "     stops resolving the en-dash connection. Repointed 2026-08-15 with the F-17\n"
+     "     foolproofing: matching moved from raw names to normalized keys, so the anchor is\n"
+     "     now the single comparison point, KeyMatches",
+     '                if (string.Equals(normalized, keys[i], StringComparison.OrdinalIgnoreCase))',
+     '                if (string.Equals(normalized, keys[i], StringComparison.Ordinal))'),
 
     # ---- the safety decision, both directions --------------------------------------------
     (PLAN,
@@ -115,6 +114,21 @@ MUTANTS = [
      '                        + "can be neither moved nor cancelled from here");',
      '                parts.Add(workingOrders + " open position(s) to protect");'),
 
+    # ---- the normalized-key matching: F-17 foolproofing -------------------------------------
+    (PLAN,
+     "dash VARIANTS stop collapsing to ASCII '-', so `Kinetick - End Of Day` stops resolving the\n"
+     "     en-dash connection -- the exact spelling a human types. Killed by the ASCII-hyphen\n"
+     "     assert in TestF17_DashAndMojibakeVariantsOfANameResolve",
+     '                sb.Append(IsDash(c) ? \'-\' : c);',
+     '                sb.Append(c);'),
+
+    (PLAN,
+     "the mojibake-repaired spelling is dropped from the request keys, so the cp1252 `â€“`\n"
+     "     spelling of the en dash stops resolving -- the third spelling this fix exists for.\n"
+     "     Killed by the mojibake assert in TestF17_DashAndMojibakeVariantsOfANameResolve",
+     '            AddKey(keys, NormalizeName(RepairMojibake(requested)));',
+     '            AddKey(keys, NormalizeName(requested));'),
+
     # ---- the route wiring, via SOURCE gates (labelled -- they prove less) -----------------
     (BRIDGE,
      "SOURCE GATE: the disconnect stops consulting WouldStrand at all, so nothing stands between\n"
@@ -124,13 +138,21 @@ MUTANTS = [
      '            if (false)'),
 
     (BRIDGE,
-     "SOURCE GATE, the sharper one: TryResolve is still CALLED but its refusal is not returned,\n"
-     "     so an unresolvable name falls through. A value that is COMPUTED is not a value that is\n"
-     "     USED -- P1-105, P2-109 and P2-115 each shipped a gate that missed exactly this",
-     '            if (!BridgeConnectionPlan.TryResolve(req.Str("name"), names, out resolved, out refusal))\n'
+     "SOURCE GATE, the sharper one: TryResolveOne is still CALLED but its refusal is not\n"
+     "     returned, so an unresolvable OR ambiguous name falls through. A value that is COMPUTED\n"
+     "     is not a value that is USED -- P1-105, P2-109 and P2-115 each shipped a gate that\n"
+     "     missed exactly this.\n"
+     "     REPOINTED 2026-08-15: the resolver became TryResolveOne(name, provider) -> INDEX in the\n"
+     "     ambiguity fix, and this anchor matched 0 times in CI in that very commit. That is the\n"
+     "     gate working; the subject is unchanged, so it is repointed, never retired",
+     '            if (!BridgeConnectionPlan.TryResolveOne(req.Str("name"), req.Str("provider"),\n'
+     '                                                    targetNames, targetProviders,\n'
+     '                                                    out connIndex, out refusal))\n'
      '                return new { success = false, action, refused = true,\n'
      '                             error = "UNRESOLVED_CONNECTION", message = refusal };',
-     '            BridgeConnectionPlan.TryResolve(req.Str("name"), names, out resolved, out refusal);'),
+     '            BridgeConnectionPlan.TryResolveOne(req.Str("name"), req.Str("provider"),\n'
+     '                                                    targetNames, targetProviders,\n'
+     '                                                    out connIndex, out refusal);'),
 ]
 
 ORIGINALS = {p: open(p, encoding='utf-8').read() for p in {m[0] for m in MUTANTS}}

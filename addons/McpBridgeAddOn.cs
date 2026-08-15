@@ -4676,15 +4676,40 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// <summary>
         /// Snapshots every configured connection. `Connection.Connections` must be enumerated
         /// under its own lock -- NinjaTrader's own @BarTimer indicator does exactly this.
+        ///
+        /// ⚠️ IT EMITS TWO GRAINS, DELIBERATELY, BECAUSE TWO DIFFERENT QUESTIONS ARE ASKED OF IT.
+        /// `names`/`providers`/`statuses` are PROVIDER-grained -- one entry per provider present
+        /// on a connection -- because that is what `BridgeFeedStatus` needs: *is any CONNECTED
+        /// provider a non-simulated one*. `targetNames`/`targetProviders`/`targets` are
+        /// CONNECTION-grained: one entry per Connection object, providers joined.
+        ///
+        /// ⚠️ CONFLATING THEM WAS A LIVE DEFECT, found by driving the tool on 2026-08-15. The
+        /// resolver read the feed-grained arrays, so the single `TPT` connection -- ONE object,
+        /// six accounts, `Simulator` and `Provider31` -- appeared TWICE and `connect TPT` was
+        /// refused as AMBIGUOUS. The refusal was false and unsatisfiable: both entries name the
+        /// same object, so no provider value distinguishes anything. **An ambiguity alarm that
+        /// fires when nothing is ambiguous is the same failure as one that never fires** -- it
+        /// teaches the operator to pass `provider` reflexively, and a genuinely ambiguous case
+        /// then goes through on whatever they habitually type.
+        ///
+        /// `targets[i]` is the live object or NULL for a configured-but-not-instantiated row, so
+        /// the caller acts on the object the index identified and never re-searches by name. The
+        /// old second lookup is what let ambiguity back in after the resolver had ruled it out.
         /// </summary>
         private static List<object> SnapshotConnections(out string[] names,
                                                         out string[] providers,
-                                                        out string[] statuses)
+                                                        out string[] statuses,
+                                                        out string[] targetNames,
+                                                        out string[] targetProviders,
+                                                        out List<Connection> targets)
         {
             var rows = new List<object>();
             var nameList = new List<string>();
             var providerList = new List<string>();
             var statusList = new List<string>();
+            var targetNameList = new List<string>();
+            var targetProviderList = new List<string>();
+            targets = new List<Connection>();
 
             var byConnection = new Dictionary<string, List<Account>>(StringComparer.OrdinalIgnoreCase);
             // ⚠️ THE CONNECTION OBJECTS COME FROM THE ACCOUNTS, NOT FROM `Connection.Connections`.
@@ -4717,6 +4742,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (idx < 0) { order.Add(a.Connection); accountsFor.Add(new List<Account>()); idx = order.Count - 1; }
                 accountsFor[idx].Add(a);
             }
+
+            // F-17: the configured-connection catalog (Config.xml <ConnectOptions>), for
+            // VISIBILITY only -- no credential field is read (see BridgeConnectionCatalog.cs).
+            // Read fresh each call so a connection added in the Connections window appears
+            // immediately. Absent connections get a configured-only row below; present ones
+            // are flagged `configured` on their live row.
+            var catalog = LoadConfiguredConnections();
+            var configuredNames = new HashSet<string>(
+                catalog.Where(c => !string.IsNullOrWhiteSpace(c.Name)).Select(c => c.Name),
+                StringComparer.OrdinalIgnoreCase);
 
             for (int i = 0; i < order.Count; i++)
             {
@@ -4756,6 +4791,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 { nameList.Add(cname); statusList.Add(cstatus); providerList.Add(provArr[k]); }
                 if (provArr.Length > 1) providerList[providerList.Count - provArr.Length] = provArr[0];
 
+                // The CONNECTION grain: exactly one entry per Connection object, carrying the
+                // object itself so the caller never re-finds it by name.
+                targetNameList.Add(cname);
+                targetProviderList.Add(provider);
+                targets.Add(c);
+
                 rows.Add(new
                 {
                     name = cname,
@@ -4765,15 +4806,73 @@ namespace NinjaTrader.NinjaScript.AddOns
                     accountCount = accts.Count,
                     openPositions = openPositions,
                     workingOrders = workingOrders,
+                    configured = configuredNames.Contains(cname),
+                    present = true,
                     // Named so a reader can see WHY feedConnected reads as it does.
                     countsTowardMarketData = BridgeFeedStatus.IsMarketDataConnected(nm, provArr, stat)
                 });
             }
 
+            // Configured connections with no live object get a configured-only row. This is
+            // the whole point of the catalog: eight brokers are configured on the box and only
+            // the two that carry accounts were visible before. Their names join the resolve
+            // array so `connect Apex` RESOLVES (and then refuses honestly with
+            // NOT_INSTANTIATED -- see HandleConnection), and their status is always the
+            // non-connected literal, which the feed predicate correctly ignores.
+            foreach (var cfg in BridgeConnectionCatalog.Absent(catalog, nameList))
+            {
+                var prov = string.IsNullOrWhiteSpace(cfg.Provider) ? null : cfg.Provider;
+                rows.Add(new
+                {
+                    name = cfg.Name,
+                    status = "Not Connected",
+                    provider = prov,
+                    providers = prov == null ? new string[0] : new[] { prov },
+                    accountCount = 0,
+                    openPositions = 0,
+                    workingOrders = 0,
+                    configured = true,
+                    present = false,
+                    countsTowardMarketData = false
+                });
+                nameList.Add(cfg.Name);
+                statusList.Add("Not Connected");
+                providerList.Add(prov);
+
+                // A configured row is RESOLVABLE with a NULL target: the caller must be able to
+                // name Apex and be told NOT_INSTANTIATED, which is a different and more useful
+                // answer than "no connection named 'Apex' exists" on a box where it plainly does.
+                targetNameList.Add(cfg.Name);
+                targetProviderList.Add(prov);
+                targets.Add(null);
+            }
+
             names = nameList.ToArray();
             providers = providerList.ToArray();
             statuses = statusList.ToArray();
+            targetNames = targetNameList.ToArray();
+            targetProviders = targetProviderList.ToArray();
             return rows;
+        }
+
+        /// <summary>
+        /// Config.xml &lt;ConnectOptions&gt; is the authoritative configured-connection inventory
+        /// (the sqlite DB has no connection table and no Connections.xml exists). Never throws:
+        /// a missing or corrupt file yields an empty catalog and the account-derived snapshot
+        /// is unchanged.
+        /// </summary>
+        private static List<BridgeConfiguredConnection> LoadConfiguredConnections()
+        {
+            try
+            {
+                string configPath = Path.Combine(Globals.UserDataDir, "Config.xml");
+                if (!File.Exists(configPath)) return new List<BridgeConfiguredConnection>();
+                return BridgeConnectionCatalog.Parse(File.ReadAllText(configPath));
+            }
+            catch
+            {
+                return new List<BridgeConfiguredConnection>();
+            }
         }
 
         private static bool OccupiesSlotForBridge(OrderState s)
@@ -4793,8 +4892,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
-                string[] names, providers, statuses;
-                var rows = SnapshotConnections(out names, out providers, out statuses);
+                string[] names, providers, statuses, targetNames, targetProviders;
+                List<Connection> targets;
+                var rows = SnapshotConnections(out names, out providers, out statuses,
+                                               out targetNames, out targetProviders, out targets);
                 return new
                 {
                     success = true,
@@ -4830,64 +4931,50 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (action == "status") return ListConnections();
 
-            string[] names, providers, statuses;
-            SnapshotConnections(out names, out providers, out statuses);
+            string[] names, providers, statuses, targetNames, targetProviders;
+            List<Connection> targets;
+            SnapshotConnections(out names, out providers, out statuses,
+                                out targetNames, out targetProviders, out targets);
 
-            // ⚠️ RESOLVE TO AN INDEX, NOT A NAME. `TPT` is two different connections on this box,
-            // so a name alone cannot identify one and `provider` is the disambiguator. Resolving
-            // to a string and then re-searching by that string is how the ambiguity came back at
-            // the second lookup.
+            // ⚠️ RESOLVE AGAINST THE CONNECTION GRAIN, NOT THE FEED GRAIN. Reading the
+            // provider-grained arrays here was a measured defect: the ONE `TPT` connection object
+            // carries `Simulator` and `Provider31`, so it appeared twice and `connect TPT` was
+            // refused as AMBIGUOUS between two entries naming the same object. See
+            // SnapshotConnections for why the two grains exist and must not be crossed.
+            //
+            // ⚠️ AND THE INDEX YIELDS THE OBJECT. Resolving to a string and then re-searching for
+            // it is how ambiguity came back at the second lookup after the resolver had already
+            // ruled it out -- the previous version of this method did exactly that, plus a
+            // `Connection.Connections` fallback that is MEASURED to enumerate zero rows from this
+            // thread. Both are gone: `targets[connIndex]` is the object the resolver chose.
             int connIndex; string refusal;
             if (!BridgeConnectionPlan.TryResolveOne(req.Str("name"), req.Str("provider"),
-                                                    names, providers, out connIndex, out refusal))
+                                                    targetNames, targetProviders,
+                                                    out connIndex, out refusal))
                 return new { success = false, action, refused = true,
                              error = "UNRESOLVED_CONNECTION", message = refusal };
-            string resolved = names[connIndex];
-            string resolvedProvider = providers != null && connIndex < providers.Length
-                ? providers[connIndex] : null;
+            string resolved = targetNames[connIndex];
+            Connection target = targets[connIndex];
 
-            // Same source as the read, for the same reason: `Connection.Connections` yields
-            // nothing from this thread, and an account's own `Connection` reference is the object
-            // the platform actually uses.
-            // Match on name AND provider, so the object picked is the one the index identified.
-            Connection target = null;
+            if (target == null)
+                // A name that RESOLVED via the Config.xml catalog but has no live Connection
+                // object. Deliberately NOT "no such connection": it is configured, it is on the
+                // box, and saying otherwise would be a false statement about the platform. NT8
+                // materializes these only when the Connections window touches them; the
+                // credential-reconstruction route that would skip that step is deferred on
+                // purpose (see BridgeConnectionCatalog.cs).
+                return new { success = false, action, connection = resolved, refused = true,
+                             error = "NOT_INSTANTIATED",
+                             message = "'" + resolved + "' is configured in Config.xml but has no "
+                                 + "live Connection object on this box. Open the Connections window "
+                                 + "once to materialize it, then connect." };
+
             int openPositions = 0, workingOrders = 0;
             foreach (Account a in Account.All)
             {
-                if (a == null || a.Connection == null || a.Connection.Options == null) continue;
-                if (!string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                if (!string.IsNullOrEmpty(resolvedProvider)
-                    && !string.Equals(a.Provider.ToString(), resolvedProvider, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                target = a.Connection; break;
-            }
-            if (target == null)
-            {
-                try
-                {
-                    lock (Connection.Connections)
-                    {
-                        foreach (Connection c in Connection.Connections)
-                        {
-                            if (c == null || c.Options == null) continue;
-                            if (string.Equals(c.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
-                            { target = c; break; }
-                        }
-                    }
-                }
-                catch { }
-            }
-            if (target == null)
-                return new { success = false, action, refused = true,
-                             error = "UNRESOLVED_CONNECTION",
-                             message = "'" + resolved + "' resolved but is no longer present." };
-
-            foreach (Account a in Account.All)
-            {
-                if (a == null || a.Connection == null || a.Connection.Options == null) continue;
-                if (!string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
-                    continue;
+                // Reference identity, the same key the snapshot groups by -- a name comparison
+                // here would re-introduce the merge that keying on `Options.Name` caused.
+                if (a == null || !ReferenceEquals(a.Connection, target)) continue;
                 foreach (Position p in a.Positions)
                     if (p != null && Math.Abs(p.Quantity) > 0) openPositions++;
                 foreach (Order o in a.Orders)
@@ -4902,36 +4989,123 @@ namespace NinjaTrader.NinjaScript.AddOns
                              openPositions, workingOrders };
 
             string before = target.Status.ToString();
+            // The connection the call actually produced; the settle poll below reads THIS, not
+            // `target`, because Connection.Connect can return a different object than the one
+            // resolved from Account.All[].Connection (measured 2026-08-15). Declared outside the
+            // try so the poll after the catch can see it.
+            Connection acted = null;
             try
             {
-                // ⚠️ THE TWO HALVES ARE NOT SYMMETRIC, and nothing but the compiler would have
-                // said so. `Connect` is STATIC on the type and takes the saved options --
+                // ⚠️ UI-THREAD AFFINE -- the P2-112 family. Measured live 2026-08-15: the bare
+                // `Connection.Connect(target.Options)` on this HTTP thread returned without
+                // throwing and the connection stayed Disconnected. That is the exact shape of a
+                // UI-affine operation called from the wrong thread -- the call is made and never
+                // takes. Marshalling to Application.Current.Dispatcher is the fix, and
+                // `Disconnect` rides the same thread so both halves of the tool agree.
+                //
+                // ⚠️ THE TWO HALVES ARE NOT SYMMETRIC, and nothing but the compiler would
+                // have said so. `Connect` is STATIC on the type and takes the saved options --
                 // `Connection.Connect(ConnectOptions)` -- while `Disconnect` is an ordinary
                 // instance method. Reached in three steps: CS7036 (no parameterless overload),
                 // then CS0176 (cannot be called on an instance). This file is in no test build,
                 // so `nt_compile` is the only thing that could find any of it.
-                if (action == "connect") Connection.Connect(target.Options);
-                else target.Disconnect();
+                var connectionUiDispatcher = System.Windows.Application.Current?.Dispatcher;
+                if (connectionUiDispatcher == null)
+                    return new { success = false, action, connection = resolved, refused = false,
+                                 error = "NO_UI_DISPATCHER",
+                                 message = "Application.Current.Dispatcher is null; NT8 connection "
+                                     + "operations are UI-thread affine and cannot run from the "
+                                     + "HTTP thread." };
+                // ⚠️ InvokeAsync + a BOUNDED wait, never a bare blocking `Invoke`. A synchronous
+                // `Dispatcher.Invoke` from the HTTP thread has no timeout: if NT8's UI thread is
+                // busy -- a modal dialog, a chart reload, its own connect prompt -- the listener
+                // thread parks forever and the bridge stops answering, including the panic
+                // flatten. A control that can hang the surface you would use to fix the platform
+                // is `P1-106`'s family, and this is the same answer: bound it.
+                //
+                // ⚠️ AND THE WAIT IS THE POINT. `InvokeAsync` alone would let this report on
+                // having QUEUED the work -- `P1-105` verbatim, where `positionClosed = true` sat
+                // on the line after an asynchronous call and recorded only that control reached
+                // it. Waiting on the operation's Task distinguishes three genuinely different
+                // outcomes: the lambda THREW, it never RAN, or it ran and the settle poll below
+                // reports what actually happened to the status.
+                // ⚠️ THE CREDENTIAL ROUTE -- MEASURED, not assumed, 2026-08-15. Passing the live
+                // `target.Options` (from Account.All[].Connection) reached Tradovate.Adapter.Connect
+                // with user='' even though that object provably carried the decrypted credential,
+                // while the menu's Gui.ControlCenter.OnConnect connected cleanly. The difference
+                // is the OPTIONS OBJECT: `Connection.Connect` decrypts the credential from the
+                // CANONICAL `Core.Globals.ConnectOptions` entry keyed by Name, and does not
+                // forward credential fields from an options object you pass it. Resolving from
+                // Core.Globals.ConnectOptions -- the documented pattern -- makes the tool connect
+                // exactly as the menu does, which is the whole point of the tool.
+                //
+                // ⚠️ THE SETTLE POLL BELOW READS THE RETURNED CONNECTION, NOT `target`.
+                // `Connection.Connect` may return a DIFFERENT Connection object than the one
+                // `target` (resolved from Account.All[].Connection) points at, and the pre-connect
+                // object stayed Disconnected while the new one Connected. Measured 2026-08-15:
+                // `POST connect TPT` answered `settled:false, statusAfter:Disconnected` while
+                // `GET /api/connections` already read `Connected` -- because the poll read the
+                // stale object. Polling what the call actually produced is `P1-105`'s rule.
+                var op = connectionUiDispatcher.InvokeAsync(() =>
+                {
+                    if (action == "connect")
+                    {
+                        ConnectOptions connectOptions = null;
+                        lock (Core.Globals.ConnectOptions)
+                            connectOptions = Core.Globals.ConnectOptions
+                                .FirstOrDefault(o => o != null
+                                    && string.Equals(o.Name, resolved,
+                                        StringComparison.OrdinalIgnoreCase));
+                        // Fallback keeps the tool usable for providers whose canonical entry is
+                        // absent; the credential route above is what makes a real broker connect.
+                        if (connectOptions == null) connectOptions = target.Options;
+                        acted = Connection.Connect(connectOptions) ?? target;
+                    }
+                    else { target.Disconnect(); acted = target; }
+                });
+                if (!op.Task.Wait(TimeSpan.FromSeconds(5)))
+                    return new { success = false, action, connection = resolved, refused = false,
+                                 error = "UI_THREAD_BUSY",
+                                 message = "the " + action + " was queued to NT8's UI thread but that "
+                                     + "thread did not run it within 5s (a modal dialog or a busy "
+                                     + "chart will do this). Nothing was changed by this call.",
+                                 statusBefore = before };
             }
             catch (Exception ex)
             {
+                // ⚠️ UNWRAP. Waiting on a Task republishes the real fault inside an
+                // AggregateException, whose own Message is the useless "One or more errors
+                // occurred." -- so the honest cause would have been swallowed by the very code
+                // that exists to report it.
+                var agg = ex as AggregateException;
+                var real = agg != null && agg.InnerExceptions.Count > 0
+                    ? agg.InnerExceptions[0] : ex;
                 return new { success = false, action, connection = resolved, refused = false,
-                             error = "CONNECTION_CALL_THREW", message = ex.Message, statusBefore = before };
+                             error = "CONNECTION_CALL_THREW",
+                             message = real.GetType().Name + ": " + real.Message,
+                             statusBefore = before };
             }
 
-            // Bounded settle poll. Stops as soon as the status changes; never blocks the listener
-            // for long. The reported status is READ, not assumed.
+            // Bounded settle poll. Stops as soon as the status reaches the terminal state; never blocks
+            // the listener for long. The reported status is READ, not assumed. Reads the
+            // connection the call actually produced (`acted`) -- `target` can be a different
+            // object that never leaves its old state.
+            //
+            // ⚠️ BREAK ONLY ON THE TERMINAL STATE, NOT ON THE FIRST CHANGE. A connect goes
+            // Disconnected -> Connecting -> Connected, and `settled:false, statusAfter:Connecting`
+            // was measured live 2026-08-15 because the loop stopped at the first transition and
+            // then reported that the target had not been reached -- a false negative that made a
+            // working connect read as a failure.
             string after = before;
-            for (int i = 0; i < 40; i++)
+            bool reached = false;
+            for (int i = 0; i < 40 && !reached; i++)
             {
                 System.Threading.Thread.Sleep(100);
-                after = target.Status.ToString();
-                if (!string.Equals(after, before, StringComparison.OrdinalIgnoreCase)) break;
+                after = (acted != null ? acted.Status : target.Status).ToString();
+                reached = action == "connect"
+                    ? string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase)
+                    : !string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase);
             }
-
-            bool reached = action == "connect"
-                ? string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase)
-                : !string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase);
 
             return new
             {

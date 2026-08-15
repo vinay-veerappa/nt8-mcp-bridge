@@ -779,6 +779,73 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         /// <summary>
+        /// The FOOLPROOF half of F-17. Measured live 2026-08-15: Kinetick's connection is
+        /// named `Kinetick – End Of Day (Free)` with a U+2013 EN DASH, and THREE spellings of
+        /// it reached the tool -- the exact en dash, an ASCII hyphen, and the cp1252 mojibake
+        /// `â€“` (E2 80 93). Only the exact form resolved; two of three were REFUSED. The
+        /// resolver now matches on a normalized key, so all three spellings find the ONE
+        /// canonical connection.
+        ///
+        /// ⚠️ Normalization is NOT fuzzing. A name whose dash was DROPPED entirely still
+        /// refuses, and two connections differing only in dash style are still AMBIGUOUS --
+        /// normalization makes a duplicate visible rather than hiding it.
+        /// </summary>
+        private static void TestF17_DashAndMojibakeVariantsOfANameResolve()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] F-17: the en-dash connection resolves however the caller spells it");
+
+            var t = F17Type();
+            Assert(t != null,
+                "BridgeConnectionPlan exists, so connection control has a decision layer a test "
+                + "can execute rather than living entirely in the untestable route");
+            if (t == null) return;
+
+            // The canonical name, exactly as Kinetick carries it on this box.
+            var available = new[] { "Kinetick \u2013 End Of Day (Free)" };
+
+            // 1. The exact en dash -- the spelling the platform itself uses. Positive control.
+            var exact = F17Resolve("Kinetick \u2013 End Of Day (Free)", available);
+            Assert((bool)exact[0], "the exact en-dash spelling resolves");
+            Assert((string)exact[1] == available[0],
+                "and returns the CANONICAL en-dash spelling, not the caller's");
+
+            // 2. The ASCII hyphen -- what a human actually types. This is the spelling the raw
+            //    StringComparison.OrdinalIgnoreCase refused before the normalized key.
+            var hyphen = F17Resolve("Kinetick - End Of Day (Free)", available);
+            Assert((bool)hyphen[0], "the ASCII-hyphen spelling resolves the en-dash connection");
+            Assert((string)hyphen[1] == available[0],
+                "and still returns the canonical en-dash spelling -- the KEY is normalized, the ANSWER is not");
+
+            // 3. The mojibake: UTF-8 bytes E2 80 93 read as cp1252 = `â€“` (U+00E2 U+20AC U+201C).
+            //    This is what an MCP tool call actually produced live. It must repair and resolve.
+            var mojibake = F17Resolve("Kinetick \u00E2\u20AC\u201C End Of Day (Free)", available);
+            Assert((bool)mojibake[0], "the cp1252 mojibake `â€“` spelling repairs and resolves");
+            Assert((string)mojibake[1] == available[0],
+                "and returns the canonical en-dash spelling");
+
+            // ⚠️ NEGATIVE CONTROL -- normalization is NOT fuzzing. A name whose dash was
+            //    dropped entirely is mangled beyond repair and must STILL refuse. If this
+            //    resolved, the normalization would be guessing, which is P1-90 verbatim.
+            var dropped = F17Resolve("Kinetick End Of Day (Free)", available);
+            Assert((bool)dropped[0] == false,
+                "a name with the dash dropped entirely is STILL refused -- normalization collapses "
+                + "dash VARIANTS, it does not invent them");
+
+            // ⚠️ Ambiguity survives normalization. Two connections differing only in dash style
+            //    are still two connections, and a name matching BOTH must stay AMBIGUOUS rather
+            //    than silently resolving to the first -- the TPT lesson, dash-style edition.
+            var two = F17Resolve("Kinetick - End Of Day (Free)",
+                new[] { "Kinetick \u2013 End Of Day (Free)", "Kinetick - End Of Day (Free)" });
+            Assert((bool)two[0] == false,
+                "two connections differing only in dash style are still AMBIGUOUS -- normalization "
+                + "makes the duplicate visible instead of hiding it");
+            var text = two[2] == null ? "" : two[2].ToString();
+            Assert(text.IndexOf("ambiguous", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and the refusal says AMBIGUOUS. Got: " + text);
+        }
+
+        /// <summary>
         /// ⚠️ A blank request is NOT a wildcard. On a path that DISCONNECTS, the failure
         /// directions are not symmetric -- `symbol: "M"` closing four instruments (P1-105) is the
         /// same shape, and here a blank name would mean "sever everything".
@@ -797,6 +864,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                     "a blank name (" + (blank == null ? "null" : "'" + blank + "'")
                     + ") is refused rather than matching everything -- on a disconnect path that "
                     + "would sever every connection on the box");
+                // ⚠️ THE GUARD'S DELIVERABLE IS THE MESSAGE, not the boolean. With the blank
+                // guard removed the loop still refuses (no name matches ""), so `ok == false`
+                // passes under the mutant -- but the operator is told "no connection named ''
+                // exists", which reads like a typo, not like a safety boundary. Assert the
+                // warning that says blank is NOT a wildcard.
+                Assert(r[2] != null && r[2].ToString().IndexOf("wildcard", StringComparison.OrdinalIgnoreCase) >= 0,
+                    "and the refusal says blank is deliberately NOT a wildcard -- the warning that "
+                    + "makes a safety boundary read as one, not as a misspelling. Got: "
+                    + (r[2] ?? "(no refusal text)"));
             }
         }
 
@@ -900,8 +976,247 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "positive control: the refusal pattern still matches the shape it is about");
         }
 
+        // ================================================================================
+        // F-17 extension (2026-08-15): the configured-connection CATALOG. The box has EIGHT
+        // brokers in Config.xml <ConnectOptions> and the account-derived snapshot showed only
+        // the two carrying accounts, so the others were invisible and unconnectable.
+        // BridgeConnectionCatalog.cs is visibility-only -- and must STAY that way, because it
+        // is reachable over HTTP:7890. These tests execute it for real (the P2-27 glob put it
+        // in this build the moment it existed) and one source assertion guards the marshalling.
+        // ================================================================================
+
+        // A faithful slice of the box's Config.xml <ConnectOptions>: the real connection names
+        // and option types, with FAKE credential blobs. The credential fields exist in the
+        // fixture precisely so the parse is proven not to read them.
+        private const string SampleConfigConnectOptions = @"<?xml version=""1.0"" encoding=""utf-8""?>
+<NinjaTrader>
+  <ConnectOptions>
+    <TradovateOptions>
+      <Name>Apex</Name>
+      <TypeName>NinjaTrader.Cbi.TradovateOptions</TypeName>
+      <Provider>Provider31</Provider>
+      <Mode>Live</Mode>
+      <AccountType>Simulation</AccountType>
+      <User>fake-user-blob</User>
+      <Password>fake-password-blob</Password>
+      <AccessToken>fake-access-token-blob</AccessToken>
+      <MdAccessToken>fake-md-access-token-blob</MdAccessToken>
+    </TradovateOptions>
+    <TradovateOptions>
+      <Name>LUCID</Name>
+      <TypeName>NinjaTrader.Cbi.TradovateOptions</TypeName>
+      <Provider>Provider31</Provider>
+      <Mode>Live</Mode>
+      <AccountType>Simulation</AccountType>
+      <User>fake-user-blob</User>
+      <AccessToken>fake-access-token-blob</AccessToken>
+    </TradovateOptions>
+    <TradovateOptions>
+      <Name>TPT</Name>
+      <TypeName>NinjaTrader.Cbi.TradovateOptions</TypeName>
+      <Provider>Provider31</Provider>
+      <Mode>Live</Mode>
+      <AccountType>Simulation</AccountType>
+      <User>fake-user-blob</User>
+      <AccessToken>fake-access-token-blob</AccessToken>
+    </TradovateOptions>
+    <TradovateOptions>
+      <Name>Tradeify</Name>
+      <TypeName>NinjaTrader.Cbi.TradovateOptions</TypeName>
+      <Provider>Provider31</Provider>
+      <Mode>Live</Mode>
+      <AccountType>Simulation</AccountType>
+      <User>fake-user-blob</User>
+      <AccessToken>fake-access-token-blob</AccessToken>
+    </TradovateOptions>
+    <SchwabOptions>
+      <Name>My Schwab</Name>
+      <TypeName>NinjaTrader.Cbi.SchwabOptions</TypeName>
+      <Provider>Provider32</Provider>
+      <Mode>Live</Mode>
+      <User>fake-schwab-user</User>
+      <AccessToken>fake-refresh-token-blob</AccessToken>
+    </SchwabOptions>
+    <KinetickEODOptions>
+      <Name>Kinetick – End Of Day (Free)</Name>
+      <TypeName>NinjaTrader.Cbi.KinetickEODOptions</TypeName>
+      <Provider>Provider7</Provider>
+      <Mode>Free</Mode>
+      <User>fake-kinetick-user</User>
+      <Password>fake-kinetick-password</Password>
+    </KinetickEODOptions>
+    <PlaybackOptions>
+      <Name>Playback</Name>
+      <TypeName>NinjaTrader.Cbi.PlaybackOptions</TypeName>
+      <Provider>Playback</Provider>
+      <Mode>Playback</Mode>
+    </PlaybackOptions>
+    <SimulatorOptions>
+      <Name>Simulated Data Feed</Name>
+      <TypeName>NinjaTrader.Cbi.SimulatorOptions</TypeName>
+      <Provider>Simulator</Provider>
+      <Mode>Simulator</Mode>
+    </SimulatorOptions>
+  </ConnectOptions>
+</NinjaTrader>";
+
+        private static void TestF17_CatalogParsesConfiguredConnectionsWithoutReadingCredentials()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] F-17: the catalog parses Config.xml <ConnectOptions>, visibility only");
+
+            var rows = BridgeConnectionCatalog.Parse(SampleConfigConnectOptions);
+            Assert(rows.Count == 8, string.Format(
+                "all eight configured connections are catalogued (found {0})", rows.Count));
+
+            var names = rows.Select(r => r.Name).ToList();
+            foreach (var expected in new[]
+                {
+                    "Apex", "LUCID", "TPT", "Tradeify", "My Schwab",
+                    "Kinetick – End Of Day (Free)", "Playback", "Simulated Data Feed"
+                })
+                Assert(names.Contains(expected), "the catalog names '" + expected + "'");
+
+            var apex = rows.First(r => r.Name == "Apex");
+            Assert(apex.TypeName == "NinjaTrader.Cbi.TradovateOptions"
+                    && apex.Provider == "Provider31" && apex.Mode == "Live"
+                    && apex.AccountType == "Simulation",
+                "Apex carries type/provider/mode/accountType from the XML");
+
+            Assert(rows.First(r => r.Name == "Playback").Provider == "Playback",
+                "Playback is catalogued as the Playback provider");
+            Assert(rows.First(r => r.Name == "My Schwab").Provider == "Provider32",
+                "My Schwab is catalogued as Provider32");
+            Assert(rows.First(r => r.Name == "Kinetick – End Of Day (Free)").Provider == "Provider7",
+                "Kinetick is catalogued as Provider7");
+
+            // The DTO is the whole contract of what this HTTP-reachable component may carry.
+            // If a future edit adds a credential field, this fails on the shape before any
+            // secret ever leaves Config.xml.
+            var fields = typeof(BridgeConfiguredConnection)
+                .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+                .Select(f => f.Name).ToList();
+            Assert(fields.Count == 5 && fields.OrderBy(f => f).SequenceEqual(
+                       new[] { "AccountType", "Mode", "Name", "Provider", "TypeName" }.OrderBy(f => f)),
+                string.Format("the catalog DTO exposes exactly Name/TypeName/Provider/Mode/AccountType "
+                    + "and nothing else (found: {0})", string.Join(",", fields)));
+            Assert(!fields.Any(f => f.IndexOf("Password", StringComparison.OrdinalIgnoreCase) >= 0
+                                     || f.IndexOf("Token", StringComparison.OrdinalIgnoreCase) >= 0
+                                     || string.Equals(f, "User", StringComparison.OrdinalIgnoreCase)
+                                     || string.Equals(f, "AccessToken", StringComparison.OrdinalIgnoreCase)),
+                "and none of those fields is a credential -- the DTO carries no secret by shape");
+
+            // Failure modes: the endpoint must never throw because its inventory file is bad.
+            Assert(BridgeConnectionCatalog.Parse(null).Count == 0, "null config -> empty catalog");
+            Assert(BridgeConnectionCatalog.Parse("").Count == 0, "blank config -> empty catalog");
+            Assert(BridgeConnectionCatalog.Parse("<this is not xml").Count == 0,
+                "corrupt config -> empty catalog, not a throw");
+            Assert(BridgeConnectionCatalog.Parse("<NinjaTrader></NinjaTrader>").Count == 0,
+                "no <ConnectOptions> section -> empty catalog");
+        }
+
+        private static void TestF17_CatalogAbsentKeepsOnlyConfiguredRows()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] F-17: absent() keeps only the configured connections with no live presence");
+
+            var catalog = BridgeConnectionCatalog.Parse(SampleConfigConnectOptions);
+            var absent = BridgeConnectionCatalog.Absent(catalog, new[] { "Playback", "TPT" });
+
+            Assert(absent.Count == 6,
+                string.Format("8 configured minus 2 present = 6 absent rows (got {0})", absent.Count));
+            Assert(absent.All(a => !string.Equals(a.Name, "Playback", StringComparison.OrdinalIgnoreCase)
+                                    && !string.Equals(a.Name, "TPT", StringComparison.OrdinalIgnoreCase)),
+                "the present names are excluded, case-insensitively");
+            Assert(absent.Any(a => a.Name == "Apex" && a.Provider == "Provider31"),
+                "an absent Provider31 broker (Apex) is in the absent set");
+
+            Assert(BridgeConnectionCatalog.Absent(catalog, null).Count == 8,
+                "no present names -> every configured row is absent");
+            Assert(BridgeConnectionCatalog.Absent(null, new[] { "anything" }).Count == 0,
+                "null catalog -> nothing absent");
+        }
+
+        private static void TestF17_TheConnectionCallIsMarshalledToTheUiDispatcher()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] F-17: connect/disconnect is marshalled to the UI dispatcher (P2-112 family)");
+
+            // Measured live 2026-08-15: the bare `Connection.Connect(target.Options)` on the HTTP
+            // thread returned without throwing and the connection stayed Disconnected -- a
+            // UI-affine call from the wrong thread. The fix is the dispatcher block; this source
+            // assertion is the bridge's own version of P2-112's test, because McpBridgeAddOn.cs
+            // is in no executable build (tests/README.md) and nt_compile is the only executor.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            var invoke = Regex.Match(code,
+                @"connectionUiDispatcher\.InvokeAsync\(\(\) =>\s*\{(.*?)\}\);",
+                RegexOptions.Singleline);
+            Assert(invoke.Success,
+                "the connection call sits inside a connectionUiDispatcher.InvokeAsync(() => ...) block");
+
+            // ⚠️ GUARD THE NEGATIVE CONTROL. On the first run of the InvokeAsync change this
+            // method did not FAIL, it CRASHED the whole harness: the match had gone false, so
+            // Groups[0].Value was "" and String.Replace threw ArgumentException, taking every
+            // later test with it. A gate that dies where it meant to report red tells you less
+            // than one that reports red, and it stops the run.
+            string codeWithoutInvoke = invoke.Success
+                ? code.Replace(invoke.Groups[0].Value, "")
+                : code;
+            Assert(!codeWithoutInvoke.Contains("Connection.Connect(target.Options)"),
+                "no bare Connection.Connect(target.Options) exists outside the marshalled block");
+            Assert(!codeWithoutInvoke.Contains("target.Disconnect()"),
+                "no bare target.Disconnect() exists outside the marshalled block");
+
+            if (invoke.Success)
+            {
+                var inner = invoke.Groups[1].Value;
+                // ⚠️ REPOINTED 2026-08-15, same commit as the credential route. The connect half
+                // used to pass `target.Options` (the live Account.All object) -- which reached
+                // Tradovate.Adapter.Connect with user='' even though it carried the decrypted
+                // credential, while the menu connected cleanly. The fix resolves from the
+                // CANONICAL `Core.Globals.ConnectOptions` entry keyed by Name (the documented
+                // pattern); `Connection.Connect` decrypts the credential from THAT object, and
+                // does not forward credential fields from one you pass it. The anchor asserting
+                // `Connection.Connect(target.Options)` matched 0 times in that very commit -- the
+                // gate working; the subject is unchanged, so it is repointed, never retired.
+                Assert(inner.Contains("Connection.Connect(connectOptions)"),
+                    "the connect half calls Connection.Connect(connectOptions), the canonical-resolved options");
+                Assert(inner.Contains("Core.Globals.ConnectOptions"),
+                    "the connect half resolves from Core.Globals.ConnectOptions -- the credential route");
+                Assert(inner.Contains("target.Disconnect()"),
+                    "and the disconnect half still calls target.Disconnect()");
+            }
+
+            Assert(Regex.IsMatch(code, @"var connectionUiDispatcher\s*=\s*System\.Windows\.Application\.Current\?\.Dispatcher"),
+                "the dispatcher is Application.Current.Dispatcher, not a new thread");
+
+            // ⚠️ THE BOUND IS THE LOAD-BEARING HALF, so it gets its own assertion rather than
+            // riding along on "a dispatcher is mentioned". A blocking `Dispatcher.Invoke` has no
+            // timeout: a busy NT8 UI thread parks the HTTP listener forever and the bridge stops
+            // answering, panic flatten included. `InvokeAsync` alone has the opposite failure --
+            // it would report on having QUEUED the work (`P1-105`). Only the bounded WAIT is
+            // both non-hanging and honest, so assert the wait, not the marshalling.
+            Assert(Regex.IsMatch(code, @"op\.Task\.Wait\(TimeSpan\.FromSeconds\(\d+\)\)"),
+                "the queued operation is waited on with a BOUNDED timeout");
+            Assert(Regex.IsMatch(code,
+                    // ⚠️ `[^)]*` for the argument was wrong on the first run, and quietly:
+                    // TimeSpan.FromSeconds(5) contains a `)`, so the class stopped early and the
+                    // assertion failed on correct code. A negative character class cannot span a
+                    // nested call -- match the nesting explicitly.
+                    @"if\s*\(\s*!\s*op\.Task\.Wait\(TimeSpan\.FromSeconds\(\d+\)\)\s*\)\s*return[\s\S]{0,300}?UI_THREAD_BUSY"),
+                "and a wait that times out RETURNS UI_THREAD_BUSY -- computed is not used");
+            Assert(!Regex.IsMatch(code, @"connectionUiDispatcher\.Invoke\("),
+                "no unbounded blocking Dispatcher.Invoke on the connection path");
+        }
+
         public static int Run()
         {
+            // cp1252 is NOT native on net8.0-windows, and F-17's mojibake repair depends on it
+            // (NT8, net48, has it natively). Registering here is what lets the harness exercise
+            // the SAME repair path the live addon runs.
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
             Console.WriteLine("====================================================");
             Console.WriteLine("nt8-mcp-bridge test harness");
             Console.WriteLine("====================================================");
@@ -920,9 +1235,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2_115_AnUnknownConnectionStateFailsClosed();
             TestP2_115_TheRouteNoLongerDerivesTheFlagFromTheAccountCount();
             TestF17_AnUnknownConnectionIsRefusedNamingTheRealOnes();
+            TestF17_DashAndMojibakeVariantsOfANameResolve();
             TestF17_ABlankConnectionNameIsNotAWildcard();
             TestF17_DisconnectingIsRefusedWhileAnythingIsLive();
             TestF17_TheDisconnectRouteActsOnTheRefusalRatherThanComputingIt();
+            TestF17_CatalogParsesConfiguredConnectionsWithoutReadingCredentials();
+            TestF17_CatalogAbsentKeepsOnlyConfiguredRows();
+            TestF17_TheConnectionCallIsMarshalledToTheUiDispatcher();
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();
@@ -976,7 +1295,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 57;
+            const int declared = 61;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 

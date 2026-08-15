@@ -38,5 +38,9 @@
     -->
     <Compile Include="../addons/*.cs" Exclude="../addons/McpBridgeAddOn.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!-- cp1252 is native on net48 (NT8) but NOT on net8.0-windows. F-17's mojibake repair
+         reads the code page, so the harness that exercises BridgeConnectionPlan must be
+         able to. Registered in Run() via CodePagesEncodingProvider.Instance. -->
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
   </ItemGroup>
 </Project>

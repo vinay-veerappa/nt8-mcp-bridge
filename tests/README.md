@@ -26,6 +26,13 @@ the shape of what runs has changed as well as the count -- which is the part wor
   back to `Sim101`, then to any account at all.
 - **`addons/CopierEnforcementView.cs`** (`P3-34`). What `GET /api/copier/config` REPORTS
   about a relationship: whether it is enforcing, and if not, why.
+- **`addons/BridgeConnectionPlan.cs` + `addons/BridgeConnectionCatalog.cs`** (`F-17`). The
+  connection-name resolution that normalizes en-dash/mojibake spellings and the Config.xml
+  configured-connection catalog that gives the endpoint its `configured`/`present` rows.
+  The catalog names no NT8 type; the plan's helpers (`NormalizeName`, `RepairMojibake`,
+  `RequestKeys`, `KeyMatches`) are exercised over ASCII-hyphen, en-dash, and cp1252-mojibake
+  spellings, and the refusal texts that distinguish "no such connection" from
+  "configured but not instantiated" from "genuinely ambiguous" are asserted as strings.
 
 Both are their own files for one reason: they name **no NinjaTrader type**, so this project
 compiles and runs them without a stub. That is the cheap, repeatable half of `P2-27` --

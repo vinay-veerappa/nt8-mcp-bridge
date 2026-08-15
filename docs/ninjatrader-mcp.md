@@ -95,6 +95,7 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | Tool Name | Endpoint | Description |
 | :--- | :--- | :--- |
 | `nt_health` | `GET /api/health` | Check NT8 AddOn connection, version, auth, and dev mode status. |
+| `nt_connection` | `GET/POST /api/connection` | List every connection (incl. configured-but-not-instantiated Config.xml rows) or connect/disconnect one. Name resolution is normalized — en-dash, ASCII-hyphen, and cp1252-mojibake spellings resolve to the canonical name; a configured connection with no live object is refused `NOT_INSTANTIATED`. Connect/Disconnect marshal to the NT8 UI thread; disconnect while live requires `confirmDisruptive`. |
 | `nt_accounts` | `GET /api/account` | List accounts, cash balances, buying power, and total equity. |
 | `nt_positions` | `GET /api/positions` | Query open market positions with live P&L per account. |
 | `nt_orders` | `GET /api/orders` | List active/working orders with pagination (`limit`, `offset`). |

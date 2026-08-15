@@ -127,6 +127,7 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | Tool | Endpoint | Description |
 |------|----------|-------------|
 | `nt_health` | `GET /api/health` | Bridge status, version, dev mode, account count, feed connected |
+| `nt_connection` | `GET/POST /api/connection` | List connections (incl. configured-but-not-instantiated Config.xml rows with `configured`/`present` flags) or connect/disconnect one. Name resolution is normalized: en-dash, ASCII-hyphen, and cp1252-mojibake spellings all resolve to the canonical name; a configured connection with no live `Connection` object is refused `NOT_INSTANTIATED`. Connect/Disconnect marshal to the NT8 UI thread; `disconnect` is REFUSED while anything on the connection is live unless `confirmDisruptive` is set. |
 | `nt_accounts` | `GET /api/account` | List accounts with balances, PnL, buying power |
 | `nt_positions` | `GET /api/positions` | Open positions with market position, quantity, avg price, unrealized PnL |
 | `nt_orders` | `GET /api/orders?account=&limit=&offset=` | Working/historical orders with state, price, quantity |

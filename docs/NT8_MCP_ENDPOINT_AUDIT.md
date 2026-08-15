@@ -41,6 +41,8 @@ All order tests were placed on **Sim101** unless otherwise noted.
 | `/api/position/close` | POST | ✅ OK | `symbol`, optional `account` | Flattens position for symbol |
 | `/api/emergency-flatten` | POST | ✅ OK | `idempotencyKey`, optional `account`, `lockoutMinutes` | Atomic cancel+flatten+lockout |
 | `/api/lockout` | POST | ✅ OK | optional `account`, `minutes`, `query` | Engage or query lockout |
+| `/api/connection` | GET/POST | ✅ OK | `action`, `name`, optional `provider` | List/connect/disconnect connections. GET snapshots every configured connection incl. Config.xml catalog rows (`configured`/`present` flags). POST resolves against the CONNECTION grain (one entry per Connection object) — NOT the provider grain, whose conflation made the single `TPT` object appear twice and refuse as AMBIGUOUS (fixed 2026-08-15). Name matching is normalized (en-dash/mojibake variants resolve to canonical); a configured-but-not-instantiated name resolves and refuses `NOT_INSTANTIATED`. Connect/Disconnect marshal to the NT8 UI thread (P2-112 family), `InvokeAsync` + 5s bounded wait; settle poll breaks only on the terminal state and reads the connection the call actually produced. |
+| `/api/connection` | POST | ✅ OK | `action=connect`, `name` | Connect by name (en-dash/ASCII-hyphen/mojibake variants resolve). Requires `confirmDisruptive` only on disconnect while live. |
 
 ---
 
