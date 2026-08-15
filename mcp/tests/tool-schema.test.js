@@ -388,3 +388,69 @@ test('P1-102: unlock REMOVES protection, so nothing about it may be defaulted', 
   assert.ok(/remove/i.test(tool.description) || /REMOVE/.test(tool.description),
     'the description says plainly that it removes protection');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-16: the JOIN between what is ADVERTISED and what is DISPATCHED.
+//
+// Every test above this line asks whether a schema is right. None of them asks
+// whether the tool it describes is REACHABLE. Those are two files -- `lib/tools.js`
+// advertises, `nt-mcp-server.js` dispatches -- and until now nothing compared them.
+//
+// That is `P2-109`'s exact shape at a new site. There, `tools.js` advertised
+// `account`, `limit` and `offset`, `nt-mcp-server.js` SENT all three, `GetOrders()`
+// was a clean read, and the line between them was `case "/api/orders": return
+// GetOrders();`, taking nothing. Every component was individually correct and
+// nothing reviewable in isolation was wrong.
+//
+// ⚠️ THE TWO DIRECTIONS FAIL DIFFERENTLY, and only one of them is loud:
+//
+//   advertised, not dispatched -> the client offers a tool, the call reaches the
+//     dispatcher's default branch, and the caller gets an error. Annoying, visible.
+//
+//   dispatched, not advertised -> THE TOOL IS INVISIBLE. It cannot be called by any
+//     client that reads tools/list, and nothing anywhere reports a problem. This is
+//     `P1-102` verbatim: /api/lockout existed on the addon for months with no tool in
+//     front of it, and `P2-103`'s two inventory surfaces had five mutation batteries
+//     keeping their payloads honest while no tool could reach them. The honesty was
+//     bought and was not being spent.
+//
+// Weigh the quiet failure above the loud one -- so this asserts BOTH directions, and
+// names which is which in the message.
+test('F-16: every advertised tool is dispatched, and every dispatched tool is advertised', () => {
+  const serverPath = path.resolve(__dirname, '..', 'nt-mcp-server.js');
+  const src = fs.readFileSync(serverPath, 'utf8');
+
+  // The dispatcher is one switch over the tool name. Read the case labels rather
+  // than importing the module: importing nt-mcp-server.js starts its stdin loop and
+  // hangs the test run, which is the reason lib/tools.js was extracted in the first
+  // place (F-16's own note said extraction had to come first -- it has).
+  const dispatched = new Set(
+    [...src.matchAll(/case\s+'(nt_[a-z0-9_]+)'\s*:/g)].map(m => m[1]));
+  const advertised = new Set(TOOLS.map(t => t.name));
+
+  // Positive control on the REGION, not on the code under test. If the regex ever
+  // stops matching -- a reformat, a switch replaced by a lookup table -- both
+  // difference sets go empty and this test passes while inspecting nothing. Five
+  // gates in the sibling repo have been caught exactly that way.
+  assert.ok(dispatched.size > 50,
+    `the dispatcher's case labels are still readable (found ${dispatched.size}); `
+    + 'if this drops, the regex has stopped matching and the two assertions below '
+    + 'are comparing against an empty set rather than proving anything');
+
+  const advertisedNotDispatched = [...advertised].filter(n => !dispatched.has(n)).sort();
+  const dispatchedNotAdvertised = [...dispatched].filter(n => !advertised.has(n)).sort();
+
+  assert.deepEqual(advertisedNotDispatched, [],
+    'these tools are advertised to the client and reach no handler: '
+    + advertisedNotDispatched.join(', '));
+
+  assert.deepEqual(dispatchedNotAdvertised, [],
+    'these tools are IMPLEMENTED AND INVISIBLE -- no client that reads tools/list can '
+    + 'call them, and nothing else reports it (P1-102, P2-103): '
+    + dispatchedNotAdvertised.join(', '));
+
+  // And the two counts agree with the exact-count gate above, so a tool added to both
+  // sides still has to be stated deliberately in one place.
+  assert.equal(dispatched.size, advertised.size,
+    'the dispatcher and the tool list are the same size');
+});
