@@ -4484,6 +4484,29 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        /// <summary>
+        /// P1-81. Whether the prop-firm rules can actually ACT, derived from the thing that
+        /// actually gates them.
+        ///
+        /// ⚠️ THIS ENDPOINT USED TO ANSWER `enforcing = cfg.ArmedForLive`, and that flag armed
+        /// NOTHING -- no prop rule ever read it. So `nt_prop_limits` has been answering "are the
+        /// prop-firm protections enforcing?" from a switch with no wiring behind it, in BOTH
+        /// directions: false while the rules were live on an armed guard, and true while they
+        /// were not. That is `F-9` at a third surface (what a rule REPORTS disagreeing with what
+        /// it DOES) and it is a consequence of P1-81 that the plan entry did not anticipate --
+        /// found only because deleting the field broke this file's compile.
+        ///
+        /// Derived from the GUARD, which is the single arming answer: the rules are enforcing
+        /// when the guard is armed AND in an acting mode. Same shape as `CopierEnforcementView`
+        /// for P3-34 -- the report is computed from the gate, so the two cannot drift.
+        /// </summary>
+        private static bool PropRulesAreEnforcing()
+        {
+            var guard = RiskGuardAddOn.Instance;
+            if (guard == null) return false;
+            return guard.IsArmed && guard.IsActingMode();
+        }
+
         private object PropLimits(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
@@ -4493,15 +4516,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (action.Equals("set", StringComparison.OrdinalIgnoreCase) || action.Equals("update", StringComparison.OrdinalIgnoreCase))
             {
                 var cfg = PropFirmProtectionSuite.Instance.ParseConfig(req);
-                if (cfg.ArmedForLive && !confirmLive)
-                {
-                    cfg.ArmedForLive = false;
-                }
+                // P1-81: the local disarm of `cfg.ArmedForLive` was here, mirroring the core's
+                // own gate. Both went with the field, which armed nothing.
                 PropFirmProtectionSuite.Instance.UpdateConfig(cfg, confirmLive);
                 PropFirmProtectionSuite.Instance.SaveToDisk(PropLimitsFile);
 
-                bool enforcing = cfg.ArmedForLive;
-                return new { success = true, action, persisted = true, loaded = true, enforcing = enforcing, config = cfg };
+                return new { success = true, action, persisted = true, loaded = true, enforcing = PropRulesAreEnforcing(), config = cfg };
             }
             else
             {
@@ -4522,8 +4542,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // write path above saves. A hand-edit to prop_limits.json is picked up at
                 // the next NT8 start, deliberately not by a reader.
                 var cfg = PropFirmProtectionSuite.Instance.Config;
-                bool enforcing = cfg != null && cfg.ArmedForLive;
-                return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = enforcing, config = cfg };
+                return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = PropRulesAreEnforcing(), config = cfg };
             }
         }
 
