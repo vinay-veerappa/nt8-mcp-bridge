@@ -516,12 +516,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP3_111_TheBarsRouteHandsTheRawStringsThrough();
             TestP3_111_NoBarsPathParsesAPeriodWithoutResolvingItFirst();
             TestP3_111_HasMoreIsNotStartGreaterThanZero();
+            TestP1_102_AnUnknownLockoutActionIsREFUSEDNotAnsweredAsAStatus();
             TestEveryResolverSiteACTSOnTheRefusal();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 56;
+            const int declared = 57;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -1876,6 +1877,61 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(BridgeBarsQuery.RequestSize(100, 0) == 100,
                 "so `available >= requestSize` is a real test -- 1000 available against a 100 "
                 + "request means history remains");
+        }
+
+        // ================================================================================
+        // P1-102. The lockout surface: a route with no tool, and a handler that answered
+        // success to anything you sent it.
+        // ================================================================================
+
+        private static void TestP1_102_AnUnknownLockoutActionIsREFUSEDNotAnsweredAsAStatus()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-102: `action: \"lock\"` used to return success:true, isLockedOut:false");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // The whitelist must exist as a single named array -- it is what the MCP tool's enum
+            // is pinned to (P1-72's remedy, after that enum drifted twice). A whitelist inlined
+            // into an `if` cannot be extracted by the wrapper's test.
+            var arr = Regex.Match(code, @"LockoutActions\s*=\s*\{([^}]*)\}");
+            Assert(arr.Success, "the accepted actions are a single named array the wrapper can pin to");
+
+            var actions = Regex.Matches(arr.Groups[1].Value, "\"([^\"]+)\"")
+                .Cast<Match>().Select(m => m.Groups[1].Value).ToList();
+            Assert(actions.Contains("status") && actions.Contains("unlock"),
+                "it names the read and the clear");
+            Assert(!actions.Contains("lock"),
+                "and it does NOT name 'lock' -- nothing implements it, and advertising an action "
+                + "the receiver refuses is P1-72 itself");
+
+            // ⚠️ THE SHIPPED DEFECT: the handler ended with an unconditional status read, so every
+            // unrecognised string fell through to `{ success = true, ... isLockedOut = false }`.
+            // `action: "lock"` -- the most obvious thing a caller would send -- was answered
+            // "I locked it, and it is not locked", with success:true. P1-88 is this exact shape
+            // in the copier; F-9 is the general form.
+            var handler = Regex.Match(code,
+                @"private object HandleLockout\(string body\)\s*\{(.*?)\n        \}",
+                RegexOptions.Singleline);
+            Assert(handler.Success, "the lockout handler is locatable");
+            if (handler.Success)
+            {
+                var body = handler.Groups[1].Value;
+                Assert(body.Contains("UNKNOWN_LOCKOUT_ACTION"),
+                    "an unrecognised action is REFUSED by name, not answered as a status read");
+                Assert(Regex.IsMatch(body, @"success\s*=\s*false"),
+                    "and the refusal says success = false -- a refusal reported as success is "
+                    + "the defect, not the fix");
+
+                // ⚠️ REPORT THE OUTCOME, NOT THE CALL. The unlock branch returned a hard-coded
+                // `isLockedOut = false`: a claim the unlock worked, made without asking. That is
+                // P1-105 (`positionClosed = true` after an async Flatten) and P0-104 (success on
+                // a flatten it had cancelled) at a third site.
+                Assert(!Regex.IsMatch(body, @"isLockedOut\s*=\s*false\s*\}"),
+                    "the unlock branch does not hard-code isLockedOut = false");
+                Assert(Regex.IsMatch(body, @"stillLocked\s*=\s*IsAccountLocked"),
+                    "it RE-READS the enforcer after unlocking and reports what it found");
+            }
         }
 
         public static int Main(string[] args)

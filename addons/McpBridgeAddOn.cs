@@ -4590,6 +4590,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new { success = true, count = rows.Count, accounts = rows };
         }
 
+        // P1-102. The ONE definition of what /api/lockout accepts. The MCP tool's `action` enum is
+        // extracted from THIS array by a test in the wrapper, exactly as `P1-72`'s pin reads the
+        // copier's `knownActions` -- because that enum drifted from its receiver twice, and both
+        // times the schema advertised actions the addon answered UNKNOWN_ to.
+        //
+        // ⚠️ 'lock' IS DELIBERATELY ABSENT and must stay absent until something implements it.
+        // Advertising it is `P1-72` verbatim; implementing it is a separate decision, because a
+        // lockout imposed by a tool is a lockout with no rule behind it and no recorded authority
+        // for `P2-92`'s clause to read.
+        internal static readonly string[] LockoutActions = { "status", "unlock", "reset", "clear" };
+
         private object HandleLockout(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
@@ -4607,7 +4618,30 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { success = false, error = lockoutResolution.Error };
             string acctName = lockoutResolution.Name;
 
-            if (action.Equals("unlock", StringComparison.OrdinalIgnoreCase) || action.Equals("reset", StringComparison.OrdinalIgnoreCase) || action.Equals("clear", StringComparison.OrdinalIgnoreCase))
+            // P1-102. ⚠️ THE ACTION WHITELIST IS EXPLICIT NOW, and it is the reason this method
+            // changed at all. It used to be `if (unlock|reset|clear) { ... }` followed by an
+            // unconditional status read, so EVERY OTHER STRING fell through and was answered
+            // `{ success: true, action: <whatever you sent>, isLockedOut: false }`.
+            //
+            // Measured consequence: `action: "lock"` -- the single most obvious thing a caller
+            // would send, and the one this surface does NOT implement -- returned success:true
+            // with isLockedOut:false. That reads as "I locked the account, and it is not locked",
+            // which is not merely useless, it is a REPORT THAT CONTRADICTS ITSELF and still says
+            // success. `P1-88` is this exact shape in the copier ("an unrecognised action is not
+            // reported as a write"), and `F-9` is the general form: what a surface REPORTS must
+            // not disagree with what it DOES.
+            //
+            // It also blocks the tool this ticket exists to add: an MCP `action` enum is pinned to
+            // the addon's own whitelist (`P1-72`'s remedy, after that enum drifted TWICE). There
+            // was no whitelist to pin to -- the addon accepted every string by construction.
+            if (action.Equals("status", StringComparison.OrdinalIgnoreCase))
+            {
+                return new { success = true, action = "status", account = acctName, isLockedOut = IsAccountLocked(acctName) };
+            }
+
+            if (action.Equals("unlock", StringComparison.OrdinalIgnoreCase)
+                || action.Equals("reset", StringComparison.OrdinalIgnoreCase)
+                || action.Equals("clear", StringComparison.OrdinalIgnoreCase))
             {
                 if (RiskGuardAddOn.Instance != null)
                 {
@@ -4616,11 +4650,38 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // Also clear the local EmergencyFlatten lockout
                 DateTime dummy;
                 _lockoutExpiry.TryRemove(acctName, out dummy);
-                return new { success = true, action, account = acctName, isLockedOut = false };
+
+                // ⚠️ REPORT WHAT IS TRUE AFTER THE FACT, NOT WHAT WAS ATTEMPTED. This returned a
+                // hard-coded `isLockedOut = false` -- a claim that the unlock worked, made without
+                // asking. That is `P1-105` verbatim (`positionClosed = true` on the line after an
+                // async Flatten) and `P0-104`'s reported success on a flatten it had cancelled.
+                // Re-read the enforcer instead; if something still holds the account, say so.
+                bool stillLocked = IsAccountLocked(acctName);
+                return new
+                {
+                    success = !stillLocked,
+                    action = action.ToLowerInvariant(),
+                    account = acctName,
+                    isLockedOut = stillLocked,
+                    error = stillLocked
+                        ? "unlock was applied but the account is STILL locked -- something else is "
+                          + "holding it (check the guard's own lockout authority and any timed lockout)"
+                        : null,
+                };
             }
-            // Query lockout status
-            bool locked = IsAccountLocked(acctName);
-            return new { success = true, action, account = acctName, isLockedOut = locked };
+
+            return new
+            {
+                success = false,
+                action,
+                account = acctName,
+                error = string.Format(
+                    "UNKNOWN_LOCKOUT_ACTION '{0}'. Valid actions: {1}. "
+                    + "⚠️ There is deliberately no 'lock' action -- this surface can only READ or "
+                    + "CLEAR a lockout. Lockouts are imposed by the guard's own rules, and by "
+                    + "nt_emergency_flatten. Refusing rather than answering a different question.",
+                    action, string.Join(", ", LockoutActions)),
+            };
         }
 
         private object ExtractTrades(string accountFilter, string format, string fromStr, string toStr, string limitStr)

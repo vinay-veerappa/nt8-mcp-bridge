@@ -299,6 +299,23 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    // P1-102. The route existed with no tool reaching it, so recovering a locked-out account
+    // meant a raw curl with the token read off disk.
+    //
+    // ⚠️ NOTHING IS DEFAULTED HERE. `account` and `action` go through exactly as sent, so the
+    // addon's resolver does the refusing (P1-90) and its whitelist does the rejecting (P1-102's
+    // own fix). A `|| 'status'` here would be the wrapper quietly answering a different question
+    // than the caller asked -- which is the defect this tool was built to expose, one layer up.
+    // ⚠️ The positional signature is `ntFetch(endpoint, method, body)`. Written first as
+    // `ntFetch(path, { method, body })` -- a fetch()-shaped options object -- which every other
+    // POST handler in this file would have contradicted, and which the SCHEMA TEST CANNOT SEE:
+    // it validates the advertised shape, not the call. Caught only by driving the server over
+    // stdio, which is the same technique that validated P2-103 and the reason it is worth doing.
+    case 'nt_lockout': {
+      const res = await ntFetch('/api/lockout', 'POST', { account: args.account, action: args.action });
+      return res.data;
+    }
+
     case 'nt_riskguard_state': {
       const params = new URLSearchParams();
       if (args.account) params.append('account', args.account);

@@ -224,7 +224,7 @@ test('the schemas are still structurally sound after any edit', () => {
   // fire in one session (the addon's ResolveOrRefuse site count, twice) and each time it made
   // the author state that the addition was deliberate. The `>= N` version of this assertion
   // let a mutant survive earlier today.
-  assert.equal(TOOLS.length, 54, 'tool count unchanged');
+  assert.equal(TOOLS.length, 55, 'tool count unchanged');
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);
@@ -329,4 +329,62 @@ test('P3-34: the copier mode is reachable and unambiguous', () => {
   assert.ok(/not the global|copierMode/i.test(p.mode.description),
     'and distinguishes itself from copierMode, because the two are one letter apart '
     + 'in intent and worlds apart in effect');
+});
+
+// P1-102. `nt_lockout` reaches `POST /api/lockout`, a route that existed for months with NO
+// tool calling it -- recovering a locked-out account meant a raw curl with the bridge token
+// read off disk.
+//
+// ⚠️ The enum is PINNED TO THE ADDON, not hand-typed, for the reason the copier's is: `P1-72`
+// drifted TWICE, and both times the schema advertised actions the receiver answered UNKNOWN_ to.
+// A hand-written list is true when someone types it and cannot see the addon change.
+function extractLockoutActions(src) {
+  const code = stripComments(src);
+  // `internal static readonly string[] LockoutActions = { "status", "unlock", ... };`
+  const m = code.match(/LockoutActions\s*=\s*\{([^}]*)\}/);
+  assert.ok(m, 'found the LockoutActions array in McpBridgeAddOn.cs');
+  return [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]);
+}
+
+test('P1-102: nt_lockout exists and its actions are pinned to the addon whitelist', () => {
+  const tool = TOOLS.find(t => t.name === 'nt_lockout');
+  assert.ok(tool, 'nt_lockout is declared -- the route had no tool at all before P1-102');
+
+  const addonActions = extractLockoutActions(fs.readFileSync(ADDON_SOURCE, 'utf8'));
+  const p = tool.inputSchema.properties;
+
+  assert.deepEqual([...p.action.enum].sort(), [...addonActions].sort(),
+    'the advertised actions are EXACTLY what the addon accepts. Advertising one it refuses is '
+    + 'P1-72; omitting one it accepts hides a capability');
+
+  // ⚠️ The specific action a caller is most likely to try, and the one that must NOT appear.
+  assert.ok(!p.action.enum.includes('lock'),
+    'there is no "lock" action -- the addon does not implement it. Before P1-102 it answered '
+    + '{success:true, isLockedOut:false}, a report that contradicts itself and still says success');
+  assert.ok(!addonActions.includes('lock'),
+    'and the addon still does not implement it, so this test fails the day someone adds one '
+    + 'side without the other');
+});
+
+test('P1-102: unlock REMOVES protection, so nothing about it may be defaulted', () => {
+  const tool = TOOLS.find(t => t.name === 'nt_lockout');
+  const p = tool.inputSchema.properties;
+
+  // P1-90 recorded that HandleLockout fed a GUESSED account name straight into UnlockAccount
+  // with no existence check -- omitting the field unlocked Sim101, and a typo returned
+  // success:true for an account that does not exist. The resolver fixed the addon; a
+  // permissive schema would re-open it from the other side.
+  assert.ok(!('default' in p.account),
+    'account carries NO default -- a defaulted account on a write that removes protection is '
+    + 'exactly how P1-90 unlocked Sim101 by omission');
+  assert.ok(!('default' in p.action),
+    'and neither does action, so "I sent nothing" cannot become "I cleared a lockout"');
+
+  assert.ok(tool.inputSchema.required.includes('account'),
+    'account is REQUIRED');
+  assert.ok(tool.inputSchema.required.includes('action'),
+    'and so is action -- this tool can remove protection, so the caller states intent');
+
+  assert.ok(/remove/i.test(tool.description) || /REMOVE/.test(tool.description),
+    'the description says plainly that it removes protection');
 });

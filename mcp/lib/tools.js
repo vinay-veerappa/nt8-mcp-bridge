@@ -341,6 +341,37 @@ export const TOOLS = [
       },
     },
   },
+  // P1-102. `POST /api/lockout` existed and NO nt_ tool called it. Found while cleaning up
+    // after P1-99's live validation: three sim accounts were locked out by the guard, and
+    // clearing them needed a raw curl with the bridge token read off disk, because nothing in
+    // the toolset reached the route.
+    //
+    // ⚠️ WHY IT IS A P1 AND NOT A CONVENIENCE. P1-100 means a SHADOW-ONLY lockout can freeze an
+    // account. So the mode an operator is told to evaluate the guard in can halt trading, and the
+    // toolset they are driving it with had no way to undo that. "The guard stopped my account and
+    // I cannot start it again" is the shape that gets a risk system deleted rather than debugged.
+    //
+    // ⚠️ `unlock` REMOVES PROTECTION. It is the one write here that must not get a permissive
+    // schema: `account` is REQUIRED with NO default (P1-91 -- a default account on a write is how
+    // omitting the field unlocked Sim101), and the action enum is PINNED to the addon's own
+    // LockoutActions array by a test, not hand-typed (P1-72, which drifted twice).
+    //
+    // ⚠️ There is deliberately NO 'lock'. The addon does not implement it, and advertising an
+    // action the receiver refuses is P1-72 itself. Before P1-102 the addon answered `lock` with
+    // `{success: true, isLockedOut: false}` -- a report that contradicts itself and still says
+    // success; that fall-through is now a refusal naming the valid set.
+    {
+      name: 'nt_lockout',
+      description: 'Read or CLEAR a RiskGuard lockout on one account. There is no "lock" action -- lockouts are imposed by the guard\'s rules and by nt_emergency_flatten. ⚠️ unlock/reset/clear REMOVE protection.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          account: { type: 'string', description: 'Account name. Required, and an unresolvable name is REFUSED naming the available accounts rather than defaulted.' },
+          action:  { type: 'string', enum: ['status', 'unlock', 'reset', 'clear'], description: 'status reads; unlock/reset/clear all REMOVE the lockout (they are aliases in the addon). Defaults to status at the receiver.' },
+        },
+        required: ['account', 'action'],
+      },
+    },
   {
     name: 'nt_riskguard_state',
     description: 'Read live RiskGuard account FSM state (Flat, InPosition, SoftStop, HardStop, Lockout), drawdown, and loss limits',
