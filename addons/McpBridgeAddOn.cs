@@ -607,6 +607,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/emergency-flatten":  return Post(method, () => ExecuteIdempotencyFromReq(body, b => EmergencyFlatten(b)));
                 case "/api/lockout":            return Post(method, () => HandleLockout(body));
 
+                // F-17. Connection visibility and control, on ONE method-differentiated route.
+                //
+                // ⚠️ NOT `/api/connections` -- that name is already taken, by an endpoint about a
+                // completely different question: `GetConnectionFeatures` reports per-connection
+                // OCO capability (NativeOcoOrders, RequiresOcoSubmitInPairs, ...). Two unrelated
+                // concepts under one plural noun. The compiler caught the collision as CS0152,
+                // which is the only reason it was noticed at all -- a source gate would not have.
+                case "/api/connection":
+                    return method == "POST" ? HandleConnection(body) : ListConnections();
+
                 // - Phase 2 & Expansion (strategy authoring / compile / backtest / v1.4 tools) -
                 case "/api/strategies":         return ListStrategies();
                 case "/api/strategy/source":    return GetStrategySource(query["name"]);
@@ -4654,6 +4664,277 @@ namespace NinjaTrader.NinjaScript.AddOns
         // lockout imposed by a tool is a lockout with no rule behind it and no recorded authority
         // for `P2-92`'s clause to read.
         internal static readonly string[] LockoutActions = { "status", "unlock", "reset", "clear" };
+
+        // ---------------------------------------------------------------------------
+        // F-17. Connection visibility and control.
+        // ---------------------------------------------------------------------------
+
+        // The actions this endpoint really implements. Pinned so the wrapper schema cannot
+        // advertise one the addon answers UNKNOWN_ to -- `P1-72`, which regressed once already.
+        internal static readonly string[] ConnectionActions = { "status", "connect", "disconnect" };
+
+        /// <summary>
+        /// Snapshots every configured connection. `Connection.Connections` must be enumerated
+        /// under its own lock -- NinjaTrader's own @BarTimer indicator does exactly this.
+        /// </summary>
+        private static List<object> SnapshotConnections(out string[] names,
+                                                        out string[] providers,
+                                                        out string[] statuses)
+        {
+            var rows = new List<object>();
+            var nameList = new List<string>();
+            var providerList = new List<string>();
+            var statusList = new List<string>();
+
+            var byConnection = new Dictionary<string, List<Account>>(StringComparer.OrdinalIgnoreCase);
+            // ⚠️ THE CONNECTION OBJECTS COME FROM THE ACCOUNTS, NOT FROM `Connection.Connections`.
+            // Measured live 2026-08-15: enumerating the static collection under its own lock --
+            // which is what NinjaTrader's own @BarTimer indicator does -- returned ZERO rows from
+            // this AddOn's HTTP thread, while `Account.All` carried perfectly good `Connection`
+            // references the whole time. The endpoint duly answered `count: 0,
+            // marketDataConnected: false` on a box with a live broker attached, which is a FALSE
+            // NEGATIVE of exactly the kind P2-115 was filed to remove -- one endpoint away.
+            // Accounts persist across a disconnect (the 89 Provider31 accounts were all still
+            // listed while Provider31 was down), so this source does not lose a connection when
+            // it drops, which is the case the tool exists for.
+            // ⚠️ KEYED BY THE CONNECTION OBJECT, NOT BY ITS NAME. Measured live 2026-08-15: keying
+            // on `Options.Name` produced two rows, BOTH `Disconnected`, and put the six Simulator
+            // accounts under a connection named `TPT` -- while `/api/health` simultaneously read
+            // `feedConnected: true`, which requires a CONNECTED non-simulated account to exist.
+            // The two answers contradicted each other, and the report was the wrong one. Distinct
+            // Connection objects can carry the same `Options.Name`, so collapsing on the name
+            // merged a live broker connection into a dormant one and reported the dormant one's
+            // status for both. Reference identity is the only key that cannot do that -- the same
+            // rule BridgeFlattenPlan uses to tell its own order from someone else's (`P0-104`).
+            var order = new List<Connection>();
+            var accountsFor = new List<List<Account>>();
+            foreach (Account a in Account.All)
+            {
+                if (a == null || a.Connection == null) continue;
+                int idx = -1;
+                for (int i = 0; i < order.Count; i++)
+                    if (ReferenceEquals(order[i], a.Connection)) { idx = i; break; }
+                if (idx < 0) { order.Add(a.Connection); accountsFor.Add(new List<Account>()); idx = order.Count - 1; }
+                accountsFor[idx].Add(a);
+            }
+
+            for (int i = 0; i < order.Count; i++)
+            {
+                Connection c = order[i];
+                var accts = accountsFor[i];
+                string cname = c.Options != null && !string.IsNullOrEmpty(c.Options.Name)
+                    ? c.Options.Name : "(unnamed)";
+                string cstatus = c.Status.ToString();
+
+                int openPositions = 0, workingOrders = 0;
+                var provs = new List<string>();
+                foreach (var a in accts)
+                {
+                    string pv = a.Provider.ToString();
+                    if (!provs.Contains(pv)) provs.Add(pv);
+                    foreach (Position p in a.Positions)
+                        if (p != null && Math.Abs(p.Quantity) > 0) openPositions++;
+                    foreach (Order o in a.Orders)
+                        if (o != null && OccupiesSlotForBridge(o.OrderState)) workingOrders++;
+                }
+
+                // ⚠️ ALL the providers on the connection, not the first account's. Reporting the
+                // first is how a live broker got labelled `Simulator` above.
+                string[] provArr = provs.ToArray();
+                string provider = provArr.Length == 0 ? null : string.Join("+", provArr);
+
+                // Feed the SAME predicate /api/health uses, one entry per provider present, so
+                // this row and that flag cannot disagree about the same connection.
+                var stat = new string[provArr.Length];
+                var nm = new string[provArr.Length];
+                for (int k = 0; k < provArr.Length; k++) { stat[k] = cstatus; nm[k] = cname; }
+
+                nameList.Add(cname);
+                statusList.Add(cstatus);
+                providerList.Add(provArr.Length == 1 ? provArr[0] : null);
+                for (int k = 1; k < provArr.Length; k++)
+                { nameList.Add(cname); statusList.Add(cstatus); providerList.Add(provArr[k]); }
+                if (provArr.Length > 1) providerList[providerList.Count - provArr.Length] = provArr[0];
+
+                rows.Add(new
+                {
+                    name = cname,
+                    status = cstatus,
+                    provider = provider,
+                    providers = provArr,
+                    accountCount = accts.Count,
+                    openPositions = openPositions,
+                    workingOrders = workingOrders,
+                    // Named so a reader can see WHY feedConnected reads as it does.
+                    countsTowardMarketData = BridgeFeedStatus.IsMarketDataConnected(nm, provArr, stat)
+                });
+            }
+
+            names = nameList.ToArray();
+            providers = providerList.ToArray();
+            statuses = statusList.ToArray();
+            return rows;
+        }
+
+        private static bool OccupiesSlotForBridge(OrderState s)
+        {
+            return s == OrderState.Working || s == OrderState.Accepted
+                || s == OrderState.Submitted || s == OrderState.TriggerPending
+                || s == OrderState.ChangePending || s == OrderState.CancelPending
+                || s == OrderState.PartFilled;
+        }
+
+        /// <summary>
+        /// F-17 read half. ⚠️ `marketDataConnected` is folded out of the SAME rows the detail
+        /// view returns, and out of the same predicate `/api/health` uses. A summary with its own
+        /// counter is free to drift from its detail -- that is `F-9` verbatim.
+        /// </summary>
+        private object ListConnections()
+        {
+            try
+            {
+                string[] names, providers, statuses;
+                var rows = SnapshotConnections(out names, out providers, out statuses);
+                return new
+                {
+                    success = true,
+                    count = rows.Count,
+                    marketDataConnected = BridgeFeedStatus.IsMarketDataConnected(names, providers, statuses),
+                    connections = rows
+                };
+            }
+            catch (Exception ex)
+            {
+                return new { success = false, error = "could not read connections: " + ex.Message };
+            }
+        }
+
+        /// <summary>
+        /// F-17 write half. Refuses an unresolvable name, and refuses a disconnect that would
+        /// strand a position or a working order unless the caller says otherwise.
+        ///
+        /// ⚠️ REPORTS THE OBSERVED STATE, NOT THE CALL. `Connect()`/`Disconnect()` are
+        /// asynchronous, so this polls for the settled status with a bound -- `P1-105` shipped
+        /// `positionClosed = true` on the line after an async Flatten and that is the whole
+        /// lesson: a field assigned after a call records that control reached the line.
+        /// </summary>
+        private object HandleConnection(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var action = req.Str("action") ?? "status";
+
+            if (Array.IndexOf(ConnectionActions, action) < 0)
+                return new { success = false, action, refused = true,
+                             error = "UNKNOWN_CONNECTION_ACTION",
+                             message = "supported: " + string.Join(", ", ConnectionActions) };
+
+            if (action == "status") return ListConnections();
+
+            string[] names, providers, statuses;
+            SnapshotConnections(out names, out providers, out statuses);
+
+            string resolved, refusal;
+            if (!BridgeConnectionPlan.TryResolve(req.Str("name"), names, out resolved, out refusal))
+                return new { success = false, action, refused = true,
+                             error = "UNRESOLVED_CONNECTION", message = refusal };
+
+            // Same source as the read, for the same reason: `Connection.Connections` yields
+            // nothing from this thread, and an account's own `Connection` reference is the object
+            // the platform actually uses.
+            Connection target = null;
+            int openPositions = 0, workingOrders = 0;
+            foreach (Account a in Account.All)
+            {
+                if (a == null || a.Connection == null || a.Connection.Options == null) continue;
+                if (string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
+                { target = a.Connection; break; }
+            }
+            if (target == null)
+            {
+                try
+                {
+                    lock (Connection.Connections)
+                    {
+                        foreach (Connection c in Connection.Connections)
+                        {
+                            if (c == null || c.Options == null) continue;
+                            if (string.Equals(c.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
+                            { target = c; break; }
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (target == null)
+                return new { success = false, action, refused = true,
+                             error = "UNRESOLVED_CONNECTION",
+                             message = "'" + resolved + "' resolved but is no longer present." };
+
+            foreach (Account a in Account.All)
+            {
+                if (a == null || a.Connection == null || a.Connection.Options == null) continue;
+                if (!string.Equals(a.Connection.Options.Name, resolved, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                foreach (Position p in a.Positions)
+                    if (p != null && Math.Abs(p.Quantity) > 0) openPositions++;
+                foreach (Order o in a.Orders)
+                    if (o != null && OccupiesSlotForBridge(o.OrderState)) workingOrders++;
+            }
+
+            string strandReason;
+            bool strands = BridgeConnectionPlan.WouldStrand(openPositions, workingOrders, out strandReason);
+            if (action == "disconnect" && strands && !req.Bool("confirmDisruptive"))
+                return new { success = false, action, connection = resolved, refused = true,
+                             error = "WOULD_STRAND_LIVE_RISK", message = strandReason,
+                             openPositions, workingOrders };
+
+            string before = target.Status.ToString();
+            try
+            {
+                // ⚠️ THE TWO HALVES ARE NOT SYMMETRIC, and nothing but the compiler would have
+                // said so. `Connect` is STATIC on the type and takes the saved options --
+                // `Connection.Connect(ConnectOptions)` -- while `Disconnect` is an ordinary
+                // instance method. Reached in three steps: CS7036 (no parameterless overload),
+                // then CS0176 (cannot be called on an instance). This file is in no test build,
+                // so `nt_compile` is the only thing that could find any of it.
+                if (action == "connect") Connection.Connect(target.Options);
+                else target.Disconnect();
+            }
+            catch (Exception ex)
+            {
+                return new { success = false, action, connection = resolved, refused = false,
+                             error = "CONNECTION_CALL_THREW", message = ex.Message, statusBefore = before };
+            }
+
+            // Bounded settle poll. Stops as soon as the status changes; never blocks the listener
+            // for long. The reported status is READ, not assumed.
+            string after = before;
+            for (int i = 0; i < 40; i++)
+            {
+                System.Threading.Thread.Sleep(100);
+                after = target.Status.ToString();
+                if (!string.Equals(after, before, StringComparison.OrdinalIgnoreCase)) break;
+            }
+
+            bool reached = action == "connect"
+                ? string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase)
+                : !string.Equals(after, "Connected", StringComparison.OrdinalIgnoreCase);
+
+            return new
+            {
+                success = reached,
+                action,
+                connection = resolved,
+                statusBefore = before,
+                statusAfter = after,
+                settled = reached,
+                openPositions,
+                workingOrders,
+                note = reached
+                    ? "status was READ after the call, not assumed from it."
+                    : "the call was made but the status had not settled within 4s; re-read /api/connections."
+            };
+        }
 
         private object HandleLockout(string body)
         {

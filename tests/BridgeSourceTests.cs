@@ -679,6 +679,202 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "answer discarded -- a value that is COMPUTED is not a value that is USED.");
         }
 
+        // ------------------------------------------------------------------
+        // F-17. Connection visibility and control, added 2026-08-15 at the operator's request
+        // while closing P2-115.
+        //
+        // P2-115 gave `/api/health` an honest `feedConnected`, but a caller who reads `false`
+        // still has no way to ask WHY, and no way to act on it. Worse, the negative half of
+        // P2-115 could not be validated at all, because nothing on the box could disconnect a
+        // connection -- so `feedConnected: false` was a state the code could produce and no test,
+        // live or otherwise, had ever observed.
+        //
+        // ⚠️ DISCONNECTING IS A DESTRUCTIVE ACT ON A TRADING PLATFORM. It severs the path by
+        // which a position is managed, which is `P1-106`'s family exactly: a control that stops
+        // you fixing the thing it just broke. So the plan REFUSES by default when any account on
+        // the connection holds a position or a working order, and says which.
+        //
+        // These reach BridgeConnectionPlan by reflection, so they compile before it exists.
+        // ------------------------------------------------------------------
+
+        private static Type F17Type()
+        {
+            return Type.GetType("NinjaTrader.NinjaScript.AddOns.BridgeConnectionPlan, " +
+                                typeof(BridgeSourceTests).Assembly.GetName().Name);
+        }
+
+        private static object[] F17Resolve(string requested, string[] available)
+        {
+            var t = F17Type();
+            if (t == null) return null;
+            var m = t.GetMethod("TryResolve",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (m == null) return null;
+            var args = new object[] { requested, available, null, null };
+            var ok = (bool)m.Invoke(null, args);
+            return new object[] { ok, args[2], args[3] };   // ok, resolved, refusal
+        }
+
+        private static object[] F17WouldStrand(int positions, int orders)
+        {
+            var t = F17Type();
+            if (t == null) return null;
+            var m = t.GetMethod("WouldStrand",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (m == null) return null;
+            var args = new object[] { positions, orders, null };
+            var strands = (bool)m.Invoke(null, args);
+            return new object[] { strands, args[2] };       // strands, reason
+        }
+
+        /// <summary>P1-90's rule at a new surface: resolve or refuse, never guess.</summary>
+        private static void TestF17_AnUnknownConnectionIsRefusedNamingTheRealOnes()
+        {
+            Console.WriteLine("\n[TEST] F-17: an unknown connection name is refused, naming the ones that exist");
+
+            var t = F17Type();
+            Assert(t != null,
+                "BridgeConnectionPlan exists, so connection control has a decision layer a test "
+                + "can execute rather than living entirely in the untestable route");
+            if (t == null) return;
+
+            var available = new[] { "Provider31", "Playback", "Simulator" };
+
+            var miss = F17Resolve("Provdier31", available);          // transposed, as a typo is
+            Assert((bool)miss[0] == false, "a typo'd connection name does NOT resolve");
+            Assert(miss[2] != null && miss[2].ToString().Contains("Provider31"),
+                "and the refusal NAMES the available connections, so the caller can correct it "
+                + "instead of guessing. Got: " + (miss[2] ?? "(no refusal text)"));
+
+            var hit = F17Resolve("provider31", available);
+            Assert((bool)hit[0], "an exact name resolves case-insensitively");
+            Assert((string)hit[1] == "Provider31",
+                "and it returns the CANONICAL spelling, because that string is what gets passed "
+                + "to the platform and printed in the audit line");
+        }
+
+        /// <summary>
+        /// ⚠️ A blank request is NOT a wildcard. On a path that DISCONNECTS, the failure
+        /// directions are not symmetric -- `symbol: "M"` closing four instruments (P1-105) is the
+        /// same shape, and here a blank name would mean "sever everything".
+        /// </summary>
+        private static void TestF17_ABlankConnectionNameIsNotAWildcard()
+        {
+            Console.WriteLine("\n[TEST] F-17: a blank connection name is refused, not treated as 'all'");
+
+            if (F17Type() == null) { Assert(false, "BridgeConnectionPlan exists"); return; }
+            var available = new[] { "Provider31", "Playback" };
+
+            foreach (var blank in new[] { null, "", "   " })
+            {
+                var r = F17Resolve(blank, available);
+                Assert((bool)r[0] == false,
+                    "a blank name (" + (blank == null ? "null" : "'" + blank + "'")
+                    + ") is refused rather than matching everything -- on a disconnect path that "
+                    + "would sever every connection on the box");
+            }
+        }
+
+        /// <summary>The safety decision, in both directions.</summary>
+        private static void TestF17_DisconnectingIsRefusedWhileAnythingIsLive()
+        {
+            Console.WriteLine("\n[TEST] F-17: a disconnect that would strand a position or an order is refused");
+
+            if (F17Type() == null) { Assert(false, "BridgeConnectionPlan exists"); return; }
+
+            var withPosition = F17WouldStrand(1, 0);
+            Assert((bool)withPosition[0],
+                "an open position makes a disconnect disruptive -- severing the connection is "
+                + "severing the only path by which that position can be closed");
+            Assert(withPosition[1] != null && withPosition[1].ToString().Contains("position"),
+                "and the reason NAMES the position, so the operator can decide rather than be "
+                + "told 'refused'. Got: " + (withPosition[1] ?? "(none)"));
+
+            var withOrder = F17WouldStrand(0, 1);
+            Assert((bool)withOrder[0],
+                "a WORKING ORDER also makes it disruptive, not just a position -- a resting stop "
+                + "is protection, and disconnecting abandons it while it still exists at the broker");
+            Assert(withOrder[1] != null && withOrder[1].ToString().Contains("order"),
+                "and that reason names the order rather than reusing the position wording");
+
+            // ⚠️ THE NEGATIVE HALF. Without it, `return true` satisfies everything above and the
+            // tool refuses every disconnect forever -- which is the same class of defect as
+            // P2-115's constant, one layer up. A detector needs a negative test.
+            var quiet = F17WouldStrand(0, 0);
+            Assert((bool)quiet[0] == false,
+                "a flat account with no working orders is NOT disruptive, so the ordinary "
+                + "disconnect goes through. A control that always refuses is a control nobody keeps");
+        }
+
+        /// <summary>
+        /// A SOURCE gate, and written this way FIRST rather than after a mutant walked through it.
+        /// P1-105, P2-109 and P2-115 each shipped a gate asserting a value was COMPUTED; all three
+        /// were satisfied by code that computed it and ignored the answer. This asserts the
+        /// refusal RETURNS.
+        /// </summary>
+        private static void TestF17_TheDisconnectRouteActsOnTheRefusalRatherThanComputingIt()
+        {
+            Console.WriteLine("\n[TEST] F-17: the disconnect route RETURNS on the refusal (source gate)");
+
+            var path = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(typeof(BridgeSourceTests).Assembly.Location),
+                "..", "..", "..", "..", "addons", "McpBridgeAddOn.cs"));
+            if (!File.Exists(path))
+                path = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "addons", "McpBridgeAddOn.cs"));
+            Assert(File.Exists(path), "McpBridgeAddOn.cs is readable at " + path);
+            if (!File.Exists(path)) return;
+
+            var code = System.Text.RegularExpressions.Regex.Replace(
+                File.ReadAllText(path), @"//[^\r\n]*", "");
+
+            Assert(code.Contains("BridgeConnectionPlan.TryResolve"),
+                "the route resolves the connection name through the plan");
+
+            // The refusal must be RETURNED, not merely produced. `return new { ... refused` inside
+            // the resolve failure is the shape being required.
+            var refusalReturns = new System.Text.RegularExpressions.Regex(
+                @"BridgeConnectionPlan\.TryResolve[\s\S]{0,400}?return\s+new\s*\{[^}]*refused",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            Assert(refusalReturns.IsMatch(code),
+                "and it RETURNS the refusal rather than computing it and carrying on. Three "
+                + "tickets here (P1-105, P2-109, P2-115) shipped a gate that only asserted the "
+                + "value was computed, and a mutant walked through every one of them.");
+
+            // ⚠️ THIS ASSERTION USED TO REQUIRE A `return ... refused` NEAR THE CALL, AND A MUTANT
+            // WALKED THROUGH IT: neutering the guard to `if (false)` leaves the return statement
+            // sitting in the source, unreachable, and a regex over source text cannot tell. That
+            // is "a value that is COMPUTED is not a value that is USED" for the FOURTH time here
+            // (P1-105, P2-109, P2-115, now this) -- and this time in the gate written expressly to
+            // avoid it. The lesson has moved on: on a guarded return, THE CONDITION IS THE
+            // LOAD-BEARING PART, so that is what gets asserted.
+            var strandGuard = new System.Text.RegularExpressions.Regex(
+                @"if\s*\([^)]*\bstrands\b[^)]*confirmDisruptive[^)]*\)");
+            Assert(strandGuard.IsMatch(code),
+                "and the disconnect is GUARDED by both the strand result and the explicit "
+                + "override, in one condition. Asserting only that a refusal is returned nearby "
+                + "passes when the condition is neutered to `if (false)` and the return goes "
+                + "unreachable -- which is exactly what a mutant did.");
+
+            var strandReturns = new System.Text.RegularExpressions.Regex(
+                @"BridgeConnectionPlan\.WouldStrand[\s\S]{0,400}?return\s+new\s*\{[^}]*refused",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            Assert(strandReturns.IsMatch(code),
+                "and the strand check still RETURNS its refusal -- kept alongside the condition "
+                + "check above, because either one alone is satisfiable without the other");
+
+            // Positive control, and it must FAIL on the mutant's shape as well as pass on the
+            // real one -- otherwise it is just a second way of writing the same weak check.
+            Assert(strandGuard.IsMatch("if (action == \"disconnect\" && strands && !req.Bool(\"confirmDisruptive\"))"),
+                "positive control: the guard pattern matches the real condition");
+            Assert(!strandGuard.IsMatch("if (false) { return new { refused = true }; }"),
+                "negative control: and it does NOT match the neutered condition the mutant used");
+
+            // Positive control on the regexes themselves: they must be able to match something.
+            Assert(refusalReturns.IsMatch(
+                    "BridgeConnectionPlan.TryResolve(x); return new { success = false, refused = true };"),
+                "positive control: the refusal pattern still matches the shape it is about");
+        }
+
         public static int Run()
         {
             Console.WriteLine("====================================================");
@@ -698,6 +894,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2_115_ALiveBrokerConnectionStillReportsTrue();
             TestP2_115_AnUnknownConnectionStateFailsClosed();
             TestP2_115_TheRouteNoLongerDerivesTheFlagFromTheAccountCount();
+            TestF17_AnUnknownConnectionIsRefusedNamingTheRealOnes();
+            TestF17_ABlankConnectionNameIsNotAWildcard();
+            TestF17_DisconnectingIsRefusedWhileAnythingIsLive();
+            TestF17_TheDisconnectRouteActsOnTheRefusalRatherThanComputingIt();
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();

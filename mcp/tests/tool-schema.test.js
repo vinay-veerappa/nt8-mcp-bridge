@@ -224,7 +224,7 @@ test('the schemas are still structurally sound after any edit', () => {
   // fire in one session (the addon's ResolveOrRefuse site count, twice) and each time it made
   // the author state that the addition was deliberate. The `>= N` version of this assertion
   // let a mutant survive earlier today.
-  assert.equal(TOOLS.length, 55, 'tool count unchanged');
+  assert.equal(TOOLS.length, 56, 'tool count unchanged');   // 55 -> 56: F-17 nt_connection
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);

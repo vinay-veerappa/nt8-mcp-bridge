@@ -316,6 +316,22 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    // F-17. `status` is a GET so it stays a read all the way down; connect/disconnect POST.
+    // The action is passed through verbatim rather than defaulted -- the addon owns the
+    // whitelist and refuses anything outside it (P1-72).
+    case 'nt_connection': {
+      if (args.action === 'status' || args.action === undefined) {
+        const res = await ntFetch('/api/connection', 'GET');
+        return res.data;
+      }
+      const res = await ntFetch('/api/connection', 'POST', {
+        action: args.action,
+        name: args.name,
+        confirmDisruptive: args.confirmDisruptive,
+      });
+      return res.data;
+    }
+
     case 'nt_riskguard_state': {
       const params = new URLSearchParams();
       if (args.account) params.append('account', args.account);

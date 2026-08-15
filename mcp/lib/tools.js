@@ -372,6 +372,44 @@ export const TOOLS = [
         required: ['account', 'action'],
       },
     },
+  // F-17. Connection visibility and control.
+  //
+  // WHY IT EXISTS. P2-115 gave /api/health a `feedConnected` that can finally be false -- but a
+  // caller reading `false` had no way to ask WHY, and no way to act on it. This is the detail
+  // view behind that one boolean, and `countsTowardMarketData` on each row is computed by the
+  // SAME predicate the flag uses, so the two cannot disagree about the same connection.
+  //
+  // ⚠️ NO `default:` ON ANYTHING, and `action` is required. P1-91: a schema default is a WRITE
+  // whenever the receiver merges it, and the one dangerous action here is `disconnect`. The enum
+  // is pinned to the addon's own ConnectionActions whitelist, because P1-72 -- advertising an
+  // action the receiver refuses -- has regressed on this wrapper once already.
+  //
+  // ⚠️ `disconnect` IS DESTRUCTIVE on a trading platform: it severs the path by which a position
+  // is managed. The addon REFUSES it while any account on the connection holds a position or a
+  // working order, and confirmDisruptive is how you override that deliberately.
+  {
+    name: 'nt_connection',
+    description: 'List NinjaTrader connections with their live status, or connect/disconnect one. This is the detail behind nt_health\'s feedConnected -- each row carries countsTowardMarketData from the same predicate. ⚠️ disconnect severs the path by which open positions are managed, and is REFUSED while anything on the connection is live unless confirmDisruptive is set.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'connect', 'disconnect'],
+          description: 'status lists every connection and is read-only. connect/disconnect act on the one named. No default -- naming the action is the point.',
+        },
+        name: {
+          type: 'string',
+          description: 'Connection name, required for connect/disconnect. An unresolvable name is REFUSED naming the real ones, and a blank name is refused rather than treated as "all".',
+        },
+        confirmDisruptive: {
+          type: 'boolean',
+          description: 'Required to disconnect a connection whose accounts hold open positions or working orders. Without it that disconnect is refused, naming what it would strand.',
+        },
+      },
+      required: ['action'],
+    },
+  },
   {
     name: 'nt_riskguard_state',
     description: 'Read live RiskGuard account FSM state (Flat, InPosition, SoftStop, HardStop, Lockout), drawdown, and loss limits',
