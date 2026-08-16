@@ -47,6 +47,22 @@ jobs:
       - name: CI runs every mutation battery
         run: python tools/check_ci_runs_every_battery.py
 
+      # ⚠️ Ported 2026-08-16 (session 47) -- FOURTH per-repo gate found missing on this side.
+      # It catches a battery that declares a mutant EXPECTED SURVIVOR: and then keeps the plain
+      # `sys.exit(1 if survivors else 0)`, which fails for that mutant every single time: in the
+      # core that shape made CI red on TEN consecutive pushes across three sessions, and every
+      # battery ordered after it never ran. It fails in BOTH directions, so a battery reaching
+      # for the helper WITHOUT a declaration is refused too -- otherwise the prompt to justify
+      # the next exemption quietly disappears.
+      #
+      # ⚠️ It has NO declaring battery here today, and that is not the same as having no subject:
+      # the other half is live on all eight, which must keep the strict exit. And the port was
+      # deliberately NOT verbatim -- there is no mutation/_battery.py in this repo, so the
+      # inherited failure text named a helper you cannot import, and the inherited SUCCESS text
+      # advertised a guarantee nothing here provides. Both now derive from what this repo has.
+      - name: A declared EXPECTED SURVIVOR does not make a battery unpassable
+        run: python tools/check_expected_survivors.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
@@ -57,6 +73,12 @@ jobs:
       # THIRD per-repo gate found missing on this side, after check_ci_runs_every_battery.py and
       # check_expected_survivors.py. A gate is per-repo: writing one where you found the defect
       # leaves the other side unguarded. This is a substring count, so it runs before everything.
+      #
+      # ⚠️ AND THAT SENTENCE WAS A COMMENT DOING A GATE'S JOB FOR FOUR SESSIONS. It named
+      # check_expected_survivors.py as an already-identified per-repo gap in session 42 -- and
+      # nobody ported it until session 47, because naming a missing gate in prose creates no
+      # failure. It is wired above now. If you find yourself listing a gate this repo lacks,
+      # port it in that commit or the list is the only thing that will exist.
       - name: Mutation anchors still match (a stale anchor scores a survivor)
         run: python tools/check_anchors.py
 
