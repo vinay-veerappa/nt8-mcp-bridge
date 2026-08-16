@@ -786,10 +786,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             var debug = req.Bool("debug", false);
-            return CompileCore(debug);
+            var ignoreWarnings = req.Bool("ignoreWarnings", false);
+            return CompileCore(debug, ignoreWarnings);
         }
 
-        private object CompileCore(bool debug)
+        private object CompileCore(bool debug, bool ignoreWarnings = false)
         {
             var compilerType = Type.GetType("NinjaTrader.Code.Compiler, NinjaTrader.Core");
             if (compilerType == null) return Persist(new { success = false, error = "NinjaTrader.Code.Compiler not found" });
@@ -839,7 +840,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // CS1701/CS1702 are benign assembly-version-unification notices NT8 emits en masse
                 // (thousands of them) - filter them out, and hard-cap the rest so the result file
                 // can never balloon.
-                warnings = diagnostics.Where(d => d.severity == "Warning" && d.id != "CS1701" && d.id != "CS1702").Take(25).ToList(),
+                warnings = ignoreWarnings
+                    ? new List<Diag>()
+                    : diagnostics.Where(d => d.severity == "Warning" && d.id != "CS1701" && d.id != "CS1702").Take(25).ToList(),
                 assemblyToLoad,
                 note = "NinjaScript hot-swaps right after this; if the connection dropped, GET /api/compile/result",
                 timestamp = DateTime.UtcNow,

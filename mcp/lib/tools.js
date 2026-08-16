@@ -769,7 +769,10 @@ export const TOOLS = [
     description: 'Recompile all NinjaScript in-process (Roslyn, hot-swap, no NT8 restart). Returns success + any compile errors/warnings. Run after nt_create_strategy.',
     inputSchema: {
       type: 'object',
-      properties: { debug: { type: 'boolean', description: 'Emit a debug build', default: false } },
+      properties: {
+        debug: { type: 'boolean', description: 'Emit a debug build', default: false },
+        ignoreWarnings: { type: 'boolean', description: 'Suppress warnings from the response (errors only). Saves context. Default: false', default: false },
+      },
     },
   },
   {

@@ -534,7 +534,7 @@ async function handleToolCall(name, args) {
 
     case 'nt_compile': {
       try {
-        await ntFetch('/api/compile', 'POST', { debug: !!args.debug }, 30000);
+        await ntFetch('/api/compile', 'POST', { debug: !!args.debug, ignoreWarnings: !!args.ignoreWarnings }, 30000);
       } catch {
         // expected on success (connection reset by hot-swap)
       }
