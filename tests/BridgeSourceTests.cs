@@ -1212,180 +1212,29 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 
         // ============================================================================
-        // P2-27 / the editable UI. `/api/riskguard/config` POST validates NO VALUES.
+        // P2-27's validator MOVED TO nt8-riskguard, 2026-08-16 (session 48).
         //
-        // The write path is already hardened against the wrong SHAPE -- P1-80 stopped it
-        // persisting a file nothing read back, and P2-41 made it MERGE onto the live config
-        // instead of flattening every omitted field to its default. Neither looks at what the
-        // values MEAN. `SaveAndReloadConfig` does not run preflight, so a config that cannot
-        // pass preflight is written and reloaded happily and the guard comes up DISARMED at the
-        // next restart, with nothing about the file looking wrong.
+        // Nine assertions stood here, red, pinning a `BridgeGuardConfigEdit` in THIS repo.
+        // They are gone because the class they pinned is not being built here, and a test that
+        // can never go green is not a test-first gate -- it is a red CI, which this project has
+        // twice let run for ten pushes while everyone stopped reading the signal.
         //
-        // That is survivable while the only writer is a deliberate API call. It is not
-        // survivable once a UI can write it: the whole point of the editable page is that an
-        // operator changes limits quickly, and the failure mode is silent and delayed.
+        // ⚠️ THEY WERE NOT DELETED TO GO GREEN. The validator is `GuardConfigEdit` in
+        // nt8-riskguard, and the reason is structural: the submodule direction is bridge ->
+        // core, so a class here is unreachable from `RiskGuardWindow.OnSaveConfigClick` -- the
+        // OTHER writer to the same config, and as it turns out one of THREE (P2-119). A
+        // validator only one of three writers can call is the defect shape, not the fix.
         //
-        // So the check is REFUSAL-SHAPED and lives in a class that names no NT8 type, which is
-        // the P2-27 pattern and the reason every Bridge*.cs file exists: the 6,994-line
-        // McpBridgeAddOn.cs is in NO test build, so anything left in the route is unverifiable
-        // by construction.
+        // What replaced them is strictly stronger: 21 assertions in the core harness, EXECUTED
+        // rather than reflected at a maybe-absent type, plus `mutation/mutate_p227.py` at 11
+        // mutants / 0 survivors. Two of those mutants are the specs these tests encoded.
         //
-        // Reached by REFLECTION so these compile before the class exists.
+        // WHAT IS GENUINELY MISSING, and it comes back with P2-119: the three ROUTE assertions
+        // -- that `RiskGuardConfig` consults the validator, tests the verdict with a real
+        // condition, and does so BEFORE SaveAndReloadConfig. There is nothing to assert against
+        // until the route calls it, and the vendored core is pinned to v1.30.0, which predates
+        // the class. Re-add them in the commit that wires the route, not before.
         // ============================================================================
-
-        private static Type GuardConfigEditType()
-        {
-            return Type.GetType("NinjaTrader.NinjaScript.AddOns.BridgeGuardConfigEdit, " +
-                                "BridgeTests");
-        }
-
-        /// <summary>
-        /// Calls BridgeGuardConfigEdit.Refuse(mode, trailingDrawdown, minShadowSessions).
-        /// Returns the refusal reason, or null when the config is acceptable.
-        /// </summary>
-        private static string CallRefuse(string mode, double trailingDrawdown, int minShadowSessions)
-        {
-            var t = GuardConfigEditType();
-            if (t == null) return "___CLASS_MISSING___";
-            var m = t.GetMethod("Refuse", new[] { typeof(string), typeof(double), typeof(int) });
-            if (m == null) return "___METHOD_MISSING___";
-            return (string)m.Invoke(null, new object[] { mode, trailingDrawdown, minShadowSessions });
-        }
-
-        /// <summary>
-        /// True only for a REAL refusal. CallRefuse answers a `___`-prefixed sentinel when the
-        /// class or method is missing, and that is non-empty -- so a bare IsNullOrEmpty check is
-        /// satisfied by the class NOT EXISTING, which is exactly the state of the red baseline.
-        /// Two assertions here passed for that reason before this helper existed.
-        /// </summary>
-        private static bool Refused(string reason)
-        {
-            return !string.IsNullOrEmpty(reason)
-                   && reason.IndexOf("___", StringComparison.Ordinal) < 0;
-        }
-
-        private static void TestP2_27_AGuardConfigEditValidatorExistsAndIsExecutable()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: AGuardConfigEditValidatorExistsAndIsExecutable");
-            var t = GuardConfigEditType();
-            Assert(t != null,
-                "BridgeGuardConfigEdit exists and is reachable from the test build, so the " +
-                "validation is EXECUTED rather than read as text. A validator inside " +
-                "McpBridgeAddOn.cs cannot be tested at all -- that file is in no test build.");
-            if (t == null) return;
-            var m = t.GetMethod("Refuse", new[] { typeof(string), typeof(double), typeof(int) });
-            Assert(m != null,
-                "BridgeGuardConfigEdit.Refuse(string mode, double trailingDrawdown, " +
-                "int minShadowSessions) exists with exactly that shape.");
-        }
-
-        // ⚠️ THE NEGATIVE CONTROL, AND IT IS THE ONE THAT PROVES THE OTHERS MEAN ANYTHING.
-        // A validator that refuses everything passes every single positive test below. This
-        // repo has shipped that exact thing before: P3-30's audit fired on a correctly
-        // protected account and its three acceptance tests were positive-only and stayed green.
-        private static void TestP2_27_AVALIDConfigIsACCEPTED()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: AVALIDConfigIsACCEPTED");
-            var reason = CallRefuse("shadow", 2500.0, 3);
-            Assert(reason == null,
-                "A valid config -- a known mode, a positive trailing drawdown and a " +
-                "non-negative shadow-session count -- is ACCEPTED. Without this, a validator " +
-                "that refuses unconditionally passes every other assertion here.");
-        }
-
-        private static void TestP2_27_AnUnknownModeIsRefusedNamingTheValidOnes()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: AnUnknownModeIsRefusedNamingTheValidOnes");
-            var reason = CallRefuse("enabled", 2500.0, 3);
-            Assert(Refused(reason),
-                "An unrecognised mode is REFUSED. This is P1-72's shape: a value the surface " +
-                "accepts and nothing implements. 'enabled' is the obvious thing an operator " +
-                "types for 'live', and silently storing it would leave the guard in whatever " +
-                "mode the deserializer defaults to.");
-            if (!Refused(reason)) return;
-            Assert(reason.IndexOf("shadow", StringComparison.OrdinalIgnoreCase) >= 0
-                   && reason.IndexOf("live", StringComparison.OrdinalIgnoreCase) >= 0,
-                "The refusal NAMES the valid modes. A refusal that does not say what would " +
-                "have worked sends the operator back to the source, which is the whole " +
-                "complaint P1-90's resolver fixed by listing the 96 real accounts.");
-        }
-
-        private static void TestP2_27_AZeroTrailingDrawdownIsRefused()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: AZeroTrailingDrawdownIsRefused");
-            var reason = CallRefuse("live", 0.0, 3);
-            Assert(Refused(reason),
-                "A trailing drawdown of ZERO is REFUSED. It is not a tight limit, it is NO " +
-                "protection -- and it reads as configured in every surface that lists it, " +
-                "which is the `configured / evaluated / enforcing` confusion that four " +
-                "shipped defects here already are.");
-            if (!Refused(reason)) return;
-            Assert(reason.IndexOf("drawdown", StringComparison.OrdinalIgnoreCase) >= 0,
-                "The refusal names the FIELD that is wrong. A UI shows this text next to an " +
-                "input; 'invalid configuration' is not actionable in a form with a dozen of them.");
-        }
-
-        private static void TestP2_27_ANegativeTrailingDrawdownIsRefused()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: ANegativeTrailingDrawdownIsRefused");
-            Assert(Refused(CallRefuse("live", -500.0, 3)),
-                "A NEGATIVE trailing drawdown is REFUSED. The sign convention is a standing " +
-                "trap here -- NT8's Position.Quantity is absolute and reading its sign doubled " +
-                "a short behind 1311 green tests -- so a negative limit is a caller who has " +
-                "guessed the convention, not one who means it.");
-        }
-
-        private static void TestP2_27_ANegativeShadowSessionCountIsRefused()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: ANegativeShadowSessionCountIsRefused");
-            Assert(Refused(CallRefuse("shadow", 2500.0, -1)),
-                "A negative MinShadowSessions is REFUSED. It cannot be satisfied, so the " +
-                "shadow-session gate can never open -- a lockout you cannot clear, which is " +
-                "P1-37's shape.");
-        }
-
-        // ⚠️ The route must CALL the validator and RETURN on its refusal. Four mutants in this
-        // project have now beaten a source gate meant to prove a value is USED, each weaker
-        // than the last assumed -- called, then mentioned, then returned-nearby, then the
-        // condition neutered to `if (false)` leaving an unreachable `return` in the text. So
-        // this asserts the CONDITION, not the call.
-        private static void TestP2_27_TheRouteRefusesRatherThanComputingAVerdict()
-        {
-            _testsRun++;
-            Console.WriteLine("\n[TEST] P2-27: TheRouteRefusesRatherThanComputingAVerdict");
-            var path = BridgeSourcePath();
-            Assert(File.Exists(path), "The bridge source is readable at " + path);
-            var code = StripComments(File.ReadAllText(path));
-
-            var i = code.IndexOf("private object RiskGuardConfig", StringComparison.Ordinal);
-            Assert(i >= 0, "RiskGuardConfig is still the guard-config handler.");
-            if (i < 0) return;
-            var end = code.IndexOf("private object GetComplianceReport", i, StringComparison.Ordinal);
-            if (end < 0) end = Math.Min(code.Length, i + 6000);
-            var region = code.Substring(i, end - i);
-
-            Assert(region.IndexOf("BridgeGuardConfigEdit", StringComparison.Ordinal) >= 0,
-                "The guard-config write path consults BridgeGuardConfigEdit.");
-
-            var refusal = new Regex(
-                @"BridgeGuardConfigEdit\.Refuse\([^;]*;\s*if\s*\(\s*!?\s*string\.IsNullOrEmpty\s*\(",
-                RegexOptions.Singleline);
-            Assert(refusal.IsMatch(region),
-                "The verdict is TESTED by a real condition, not merely computed. A gate that a " +
-                "value is computed is not a gate that it is used.");
-
-            var applyAt = region.IndexOf("SaveAndReloadConfig", StringComparison.Ordinal);
-            var checkAt = region.IndexOf("BridgeGuardConfigEdit", StringComparison.Ordinal);
-            Assert(applyAt < 0 || (checkAt >= 0 && checkAt < applyAt),
-                "The check runs BEFORE SaveAndReloadConfig. Validating after applying is a " +
-                "report, not a gate -- the live engine has already been reloaded by then.");
-        }
 
         public static int Run()
         {
@@ -1419,13 +1268,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestF17_CatalogParsesConfiguredConnectionsWithoutReadingCredentials();
             TestF17_CatalogAbsentKeepsOnlyConfiguredRows();
             TestF17_TheConnectionCallIsMarshalledToTheUiDispatcher();
-            TestP2_27_AGuardConfigEditValidatorExistsAndIsExecutable();
-            TestP2_27_AVALIDConfigIsACCEPTED();
-            TestP2_27_AnUnknownModeIsRefusedNamingTheValidOnes();
-            TestP2_27_AZeroTrailingDrawdownIsRefused();
-            TestP2_27_ANegativeTrailingDrawdownIsRefused();
-            TestP2_27_ANegativeShadowSessionCountIsRefused();
-            TestP2_27_TheRouteRefusesRatherThanComputingAVerdict();
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();
@@ -1479,7 +1321,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 68;
+            const int declared = 61;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
