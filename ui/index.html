@@ -95,6 +95,17 @@
   .act[disabled] { opacity: .4; cursor: not-allowed; }
   .act.warn { border-color: var(--amber); color: var(--amber); }
   .banner.ok { border-color: var(--green); }
+  /* P1-125. The system row's severity vocabulary, and it is the ONLY thing this page
+     decides about the copier's state: the name comes from CopierEnforcementView, which
+     is in the test build, and all that happens here is a colour. Deliberately a NAME and
+     not a number -- the rows in the same payload carry a numeric `severity` whose 0 is
+     the WORST, and keying a colour off the wrong polarity would paint an orphan green. */
+  .sev-ok { color: var(--green); }
+  .sev-info { color: var(--dim); }
+  .sev-warn { color: var(--amber); }
+  .sev-critical { color: var(--red); }
+  .banner.warn { border-color: var(--amber); }
+  .banner .detail { color: var(--dim); font-size: 12px; margin-top: 4px; }
   .banner .dismiss { float: right; padding: 1px 8px; font-size: 12px; }
   .banner .reason {
     display: block; margin-top: 6px; color: var(--text);
@@ -119,6 +130,11 @@
 <header>
   <h1>RiskGuard — rule inventory</h1>
   <span class="meta" id="hdr">connecting…</span>
+  <!-- P1-125. The second of the system row's indicators. The guard's mode and the
+       COPIER's are different switches -- separate since P3-34, so the sim can copy
+       while the guard observes -- and this page showed only the first. An operator
+       told about "mode shadow" reads it as covering both. -->
+  <span class="meta" id="hdrcopier">copier …</span>
   <span style="flex:1"></span>
   <span class="meta" id="taken"></span>
   <button id="refresh">Refresh</button>
@@ -177,6 +193,14 @@ var LABEL = {
 function esc(s) {
   return String(s === null || s === undefined ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// For text going inside an ATTRIBUTE, where esc() is not enough: it leaves quotes
+// alone, and these strings carry values from a hand-edited config file. An
+// unrecognised copier mode is quoted back to the operator verbatim (that is the
+// point of P1-87), so `"` in a mode name would otherwise close the attribute early.
+function escAttr(s) {
+  return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // ⚠️ null and 0 are DIFFERENT and must render differently. A rule with no
@@ -399,20 +423,66 @@ function position(side, qty) {
   return esc(side === "Long" ? "L" : "S") + " " + esc(qty);
 }
 
+// P1-125. The copier third of the system row, rendered from `system` in the same
+// payload as the rows. Nothing here decides anything: severity, headline and detail
+// are all folded in core by CopierStatusView out of the same relationships and groups
+// the table below renders, so this page and the WPF window cannot disagree about
+// whether the copier is copying.
+//
+// It runs BEFORE the error and empty branches on purpose. "The bridge did not answer"
+// and "the copier is disabled" are both states in which nothing is being copied, and
+// the header must not go blank -- a blank indicator reads as "fine".
+function renderCopierSystem(sys) {
+  var el = document.getElementById("hdrcopier");
+  if (!el) return;
+
+  if (!sys) {
+    el.innerHTML = 'copier <b class="sev-critical">unknown</b>';
+    el.title = "The bridge did not report the copier's state, so this page cannot say "
+             + "whether anything is being copied.";
+    return;
+  }
+
+  el.innerHTML = 'copier <b class="sev-' + esc(sys.severity) + '">' + esc(sys.mode) + '</b>'
+    + ' &middot; ' + (sys.isActing ? 'acting' : '<b class="sev-' + escAttr(sys.severity) + '">not acting</b>')
+    + (sys.configConflicts
+        ? ' &middot; <b class="sev-warn">' + sys.configConflicts + ' conflict'
+          + (sys.configConflicts === 1 ? '' : 's') + '</b>'
+        : '');
+  el.title = (sys.headline || "") + " " + (sys.detail || "");
+}
+
+function copierBanner(sys) {
+  // Silent when the copier is doing what it is configured to do. A banner that is
+  // always there is furniture, and the operator stops reading it -- the same reason
+  // the fleet banner appears only when the guard cannot act.
+  if (!sys || sys.severity === "ok") return "";
+  // info is stated, not shouted: "live, but nothing is armed" is a fact about the
+  // configuration, not a fault, and painting it the same amber as a shadow copier is
+  // how amber stops meaning anything. Only warn and critical get a colour.
+  var cls = sys.severity === "critical" ? " bad" : (sys.severity === "warn" ? " warn" : "");
+  return '<div class="banner' + cls + '">'
+       + '<b>' + esc(sys.headline || "") + '</b>'
+       + '<div class="detail">' + esc(sys.detail || "") + '</div></div>';
+}
+
 function renderCopier(data) {
   var el = document.getElementById("copier");
   if (!el) return;
 
+  renderCopierSystem(data.system);
+
   if (data.error) {
-    el.innerHTML = '<section><h2>Copier</h2><div class="banner bad">'
-                 + esc(data.error) + '</div></section>';
+    el.innerHTML = '<section><h2>Copier</h2>' + copierBanner(data.system)
+                 + '<div class="banner bad">' + esc(data.error) + '</div></section>';
     return;
   }
 
   // "The copier mirrors nothing" and "the copier is not loaded" are different
   // answers and the payload distinguishes them, so the page must too.
   if (!data.rows || !data.rows.length) {
-    el.innerHTML = '<section><h2>Copier</h2><div class="banner">The copier is loaded and has '
+    el.innerHTML = '<section><h2>Copier</h2>' + copierBanner(data.system)
+                 + '<div class="banner">The copier is loaded and has '
                  + '<b>no relationships</b>. Nothing is being mirrored.</div></section>';
     return;
   }
@@ -425,6 +495,7 @@ function renderCopier(data) {
   lastCopierRows = rows;
 
   var html = '<section><h2>Copier (' + rows.length + ')</h2>'
+    + copierBanner(data.system)
     + '<table><thead><tr>'
     + '<th>Verdict</th><th>Leader &rarr; Follower</th><th>Instrument</th>'
     + '<th>Leader</th><th>Expected</th><th>Actual</th>'
@@ -432,9 +503,14 @@ function renderCopier(data) {
     + '</tr></thead><tbody>';
 
   rows.forEach(function (r, i) {
+    // P3-122/P1-125. `notEnforcingLabel` replaces the two flags this page used to
+    // derive for itself ("disabled", "not armed"), and it is strictly more than they
+    // were: those two named the relationship's own terms only, so a row under a
+    // `shadow` copier -- copying nothing at all -- carried no flag whatsoever. The
+    // label and its sentence come from ONE ordering in CopierEnforcementView, ranked
+    // by what BINDS. `clamped` survives because it is not a refusal: that row copies.
     var flags = [];
-    if (!r.isEnabled) flags.push("disabled");
-    if (!r.armedForLive) flags.push("not armed");
+    if (r.notEnforcingLabel) flags.push(r.notEnforcingLabel);
     if (r.expectedIsClamped) flags.push("clamped by MaxPositionSize");
 
     var mismatch = r.actualSide !== r.expectedSide || r.actualQuantity !== r.expectedQuantity;
@@ -450,7 +526,12 @@ function renderCopier(data) {
       + '<td class="pos' + (mismatch ? ' bad' : '') + '">' + position(r.actualSide, r.actualQuantity) + '</td>'
       + '<td>' + metric(r.latency, "ms") + '</td>'
       + '<td>' + metric(r.slippage, "ticks") + '</td>'
-      + '<td class="note">' + esc(r.quarantineReason || flags.join(" · ")) + '</td>'
+      // The full sentence is the tooltip rather than the cell: it is 30 words, it is
+      // identical on every row whenever the GLOBAL mode is the cause, and a table that
+      // repeats one paragraph per row buries the row that differs (P2-41's shape). The
+      // banner above states it once; here it is one click of hover away.
+      + '<td class="note"' + (r.notEnforcingReason ? ' title="' + escAttr(r.notEnforcingReason) + '"' : '')
+      + '>' + esc(r.quarantineReason || flags.join(" · ")) + '</td>'
       // The release button appears only on a quarantined row, because an action
       // that is always offered and usually meaningless trains you to ignore it.
       + '<td>'

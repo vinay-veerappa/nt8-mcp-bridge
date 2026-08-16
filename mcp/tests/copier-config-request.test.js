@@ -31,7 +31,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { buildCopierConfigRequest } from '../lib/copier-config-request.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Reads ──────────────────────────────────────────────────────────────
 
@@ -327,4 +333,106 @@ test('the builder does not mutate the caller args', () => {
   const copy = JSON.parse(JSON.stringify(args));
   buildCopierConfigRequest(args);
   assert.deepEqual(args, copy, 'a mapping function that rewrites its input is a read that mutates');
+});
+
+// ─── P2-129: three lists, and the gate watched the two that agreed ──────
+
+/**
+ * P2-129. `set_mode` was in the tool SCHEMA (advertised) and in the addon's
+ * `knownActions` (implemented) -- those two lists agreed exactly, 14 for 14, and a
+ * test in tool-schema.test.js proved it in both directions. The builder in between,
+ * which is the only one of the three that RUNS, named neither `set_mode` nor any set
+ * containing it, so every call threw `unknown action 'set_mode'` before reaching the
+ * bridge at all.
+ *
+ * Measured live 2026-08-16: `nt_copier_config action=set_mode copierMode=shadow` was
+ * refused by the wrapper while `curl` against the same addon accepted it and changed
+ * the mode. The copier's global gate -- the one that decides whether ANY copy is
+ * submitted, and the one P1-125 had just made visible on the operator's page -- was
+ * unreachable through the tool that advertises it.
+ *
+ * ⚠️ THE LESSON IS THE GATE'S REGION, NOT THE LINE. A schema/addon agreement test is
+ * the right idea aimed at the wrong pair: it compares what is DECLARED at each end and
+ * cannot see the translation between them. The test below drives the BUILDER, because
+ * that is the artefact that decides.
+ */
+test('P2-129: every action the ADDON accepts can be built by this wrapper', () => {
+  // Extracted from the addon source, never transcribed -- a hand-typed copy cannot
+  // see the addon change, which is how P1-72 regressed twice.
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '..', '..', 'addons', 'McpBridgeAddOn.cs'), 'utf8');
+  const block = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').map(l => { const i = l.indexOf('//'); return i >= 0 ? l.slice(0, i) : l; })
+    .join('\n')
+    .match(/knownActions\s*=\s*new\s+HashSet<string>\s*\([^)]*\)\s*\{([\s\S]*?)\}/);
+  assert.ok(block, 'found the addon knownActions initializer -- without it this pin is a comment');
+
+  const addonActions = [...block[1].matchAll(/"([^"]+)"/g)]
+    .map(x => x[1]).filter(a => /^[a-z_]+$/.test(a));
+  assert.ok(addonActions.length >= 14,
+    `extracted a plausible whitelist (got ${addonActions.length})`);
+
+  // Every argument any action might need, supplied at once: this test is about which
+  // actions are REACHABLE, not about their argument rules, which are tested above.
+  const everyArg = {
+    leaderAccount: 'Sim101', followerAccount: 'Sim-ORB',
+    groupName: 'G', followerAccounts: ['Sim-ORB'], copierMode: 'shadow',
+  };
+
+  const unreachable = [];
+  for (const action of addonActions) {
+    try {
+      const req = buildCopierConfigRequest({ action, ...everyArg });
+      // Reachable is not enough: what it SENDS must be an action the addon knows,
+      // or the call is refused at the far end instead of at this one.
+      const sent = req.method === 'GET'
+        ? (new URL(req.path, 'http://x').searchParams.get('action') ?? 'get')
+        : req.body.action;
+      if (!addonActions.includes(sent)) unreachable.push(`${action} -> sends "${sent}"`);
+    } catch (e) {
+      unreachable.push(`${action} -> ${e.message.split('.')[0]}`);
+    }
+  }
+
+  assert.deepEqual(unreachable, [],
+    'every action the addon implements is reachable through the builder. Unreachable: '
+    + unreachable.join('; '));
+});
+
+test('P2-129: set_mode is global -- it names no relationship and carries the mode', () => {
+  const req = buildCopierConfigRequest({ action: 'set_mode', copierMode: 'shadow' });
+  assert.equal(req.method, 'POST');
+  assert.equal(req.body.action, 'set_mode');
+  assert.equal(req.body.copierMode, 'shadow');
+
+  // ⚠️ It must NOT be routed through the relationship branch. That branch requires a
+  // leader and a follower, and demanding them here would name a scope this action does
+  // not have: set_mode changes what EVERY relationship does.
+  assert.ok(!('leaderAccount' in req.body),
+    'a global mode change names no leader -- requiring one would be a scope this action lacks');
+  assert.ok(!('followerAccount' in req.body), 'and no follower');
+
+  // The mode itself is required: `set_mode` with nothing to set would reach the bridge
+  // as a request to set the mode to nothing.
+  assert.throws(() => buildCopierConfigRequest({ action: 'set_mode' }), /copierMode/);
+
+  // ⚠️ And the VALUE is deliberately not validated here. The addon owns which modes
+  // exist and fails closed on the rest; a second list in the wrapper is how P3-111's
+  // hand-typed `period` enum came to forbid twelve values the addon serves.
+  assert.doesNotThrow(
+    () => buildCopierConfigRequest({ action: 'set_mode', copierMode: 'nonsense' }),
+    'an unrecognised mode is the ADDON\'s refusal to make, not this file\'s');
+});
+
+test('P2-129: the refusal message lists every action the builder accepts', () => {
+  // A refusal that names an incomplete menu sends the caller looking for another tool.
+  // `set_mode` was missing from the accepted set AND from this message, for the same
+  // reason and for the same length of time.
+  let message = '';
+  try { buildCopierConfigRequest({ action: 'no_such_action' }); } catch (e) { message = e.message; }
+  assert.match(message, /unknown action/);
+  for (const a of ['get', 'set', 'set_mode', 'set_group']) {
+    assert.ok(message.includes(a), `the refusal names "${a}" as available`);
+  }
 });

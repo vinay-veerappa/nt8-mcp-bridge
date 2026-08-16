@@ -178,6 +178,21 @@ jobs:
       - name: Mutation F-17 (connection control that must refuse before it strands)
         run: python mutation/mutate_f17.py
 
+      # P1-125 + P3-122. The browser UI showed the GUARD's mode and never the COPIER's, so a
+      # `disabled` copier -- submitting nothing, anywhere -- rendered exactly like a working one.
+      # Reporting one of two modes is worse than reporting neither. Shipped with P3-122, the
+      # ordering defect in the reason text: the mode was named LAST, so an enabled+UNARMED
+      # relationship under a `shadow` copier was told it "copies to SIMULATION followers only"
+      # while the copy path blocks before any follower is reached. RANK REFUSAL REASONS BY WHAT
+      # BINDS, NOT BY WHAT SURPRISES -- and a defect in a string nothing DISPLAYS is not reachable
+      # by an operator, which is why one battery covers both.
+      # ⚠️ The mutant to know is group 1's second: it DELETES the simulation sentence rather than
+      # misplacing it. Every assertion about the filed defect passes under that, because they all
+      # say the sentence must not appear; only the positive control -- that it still appears when
+      # the copier IS acting -- can catch a reorder that quietly dropped a correct answer.
+      - name: Mutation P1-125 (the copier's own mode, and which refusal binds)
+        run: python mutation/mutate_p1125.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core

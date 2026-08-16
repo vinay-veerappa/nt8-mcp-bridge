@@ -557,9 +557,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // reason as the inventory -- and with one extra: CopierConformance's integers are
                 // historical rather than severity, so each row carries a stated `severity` rank.
                 // Sorting by the enum cast would put an ORPHAN below a quarantined row.
+                //
+                // P1-125. The rows are core's; the `system` block and the per-row refusal are
+                // added here, because the page that reads this had no way to know the copier's
+                // GLOBAL mode -- the one gate that decides whether any of these rows means
+                // anything -- and rendered a `disabled` copier identically to a live one.
                 case "/api/copier/snapshot":
-                    return JObject.Parse(CopierSnapshotJson.ToJson(
-                        TradeCopierEngine.Instance == null ? null : TradeCopierEngine.Instance.GetSnapshot()));
+                    return GetCopierSnapshot();
 
                 // P0-9 targets/OCO research: what does each connection actually support?
                 // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
@@ -4592,6 +4596,69 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var cfg = PropFirmProtectionSuite.Instance.Config;
                 return new { success = true, action, persisted = File.Exists(PropLimitsFile), loaded = true, enforcing = PropRulesAreEnforcing(), config = cfg };
             }
+        }
+
+        /// <summary>
+        /// The copier conformance rows, plus the two things the page could not see: the copier's
+        /// GLOBAL mode, and why each individual row is or is not enforcing.
+        ///
+        /// P1-125. The header of /ui reads `mode shadow · armed · cannot act` and that is the
+        /// GUARD's mode. The copier has had its own live/shadow/disabled mode since P3-34 --
+        /// deliberately separate, so the sim can keep copying while the guard observes -- and it
+        /// appeared nowhere on the page. Reporting one mode and not the other is worse than
+        /// reporting neither: it invites the reader to assume both were covered.
+        ///
+        /// ⚠️ EVERY DECISION BELOW IS SOMEBODY ELSE'S. The severity, headline and detail are
+        /// CopierStatusView.Describe's, folded in core out of the same relationships and groups
+        /// this payload's rows come from -- so the browser page and the WPF window cannot
+        /// disagree about whether the copier is copying, which is what P3-122 was. The wire
+        /// shape and the not-loaded case are CopierEnforcementView's, which the bridge harness
+        /// executes. This method is plumbing, and that is the point: it is in no test build.
+        /// </summary>
+        private object GetCopierSnapshot()
+        {
+            var engine = TradeCopierEngine.Instance;
+            var payload = JObject.Parse(CopierSnapshotJson.ToJson(
+                engine == null ? null : engine.GetSnapshot()));
+            var camel = JsonSerializer.Create(GuardSnapshotJson.UiJsonSettings);
+
+            if (engine == null)
+            {
+                payload["system"] = JObject.FromObject(CopierEnforcementView.NotLoadedCell(), camel);
+                return payload;
+            }
+
+            string copierMode = engine.GetCopierMode();
+            bool acting = TradeCopierEngine.IsCopierActingMode(copierMode);
+            var conflicts = engine.DetectConfigConflicts();
+
+            var headline = CopierStatusView.Describe(
+                copierMode, engine.GetRelationships(), engine.GetGroups(),
+                conflicts == null ? 0 : conflicts.Count);
+
+            payload["system"] = JObject.FromObject(
+                CopierEnforcementView.SystemCell(
+                    copierMode, acting, (int)headline.Severity,
+                    headline.Text, headline.Detail, conflicts == null ? 0 : conflicts.Count),
+                camel);
+
+            // Per row, because `isEnabled` and `armedForLive` differ per row -- and when they do
+            // not, the repetition is itself the finding: the same sentence on every row is the
+            // global mode speaking, which is exactly what the operator was never told.
+            var rows = payload["rows"] as JArray;
+            foreach (var row in rows ?? new JArray())
+            {
+                bool isEnabled = (bool?)row["isEnabled"] ?? false;
+                bool armedForLive = (bool?)row["armedForLive"] ?? false;
+                var refusal = CopierEnforcementView.WhyNotEnforcing(
+                    isEnabled, armedForLive, acting, copierMode);
+
+                row["enforcing"] = CopierEnforcementView.IsEnforcing(isEnabled, armedForLive, acting);
+                row["notEnforcingLabel"] = refusal == null ? null : refusal.Label;
+                row["notEnforcingReason"] = refusal == null ? null : refusal.Sentence;
+            }
+
+            return payload;
         }
 
         /// <summary>

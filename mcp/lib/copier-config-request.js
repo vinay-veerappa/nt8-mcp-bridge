@@ -44,6 +44,18 @@ const GROUP_WRITES = new Set([
 // Group writes that name a single follower rather than a list.
 const NEEDS_ONE_FOLLOWER = new Set(['add_follower_to_group', 'remove_follower_from_group']);
 
+// P2-129. Writes that name NO relationship, because they are global. `set_mode` was
+// advertised by this tool's schema and implemented by the addon's knownActions -- the
+// two lists agreed EXACTLY, 14 for 14 -- and refused right here, by the only one of the
+// three that runs. Measured live: `nt_copier_config action=set_mode` threw
+// `unknown action 'set_mode'`, so the copier's global live/shadow/disabled gate was
+// unreachable through the wrapper while both halves of the contract named it.
+//
+// It also must NOT go through the relationship branch below, which requires a leader and
+// a follower: this action changes what EVERY relationship does, and demanding one names a
+// scope it does not have.
+const GLOBAL_WRITES = new Set(['set_mode']);
+
 // Every relationship field the engine stores and this tool can now set. Ordered as
 // the operator thinks about them, not alphabetically.
 const RELATIONSHIP_FIELDS = [
@@ -76,7 +88,10 @@ const GROUP_FIELDS = [
 const PATH = '/api/copier/config';
 
 function known() {
-  return [...READ_ACTIONS, ...RELATIONSHIP_WRITES, ...GROUP_WRITES].join(', ');
+  // Every set the refusal above tests, or the message names fewer actions than the code
+  // accepts -- and a refusal that lists an incomplete menu sends the caller looking for a
+  // different tool. `set_mode` was missing from BOTH for exactly as long (P2-129).
+  return [...READ_ACTIONS, ...RELATIONSHIP_WRITES, ...GROUP_WRITES, ...GLOBAL_WRITES].join(', ');
 }
 
 /** Present means present. `false` and `0` are values; only undefined/null are absent. */
@@ -126,7 +141,8 @@ function translateAutoConversion(args, body) {
 export function buildCopierConfigRequest(args = {}) {
   const action = (has(args, 'action') ? String(args.action) : 'get').trim();
 
-  if (!READ_ACTIONS.has(action) && !RELATIONSHIP_WRITES.has(action) && !GROUP_WRITES.has(action)) {
+  if (!READ_ACTIONS.has(action) && !RELATIONSHIP_WRITES.has(action)
+      && !GROUP_WRITES.has(action) && !GLOBAL_WRITES.has(action)) {
     throw new Error(
       `nt_copier_config: unknown action '${action}'. Known actions: ${known()}. ` +
       `Refusing rather than falling through to a read -- the bridge would return ` +
@@ -149,6 +165,18 @@ export function buildCopierConfigRequest(args = {}) {
 
   // ── Writes: POST, and only what was supplied.
   const body = {};
+
+  if (GLOBAL_WRITES.has(action)) {
+    // The mode itself is deliberately NOT validated here. The addon's TrySetCopierMode
+    // owns which modes exist and fails closed on anything else, and a second list in the
+    // wrapper is how P3-111's hand-typed `period` enum came to forbid twelve values the
+    // addon serves. What IS enforced is presence: `set_mode` with no mode would otherwise
+    // reach the bridge as a request to set the mode to nothing.
+    require_(args, 'copierMode', action);
+    body.action = action;
+    body.copierMode = args.copierMode;
+    return { method: 'POST', path: PATH, body };
+  }
 
   if (GROUP_WRITES.has(action)) {
     require_(args, 'groupName', action);

@@ -1322,6 +1322,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP334_EnforcingIsDerivedFromTheCopierGate();
             TestP334_TheNotEnforcingReasonNamesTheGlobalSwitch();
             TestP334_TheEndpointExposesAndCanSetTheMode();
+            TestP3122_TheBindingGateIsNamedBeforeTheSurprisingOne();
+            TestP3122_TheLabelAndTheSentenceAreOneOrdering();
+            TestP1125_TheSystemCellReportsTheCopiersOwnMode();
+            TestP1125_SeverityIsANameAndAnUnknownRankIsNotHealthy();
+            TestP1125_TheSnapshotRouteDelegatesEveryDecision();
+            TestP1125_ThePageActuallyReadsWhatTheRouteNowSends();
             TestP1_97_TheOrderActionIsResolvedFromThePosition();
             TestP1_97_TheEndpointResolvesRatherThanHardcoding();
             TestP0_104_TheFlattensOwnOrderIsNotCancelled();
@@ -1373,7 +1379,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 62;
+            const int declared = 68;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -1502,6 +1508,325 @@ namespace NinjaTrader.NinjaScript.AddOns
             // copier's mode -- the trap CopierReadFromQuery's whitelist exists to prevent.
             Assert(!Regex.IsMatch(code, @"action\.Equals\(""set_mode"", StringComparison\.OrdinalIgnoreCase\)\s*\|\|\s*isRead"),
                 "and set_mode is not in the GET read whitelist, so it cannot be issued as a URL");
+        }
+
+        // ================================================================================
+        // P3-122 / P1-125. EXECUTED.
+        //
+        // P3-122: the reason ordering. `NotEnforcingReason` named the mode LAST, on the
+        // stated grounds that it is "the one an operator will not think to check" -- right
+        // about which reason SURPRISES, wrong about which one BINDS. An enabled, unarmed
+        // relationship under a `shadow` copier was told it "copies to SIMULATION followers
+        // only" while the copy path blocks before any follower is reached, so it copies to
+        // simulation followers too. The sentence described a behaviour that was not
+        // happening, which is worse than saying nothing.
+        //
+        // Found by comparing two readers of one question: CopierStatusView (the WPF window,
+        // core) ranks mode ABOVE armed and got this right. Both now do.
+        //
+        // P1-125: the browser page never stated the copier's global mode at all.
+        // ================================================================================
+
+        private static void TestP3122_TheBindingGateIsNamedBeforeTheSurprisingOne()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-122: the reason names the gate that BINDS, not the one that surprises");
+
+            // ⚠️ THE REGRESSION ROW, verbatim from the ticket: enabled, NOT armed, shadow.
+            // Under the old ordering this returned the simulation sentence.
+            string unarmedShadow = CopierEnforcementView.NotEnforcingReason(true, false, false, "shadow");
+            Assert(unarmedShadow != null
+                   && unarmedShadow.IndexOf("copies to SIMULATION", StringComparison.OrdinalIgnoreCase) < 0,
+                "an enabled, UNARMED relationship under a `shadow` copier is NOT described as "
+                + "copying to simulation followers -- in shadow the copy path blocks before any "
+                + "follower is reached, so that sentence is false in the direction that reassures. "
+                + "Got: " + (unarmedShadow ?? "<null>"));
+            // ⚠️ Paired with the POSITIVE half, because the assertion above is a substring test
+            // and a reworded false claim would walk past it. Any sentence that also states
+            // nothing is submitted contradicts itself visibly if the promise creeps back.
+            Assert(unarmedShadow != null
+                   && unarmedShadow.IndexOf("submits nothing", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and it states the TRUE behaviour outright -- nothing is submitted, to anyone. "
+                + "Got: " + (unarmedShadow ?? "<null>"));
+            Assert(unarmedShadow != null
+                   && unarmedShadow.IndexOf("shadow", StringComparison.OrdinalIgnoreCase) >= 0,
+                "it names the MODE instead. Got: " + (unarmedShadow ?? "<null>"));
+
+            // ⚠️ And the moved branch must not have taken the arming claim with it. The old
+            // mode sentence asserted "enabled and armed"; reached now by unarmed rows too, an
+            // unchanged string would state the opposite of the row it is explaining.
+            Assert(unarmedShadow != null && unarmedShadow.IndexOf("and armed", StringComparison.Ordinal) < 0,
+                "and it does NOT claim the relationship is armed, because this row is not. "
+                + "Got: " + unarmedShadow);
+            string armedShadow = CopierEnforcementView.NotEnforcingReason(true, true, false, "shadow");
+            Assert(armedShadow != null && armedShadow.IndexOf("armed", StringComparison.Ordinal) >= 0,
+                "while an ARMED row under the same mode still says so -- the two rows differ in "
+                + "a way the operator can act on. Got: " + (armedShadow ?? "<null>"));
+
+            // The `disabled` mode takes the same path and must keep its own name (P1-87).
+            string unarmedOff = CopierEnforcementView.NotEnforcingReason(true, false, false, "disabled");
+            Assert(unarmedOff != null
+                   && unarmedOff.IndexOf("simulation", StringComparison.OrdinalIgnoreCase) < 0
+                   && unarmedOff.IndexOf("disabled", StringComparison.OrdinalIgnoreCase) >= 0,
+                "the same row under a `disabled` copier names that mode, and still does not "
+                + "promise simulation followers. Got: " + (unarmedOff ?? "<null>"));
+
+            // ⚠️ THE OTHER DIRECTION, which is the half a reordering breaks silently: the
+            // simulation sentence must still be reachable. It is the correct answer whenever
+            // the copier IS acting, and a reorder that deleted it in practice would pass every
+            // assertion above.
+            string simOnly = CopierEnforcementView.NotEnforcingReason(true, false, true, "live");
+            Assert(simOnly != null
+                   && simOnly.IndexOf("SIMULATION", StringComparison.OrdinalIgnoreCase) >= 0,
+                "with the copier LIVE, an unarmed relationship really does copy to simulation "
+                + "followers only, and is told so. Got: " + (simOnly ?? "<null>"));
+
+            // The nearest actionable cause still wins over the global one.
+            string off = CopierEnforcementView.NotEnforcingReason(false, false, false, "shadow");
+            Assert(off != null && off.IndexOf("disabled", StringComparison.OrdinalIgnoreCase) >= 0
+                   && off.IndexOf("COPIER", StringComparison.Ordinal) < 0,
+                "and a relationship the operator switched off is explained by ITS OWN state, not "
+                + "by the global mode -- that is the switch they would go and flip. Got: "
+                + (off ?? "<null>"));
+
+            // Enforcing is still silent.
+            Assert(CopierEnforcementView.NotEnforcingReason(true, true, true, "live") == null,
+                "an enforcing relationship still has no reason at all");
+        }
+
+        private static void TestP3122_TheLabelAndTheSentenceAreOneOrdering()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P3-122: the short label and the full sentence are ONE decision");
+
+            // The label exists so a table cell need not carry a 30-word paragraph. If it were
+            // computed anywhere else it would be free to disagree with the sentence beside it,
+            // which is this ticket at a smaller scale. Drive the whole space.
+            string[] modes = { "live", "shadow", "disabled", "Shadow_Mode_Typo", "", null };
+            int refusals = 0, enforcing = 0;
+
+            foreach (bool isEnabled in new[] { true, false })
+            foreach (bool armed in new[] { true, false })
+            foreach (bool acting in new[] { true, false })
+            foreach (string mode in modes)
+            {
+                var why = CopierEnforcementView.WhyNotEnforcing(isEnabled, armed, acting, mode);
+                string sentence = CopierEnforcementView.NotEnforcingReason(isEnabled, armed, acting, mode);
+                bool isEnf = CopierEnforcementView.IsEnforcing(isEnabled, armed, acting);
+
+                if (why == null)
+                {
+                    enforcing++;
+                    if (!(isEnf && sentence == null))
+                        Assert(false, "a null refusal must mean IsEnforcing and a null sentence, "
+                            + "for " + isEnabled + "/" + armed + "/" + acting + "/" + (mode ?? "<null>"));
+                    continue;
+                }
+
+                refusals++;
+                if (isEnf)
+                    Assert(false, "a refusal was produced for a relationship that IS enforcing: "
+                        + isEnabled + "/" + armed + "/" + acting + "/" + (mode ?? "<null>"));
+                if (why.Sentence != sentence)
+                    Assert(false, "NotEnforcingReason disagreed with WhyNotEnforcing().Sentence for "
+                        + isEnabled + "/" + armed + "/" + acting + "/" + (mode ?? "<null>"));
+                if (string.IsNullOrWhiteSpace(why.Label))
+                    Assert(false, "a refusal carried no label for "
+                        + isEnabled + "/" + armed + "/" + acting + "/" + (mode ?? "<null>"));
+                if (why.Label.Length >= why.Sentence.Length)
+                    Assert(false, "the label is not shorter than the sentence for "
+                        + isEnabled + "/" + armed + "/" + acting + "/" + (mode ?? "<null>")
+                        + " -- a 'short' form as long as the paragraph is not one");
+            }
+
+            Assert(refusals == 42 && enforcing == 6, string.Format(
+                "all 48 combinations answered, 42 refusing and 6 enforcing (the 6 being "
+                + "enabled+armed+acting, once per mode string -- IsEnforcing does not read the "
+                + "mode NAME, only the answer the engine gave about it). Got {0} and {1}",
+                refusals, enforcing));
+
+            // A null/blank mode is quoted back as something rather than vanishing mid-sentence.
+            var blank = CopierEnforcementView.WhyNotEnforcing(true, true, false, null);
+            Assert(blank != null && blank.Sentence.Contains("(unset)"),
+                "a null mode reads as '(unset)', not as an empty gap the operator has to "
+                + "interpret. Got: " + (blank == null ? "<null>" : blank.Sentence));
+        }
+
+        private static void TestP1125_TheSystemCellReportsTheCopiersOwnMode()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-125: the system cell states the COPIER's mode, and the not-loaded case");
+
+            var live = CopierEnforcementView.SystemCell(
+                "live", true, 0, "[ COPIER LIVE - 2 ARMED ]", "2 relationships, 2 armed for live.", 0);
+            Assert(live.Loaded && live.IsActing && live.Mode == "live" && live.Severity == "ok",
+                "a live, acting copier is reported as loaded, acting and ok");
+            Assert(live.Headline == "[ COPIER LIVE - 2 ARMED ]"
+                   && live.Detail == "2 relationships, 2 armed for live.",
+                "and the headline and detail are passed through UNCHANGED -- they are "
+                + "CopierStatusView's words, and rewording them here is how this page would "
+                + "start disagreeing with the window about the same copier");
+
+            var shadow = CopierEnforcementView.SystemCell(
+                "shadow", false, 2, "[ COPIER SHADOW ]", "Shadow: the copier logs and submits nothing.", 1);
+            Assert(!shadow.IsActing && shadow.Severity == "warn" && shadow.ConfigConflicts == 1,
+                "a shadow copier is not acting, warns, and carries its conflict count");
+
+            var blank = CopierEnforcementView.SystemCell("   ", false, 3, "h", "d", 0);
+            Assert(blank.Mode == "(unset)",
+                "a blank mode renders as '(unset)' -- an empty header field reads as 'nothing to "
+                + "report', which is the one thing it does not mean");
+
+            // ⚠️ The state that must not look like health. `TradeCopierEngine.Instance` is null
+            // on a box where the copier addon failed to load, and the route has to answer
+            // something. A blank indicator in the header is read as fine.
+            var none = CopierEnforcementView.NotLoadedCell();
+            Assert(!none.Loaded && !none.IsActing && none.Severity == "critical",
+                "no copier at all is CRITICAL and not acting -- not a blank");
+            Assert(none.Headline.IndexOf("NOT LOADED", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and it says so in the headline. Got: " + none.Headline);
+            Assert(none.Detail.IndexOf("not the same", StringComparison.OrdinalIgnoreCase) >= 0,
+                "and distinguishes itself from a loaded copier with no relationships, because "
+                + "the page already tells those two apart for the rows. Got: " + none.Detail);
+            Assert(none.Mode != null && none.Mode != "live",
+                "and it never reports a mode that would read as working");
+        }
+
+        private static void TestP1125_SeverityIsANameAndAnUnknownRankIsNotHealthy()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-125: severity crosses the wire as a NAME, and an unmapped rank is not 'ok'");
+
+            // CopierStatusSeverity is Ok=0, Info=1, Warn=2, Critical=3.
+            Assert(CopierEnforcementView.SeverityName(0) == "ok"
+                   && CopierEnforcementView.SeverityName(1) == "info"
+                   && CopierEnforcementView.SeverityName(2) == "warn"
+                   && CopierEnforcementView.SeverityName(3) == "critical",
+                "the four ranks map to the four names the page keys its colour off");
+
+            // ⚠️ A member added to the enum upstream and not mapped here is NOT evidence of
+            // health -- the same rule CopierSnapshotJson.SeverityRank applies when it ranks an
+            // unrecognised verdict worst. Fail loud, in the direction that gets looked at.
+            foreach (int rank in new[] { -1, 4, 99, int.MinValue, int.MaxValue })
+                Assert(CopierEnforcementView.SeverityName(rank) == "critical",
+                    "an unmapped rank (" + rank + ") reads as critical, never as ok");
+
+            // ⚠️ AND IT IS A NAME, WHICH IS LOAD-BEARING. The rows in the SAME payload carry a
+            // numeric `severity` from CopierSnapshotJson.SeverityRank where **0 is the worst**.
+            // Two numbers with opposite polarity in one document is a trap for the next
+            // consumer; a colour keyed off the wrong one paints an ORPHAN green.
+            foreach (int rank in new[] { 0, 1, 2, 3, 7 })
+            {
+                string name = CopierEnforcementView.SeverityName(rank);
+                int parsed;
+                Assert(!int.TryParse(name, out parsed),
+                    "rank " + rank + " crosses the wire as a word, not a digit");
+            }
+        }
+
+        /// <summary>
+        /// The route half, in McpBridgeAddOn.cs and therefore in no test build (P2-27). A
+        /// SOURCE gate, and it proves less than the five above -- said plainly, per 5.26.
+        ///
+        /// What it is actually for: this route is the one place the new payload could grow a
+        /// SECOND opinion about whether the copier is copying. The whole design is that it has
+        /// none, and a source gate is the only thing that can see that here.
+        /// </summary>
+        private static void TestP1125_TheSnapshotRouteDelegatesEveryDecision()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-125: the snapshot route decides NOTHING for itself (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            var body = Regex.Match(code,
+                @"private object GetCopierSnapshot\(\)\s*\{(?<b>(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}");
+            Assert(body.Success,
+                "GetCopierSnapshot is locatable, so the assertions below inspect the METHOD and "
+                + "not the whole 7,000-line file -- a check that does not state its region is a "
+                + "check that passes over code it never read");
+            string method = body.Success ? body.Groups["b"].Value : "";
+
+            Assert(Regex.IsMatch(code, @"case ""/api/copier/snapshot"":\s*return GetCopierSnapshot\(\);"),
+                "and the route calls it");
+
+            // Delegation, and USED not merely called: four gates have now been beaten by a
+            // mutant that left a call in place and threw its answer away.
+            Assert(Regex.IsMatch(method, @"CopierStatusView\.Describe\("),
+                "the headline comes from CopierStatusView.Describe -- the same producer the WPF "
+                + "window reads, which is why the two surfaces cannot disagree (P3-122)");
+            Assert(Regex.IsMatch(method, @"headline\.Severity") && Regex.IsMatch(method, @"headline\.Text"),
+                "and its answer is USED: a gate that Describe is CALLED passes under a mutant "
+                + "that discards what it returns");
+            Assert(Regex.IsMatch(method, @"CopierEnforcementView\.SystemCell\(")
+                   && Regex.IsMatch(method, @"CopierEnforcementView\.NotLoadedCell\(\)"),
+                "the wire shape and the no-copier case come from the tested class, including the "
+                + "null-engine branch -- the state where there is nothing to ask");
+            Assert(Regex.IsMatch(method, @"CopierEnforcementView\.WhyNotEnforcing\(")
+                   && Regex.IsMatch(method, @"notEnforcingReason")
+                   && Regex.IsMatch(method, @"notEnforcingLabel"),
+                "and every row carries the refusal, in both lengths -- rendering it is what makes "
+                + "P3-122's ordering reachable by an operator at all");
+
+            // ⚠️ NEGATIVE CONTROL for the two patterns above. A regex that cannot fail is a
+            // comment; these are shown failing against a doctored copy in the same run.
+            string neutered = method
+                .Replace("CopierStatusView.Describe(", "SomethingElse.Describe(")
+                .Replace("CopierEnforcementView.SystemCell(", "LocalCell(");
+            Assert(!Regex.IsMatch(neutered, @"CopierStatusView\.Describe\(")
+                   && !Regex.IsMatch(neutered, @"CopierEnforcementView\.SystemCell\("),
+                "and both patterns DO fail when the delegation is removed");
+
+            // The re-derivation this design exists to forbid. If the route ever compares the
+            // mode to a literal itself, there are two definitions of an acting copier again --
+            // which is P1-100, P2-98/P1-99, P1-105 and P3-111 at a fifth site.
+            Assert(!Regex.IsMatch(method, @"copierMode\s*==\s*""|""live""\s*==\s*copierMode"),
+                "and the method NEVER compares the mode to a literal -- TradeCopierEngine."
+                + "IsCopierActingMode owns that, and a second copy is how the report drifts "
+                + "from the gate");
+        }
+
+        /// <summary>
+        /// The page half. `ui/index.html` is in no test build and no mutation battery can
+        /// reach it, so this is a source gate over a static asset and it proves the least of
+        /// anything here -- but the DEFECT WAS EXACTLY THIS: the fields existed in the API and
+        /// the page read none of them. Measured before the fix: `copierMode`,
+        /// `notEnforcingReason` and `configConflicts` appeared **0** times in this file and
+        /// **21** times in the two sources that produce them.
+        /// </summary>
+        private static void TestP1125_ThePageActuallyReadsWhatTheRouteNowSends(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-125: the page reads the copier's state it is now sent (SOURCE gate)");
+
+            string page = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "..", "ui", "index.html"));
+            Assert(File.Exists(page), "the served page is readable at " + page);
+            if (!File.Exists(page)) return;
+
+            string html = File.ReadAllText(page);
+
+            Assert(html.Contains("hdrcopier"),
+                "the header has a second indicator -- it showed the GUARD's mode and nothing "
+                + "else, and an operator told about one mode assumes both were covered");
+            Assert(Regex.IsMatch(html, @"data\.system") && Regex.IsMatch(html, @"sys\.mode"),
+                "and it renders the `system` block the route now sends, rather than ignoring it");
+            Assert(Regex.IsMatch(html, @"sys\.isActing"),
+                "including whether the copier is ACTING, which is the whole question: a "
+                + "`disabled` copier rendered identically to a working one");
+            Assert(Regex.IsMatch(html, @"r\.notEnforcingLabel") && Regex.IsMatch(html, @"r\.notEnforcingReason"),
+                "and each row shows why it is not enforcing -- P3-122 is a defect in a string, "
+                + "and a string nothing displays is not reachable by the operator");
+            Assert(Regex.IsMatch(html, @"renderCopierSystem\(data\.system\);"),
+                "the indicator is rendered BEFORE the error and empty branches return, so a "
+                + "bridge that did not answer leaves no blank where a state should be");
+
+            // The page must not have started deciding for itself. Its whole contribution is a
+            // colour, and the name it keys that colour off comes from the tested class.
+            Assert(!Regex.IsMatch(html, @"sys\.mode\s*===?\s*""live"""),
+                "and the page NEVER compares the copier mode to a literal -- the acting answer "
+                + "is computed by the engine and shipped, not re-decided in JavaScript");
         }
 
 
