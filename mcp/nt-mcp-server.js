@@ -542,7 +542,15 @@ async function handleToolCall(name, args) {
         await new Promise((r) => setTimeout(r, 1500));
         try {
           const res = await ntFetch('/api/compile/result', 'GET', null, 5000);
-          if (res.status === 200 && res.data && typeof res.data === 'object') return res.data;
+          if (res.status === 200 && res.data && typeof res.data === 'object') {
+            // Filter warnings in Node.js layer — the C# addon may not have the
+            // ignoreWarnings code yet (it hot-swaps after writing the result file).
+            if (args.ignoreWarnings && res.data.warnings) {
+              res.data.warnings = [];
+              res.data.warningCount = 0;
+            }
+            return res.data;
+          }
         } catch { /* bridge reloading */ }
       }
       return { error: 'compile result unavailable' };
