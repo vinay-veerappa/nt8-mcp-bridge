@@ -12,16 +12,14 @@
         "BridgeGuardConfigEdit exists and is reachable from the test build",
         "A valid config -- a known mode, a positive trailing drawdown",
         "An unrecognised mode is REFUSED",
-        "The refusal NAMES the valid modes",
         "A trailing drawdown of ZERO is REFUSED",
-        "The refusal names the FIELD that is wrong",
         "A NEGATIVE trailing drawdown is REFUSED",
         "A negative MinShadowSessions is REFUSED",
         "The guard-config write path consults BridgeGuardConfigEdit",
         "The verdict is TESTED by a real condition",
         "The check runs BEFORE SaveAndReloadConfig"
       ],
-      "note_expect_green": "These are the assertions actually RED at the 396/9 baseline. The load-bearing one is 'A valid config ... is ACCEPTED': a validator that refuses everything satisfies all six negative assertions, and this repo has shipped exactly that -- P3-30's audit fired on correctly protected accounts behind three positive-only acceptance tests. For a refuser, the acceptance case is the one that proves it works.\n\nTwo of these assertions passed VACUOUSLY on their first run: CallRefuse answers a `___CLASS_MISSING___` sentinel while the class does not exist, which is non-empty, so a bare IsNullOrEmpty check was satisfied by the class being ABSENT. They now route through Refused(), which rejects the sentinel. Do not reintroduce a sentinel-shaped return value from Refuse().",
+      "note_expect_green": "Only assertions that ACTUALLY FAIL at baseline belong here -- expect_green is matched against the runner FAILURE LINES and means red-now-green-after. Two sub-assertions were listed here and the loop REFUSED the ticket for it, correctly: they sit behind an if (!Refused(reason)) return; guard, so while the class does not exist they do not FAIL, they never RUN. They are still enforced -- the loop requires the whole suite green at the end -- they just cannot be part of the test-first gate.\n\nThese are the assertions actually RED at the 396/9 baseline. The load-bearing one is 'A valid config ... is ACCEPTED': a validator that refuses everything satisfies all six negative assertions, and this repo has shipped exactly that -- P3-30's audit fired on correctly protected accounts behind three positive-only acceptance tests. For a refuser, the acceptance case is the one that proves it works.\n\nTwo of these assertions passed VACUOUSLY on their first run: CallRefuse answers a `___CLASS_MISSING___` sentinel while the class does not exist, which is non-empty, so a bare IsNullOrEmpty check was satisfied by the class being ABSENT. They now route through Refused(), which rejects the sentinel. Do not reintroduce a sentinel-shaped return value from Refuse().",
       "regions": [
         {
           "id": "NewGuardConfigEditClass",
