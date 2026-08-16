@@ -1384,11 +1384,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2127_TheOrderIsTOTALSoTheSameDataGivesTheSameList();
             TestP2127_AnAccountWithNoCopierRelationshipIsNotRankedWORST();
             TestP2127_TheUnlinkedNodeIsPresentEvenWhenItIsEmpty();
+            TestP1131_EveryNonTerminalStateWouldBeStranded();
+            TestP1131_TheThreeTerminalStatesAndOnlyThose();
+            TestP1131_AnUnknownStateNameFailsSAFE();
+            TestP1131_NoBridgePathKeepsItsOwnStateList();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 77;
+            const int declared = 81;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3422,6 +3426,142 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(At(tree, tree.Count - 1) != null
                    && At(tree, tree.Count - 1).Name == BridgeFleetView.UnlinkedName,
                 "P2-127: and an empty Unlinked node is still LAST");
+        }
+
+        // ================================================================================
+        // P1-131. "Would severing this connection strand the order?" -- the FOURTH question
+        // over NT8's OrderState enum, after the core's OccupiesSlot ("must I not place a
+        // second one?"), ProvidesCoverage ("is the position protected?") and
+        // AcceptsModification ("can I Change() it now?").
+        //
+        // Measured live: nt_connection reported workingOrders: 7 on TPT -- four real bracket
+        // legs on the funded account and three Sim101 orders that had been CancelPending for
+        // about five hours. The old hand-written list omitted SIX non-terminal states, every
+        // omission in the direction that PERMITS a disconnect.
+        // ================================================================================
+
+        // Every OrderState NT8 8.1 defines. The point of listing them here is that a state
+        // added later is NOT in this array, and the unknown-name test covers that case.
+        private static readonly string[] AllOrderStates = new[]
+        {
+            "Initialized", "Submitted", "Accepted", "AcceptedByRisk", "Working", "PartFilled",
+            "TriggerPending", "ChangeSubmitted", "ChangePending", "CancelSubmitted",
+            "CancelPending", "Suspended", "Filled", "Cancelled", "Rejected", "Unknown"
+        };
+
+        private static void TestP1131_EveryNonTerminalStateWouldBeStranded()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-131: every non-terminal state would be stranded");
+
+            // The six the old list omitted, named individually so a regression says WHICH.
+            // ChangePending was in the old list and ChangeSubmitted was not; CancelPending was
+            // in and CancelSubmitted was not. Each handshake has two halves.
+            var omitted = new[] { "Initialized", "AcceptedByRisk", "ChangeSubmitted",
+                                  "CancelSubmitted", "Suspended", "Unknown" };
+            var missed = omitted.Where(st => !BridgeOrderLiveness.WouldBeStrandedByDisconnect(st)).ToList();
+            Assert(missed.Count == 0, string.Format(
+                "P1-131: the six states the old list omitted all strand ({0} still do not)",
+                missed.Count));
+
+            // And the twins are treated alike, which is the asymmetry that gave the old list away.
+            Assert(BridgeOrderLiveness.WouldBeStrandedByDisconnect("ChangeSubmitted")
+                   == BridgeOrderLiveness.WouldBeStrandedByDisconnect("ChangePending")
+                   && BridgeOrderLiveness.WouldBeStrandedByDisconnect("CancelSubmitted")
+                   == BridgeOrderLiveness.WouldBeStrandedByDisconnect("CancelPending"),
+                "P1-131: both halves of a handshake answer the same");
+
+            // ⚠️ The measured case. Borrowing the core's OccupiesSlot would answer NO here,
+            // because it excludes Departing on purpose -- and these are the orders that had
+            // been stuck for five hours.
+            Assert(BridgeOrderLiveness.WouldBeStrandedByDisconnect("CancelPending"),
+                "P1-131: an order stuck cancelling is the strongest case of stranded, not the weakest");
+        }
+
+        private static void TestP1131_TheThreeTerminalStatesAndOnlyThose()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-131: exactly three terminal states");
+
+            var terminal = AllOrderStates.Where(BridgeOrderLiveness.IsTerminal).OrderBy(x => x).ToArray();
+            Assert(string.Join(",", terminal) == "Cancelled,Filled,Rejected", string.Format(
+                "P1-131: Filled, Cancelled and Rejected are terminal and nothing else is (got {0})",
+                string.Join(",", terminal)));
+
+            // Rejected is the one GetOrders' inline filter forgot, which is how a rejected
+            // order was served by an endpoint advertising "active/working".
+            Assert(BridgeOrderLiveness.IsTerminal("Rejected"),
+                "P1-131: Rejected is terminal -- the state the orders filter forgot");
+
+            // The two questions are exact complements. If they ever drift, one of the two
+            // call sites is answering a question nobody asked.
+            var disagree = AllOrderStates.Where(st =>
+                BridgeOrderLiveness.IsTerminal(st) == BridgeOrderLiveness.WouldBeStrandedByDisconnect(st)).ToList();
+            Assert(disagree.Count == 0,
+                "P1-131: stranded and terminal are exact complements across every state");
+        }
+
+        private static void TestP1131_AnUnknownStateNameFailsSAFE()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-131: an unrecognised state fails SAFE, not quiet");
+
+            // The directions do not cost the same. A false YES costs a refused disconnect the
+            // operator can override with confirmDisruptive; a false NO costs a protective stop
+            // left at a broker this process can no longer reach.
+            Assert(BridgeOrderLiveness.WouldBeStrandedByDisconnect("SomeStateNT8AddsIn2027")
+                   && !BridgeOrderLiveness.IsTerminal("SomeStateNT8AddsIn2027"),
+                "P1-131: a state this build has never heard of is treated as still out there");
+
+            Assert(BridgeOrderLiveness.WouldBeStrandedByDisconnect(null)
+                   && BridgeOrderLiveness.WouldBeStrandedByDisconnect(""),
+                "P1-131: a null or blank state name is treated as still out there");
+
+            // Casing/whitespace arrive from ToString(), so they should not decide safety --
+            // but a MISSPELLING must not silently become terminal either.
+            Assert(BridgeOrderLiveness.IsTerminal(" Filled ") && !BridgeOrderLiveness.IsTerminal("filled"),
+                "P1-131: whitespace is trimmed and an unexpected casing is not assumed terminal");
+        }
+
+        private static void TestP1131_NoBridgePathKeepsItsOwnStateList()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-131: no bridge path keeps its own OrderState list");
+
+            string code = File.ReadAllText(BridgeSourcePath());
+
+            // SOURCE GATE (McpBridgeAddOn.cs is in no test build -- P2-27). It proves wiring,
+            // not behaviour; nt_compile and the live read are the evidence for that half.
+            Assert(!code.Contains("OccupiesSlotForBridge"),
+                "P1-131: the hand-rolled predicate is gone, not merely bypassed");
+
+            // The defect was a SECOND LIST, so the gate is against an inline terminal-state
+            // comparison -- but ONLY inside the method this ticket is about. A blanket ban over
+            // the file fails on nine legitimate sites: the cancel paths ask a different question
+            // again ("what should I try to cancel?"), and 2661 asks "was this REJECTED?", which
+            // is a real distinct question rather than a terminal-set test. One of those cancel
+            // filters carries a comment saying narrowing it is a behaviour change; this ticket is
+            // about the REPORT. So: state the region, and print what was inspected, or this is a
+            // gate nobody can tell is looking at nothing.
+            // Located by index rather than a multiline regex: the signature gained three
+            // parameters in P2-109, and a pattern that silently stops matching is the failure
+            // this whole class of gate exists to avoid. The region ends at the next member.
+            int gStart = code.IndexOf("private object GetOrders(");
+            int gEnd = gStart < 0 ? -1 : code.IndexOf("\n        private ", gStart + 10);
+            string getOrders = (gStart >= 0 && gEnd > gStart) ? code.Substring(gStart, gEnd - gStart) : "";
+            Assert(getOrders.Length > 200, string.Format(
+                "P1-131: the orders route is locatable for inspection ({0} chars read)",
+                getOrders.Length));
+            var inlineStateTests = Regex.Matches(getOrders, @"OrderState\.(Filled|Cancelled|Rejected)");
+            Assert(getOrders.Length > 200 && inlineStateTests.Count == 0, string.Format(
+                "P1-131: the orders route keeps no terminal-state list of its own ({0} found in {1} chars)",
+                inlineStateTests.Count, getOrders.Length));
+
+            // Both stranding call sites go through the one predicate.
+            Assert(Regex.Matches(code, @"BridgeOrderLiveness\.WouldBeStrandedByDisconnect\b").Count == 2,
+                "P1-131: both workingOrders counts consult the shared predicate");
+            Assert(Regex.Matches(code, @"BridgeOrderLiveness\.IsTerminal\b").Count == 1,
+                "P1-131: the orders filter consults it too");
         }
 
         public static int Main(string[] args)

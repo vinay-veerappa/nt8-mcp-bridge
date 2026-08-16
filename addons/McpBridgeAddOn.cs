@@ -1877,7 +1877,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!BridgeAccountScope.Matches(account.Name, requestedAccount)) continue;
                 foreach (Order order in account.Orders)
                 {
-                    if (order.OrderState == OrderState.Filled || order.OrderState == OrderState.Cancelled) continue;
+                    // P1-131: one definition of "the broker is done with this". The inline
+                    // list here forgot Rejected, so a rejected order was served as active.
+                    if (BridgeOrderLiveness.IsTerminal(order.OrderState.ToString())) continue;
                     orders.Add(new
                     {
                         id = order.Id.ToString(), orderId = order.OrderId, name = order.Name, account = account.Name,
@@ -4840,7 +4842,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     foreach (Position p in a.Positions)
                         if (p != null && Math.Abs(p.Quantity) > 0) openPositions++;
                     foreach (Order o in a.Orders)
-                        if (o != null && OccupiesSlotForBridge(o.OrderState)) workingOrders++;
+                        if (o != null && BridgeOrderLiveness.WouldBeStrandedByDisconnect(o.OrderState.ToString())) workingOrders++;
                 }
 
                 // ⚠️ ALL the providers on the connection, not the first account's. Reporting the
@@ -4945,14 +4947,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        private static bool OccupiesSlotForBridge(OrderState s)
-        {
-            return s == OrderState.Working || s == OrderState.Accepted
-                || s == OrderState.Submitted || s == OrderState.TriggerPending
-                || s == OrderState.ChangePending || s == OrderState.CancelPending
-                || s == OrderState.PartFilled;
-        }
-
         /// <summary>
         /// F-17 read half. ⚠️ `marketDataConnected` is folded out of the SAME rows the detail
         /// view returns, and out of the same predicate `/api/health` uses. A summary with its own
@@ -5048,7 +5042,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 foreach (Position p in a.Positions)
                     if (p != null && Math.Abs(p.Quantity) > 0) openPositions++;
                 foreach (Order o in a.Orders)
-                    if (o != null && OccupiesSlotForBridge(o.OrderState)) workingOrders++;
+                    if (o != null && BridgeOrderLiveness.WouldBeStrandedByDisconnect(o.OrderState.ToString())) workingOrders++;
             }
 
             string strandReason;
