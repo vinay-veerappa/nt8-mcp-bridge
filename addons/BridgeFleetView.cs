@@ -43,6 +43,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         public string FollowerAccountName;
         public string GroupName;
 
+        /// <summary>
+        /// Null on both live rows today, and that is exactly why it is here: a leader and a
+        /// follower may hold more than one relationship, one per instrument, and a tree built
+        /// per ROW would then list that account twice. Carried so the case is representable in
+        /// a test rather than only in production.
+        /// </summary>
+        public string InstrumentFullName;
+
         /// <summary>`CopierSnapshotJson.SeverityRank`, in which <b>0 is WORST</b>.</summary>
         public int Severity;
 
@@ -87,13 +95,36 @@ namespace NinjaTrader.NinjaScript.AddOns
         public const string UnlinkedName = "Unlinked accounts";
 
         /// <summary>
+        /// The rank of an account the COPIER scale does not describe at all -- an account in no
+        /// relationship. Above every real rank, so it sorts as the least severe thing on the page
+        /// and never crowds the top.
+        ///
+        /// ⚠️ IT IS DELIBERATELY NOT <see cref="UnknownRank"/>, and the distinction is the whole
+        /// point: fail-closed is for a state we cannot READ, not for one that does not APPLY.
+        /// Measured on the live box, 95 of 97 accounts are in no copier relationship, so ranking
+        /// them "worst" paints 95 permanent red rows -- an alarm that is always on, which this
+        /// system has now produced seven times by other routes. Ranking them "ok" is the opposite
+        /// lie. So the renderer gets a value it can show as neutral and colour as neither.
+        ///
+        /// ⚠️ TEMPORARY, AND THE NEXT SLICE OF P2-127 REPLACES IT. An unlinked account still has a
+        /// GUARD state, which is the thing the operator wants for it; this rank is what stands in
+        /// until that is folded in. A test pins it so that change has to be deliberate.
+        /// </summary>
+        public const int NotApplicableRank = 6;
+
+        /// <summary>
         /// A copier row's severity, converted to the unified rank. `CopierSnapshotJson`
         /// already uses 0-is-worst, so this is near-identity -- it exists so the conversion
         /// is NAMED and so an out-of-range value is clamped rather than sorted.
         /// </summary>
         public static int RankOfCopierRow(int copierSeverity)
         {
-            return -1;   // NOT IMPLEMENTED (P2-127)
+            // CopierSnapshotJson.SeverityRank is already 0-is-worst, so valid values keep their meaning.
+            if (copierSeverity >= 0 && copierSeverity <= 5)
+                return copierSeverity;
+
+            // An unreadable rank must sort below every real state so it cannot look healthy.
+            return UnknownRank;
         }
 
         /// <summary>
@@ -103,7 +134,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static int RankOfSystemSeverity(string severityName)
         {
-            return -1;   // NOT IMPLEMENTED (P2-127)
+            if (string.IsNullOrWhiteSpace(severityName))
+                return UnknownRank;
+
+            // The system scale runs best-to-worst 0..3; invert it so the page still sorts 0-is-worst.
+            switch (severityName.Trim().ToLowerInvariant())
+            {
+                case "ok":       return 3;          // best system state -> lowest page priority
+                case "info":     return 2;
+                case "warn":     return 1;
+                case "critical": return WorstRank;  // worst system state -> top of page
+                default:         return UnknownRank;
+            }
         }
 
         /// <summary>
@@ -116,7 +158,21 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static int WorstOf(IEnumerable<int> ranks)
         {
-            return -1;   // NOT IMPLEMENTED (P2-127)
+            // On this page 0 is worst, so the smallest value is the worst.
+            if (ranks == null)
+                return UnknownRank;
+
+            int worst = int.MaxValue;
+            bool any = false;
+            foreach (int rank in ranks)
+            {
+                if (!any || rank < worst)
+                    worst = rank;
+                any = true;
+            }
+
+            // No ranks means no evaluable state; fail closed rather than returning a clean 0.
+            return any ? worst : UnknownRank;
         }
 
         /// <summary>
@@ -131,9 +187,144 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// "Unlinked accounts", and NO account appears in two places: a leader is its group's
         /// leader and is not also unlinked.
         /// </summary>
+        /// <summary>
+        /// Worst rank first, then by name. The name half is not cosmetic: `List&lt;T&gt;.Sort` is
+        /// documented as UNSTABLE, and equal ranks are the normal case here, not the exception.
+        /// </summary>
+        private static int CompareNodes(FleetNode a, FleetNode b)
+        {
+            int byRank = a.Rank.CompareTo(b.Rank);
+            if (byRank != 0) return byRank;
+            return string.CompareOrdinal(a.Name ?? "", b.Name ?? "");
+        }
+
         public static List<FleetNode> Build(IList<FleetCopierRow> rows, IList<string> allAccounts)
         {
-            return new List<FleetNode>();   // NOT IMPLEMENTED (P2-127)
+            // Treat null inputs as empty so the tree is always well-formed.
+            IList<FleetCopierRow> safeRows = rows ?? new List<FleetCopierRow>();
+            IList<string> safeAccounts = allAccounts ?? new List<string>();
+
+            Dictionary<string, List<FleetCopierRow>> groups = new Dictionary<string, List<FleetCopierRow>>();
+            HashSet<string> linked = new HashSet<string>();
+
+            foreach (FleetCopierRow row in safeRows)
+            {
+                // Group by name when one exists; otherwise the leader account is the group of one.
+                string key = string.IsNullOrWhiteSpace(row.GroupName)
+                    ? row.LeaderAccountName
+                    : row.GroupName;
+
+                if (!string.IsNullOrEmpty(row.LeaderAccountName))
+                    linked.Add(row.LeaderAccountName);
+                if (!string.IsNullOrEmpty(row.FollowerAccountName))
+                    linked.Add(row.FollowerAccountName);
+
+                // A row with no group and no leader cannot form a group, but its follower is still linked.
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                linked.Add(key);
+
+                if (!groups.TryGetValue(key, out List<FleetCopierRow> bucket))
+                {
+                    bucket = new List<FleetCopierRow>();
+                    groups[key] = bucket;
+                }
+                bucket.Add(row);
+            }
+
+            List<FleetNode> groupNodes = new List<FleetNode>();
+            foreach (KeyValuePair<string, List<FleetCopierRow>> kvp in groups)
+            {
+                // ONE node per follower, not one per ROW. A leader and a follower can hold more
+                // than one relationship -- FleetCopierRow carries InstrumentFullName precisely so
+                // a per-instrument relationship can exist -- and rendering the same account twice
+                // in one group breaks "no account appears twice" without any test noticing,
+                // because both live rows on the box today are instrument-less.
+                // The account keeps its WORST rank across those rows, for the same reason a group
+                // keeps its worst child: the reassuring one must not be the one displayed.
+                List<FleetNode> children = new List<FleetNode>();
+                Dictionary<string, FleetNode> byFollower = new Dictionary<string, FleetNode>();
+                List<int> childRanks = new List<int>();
+                foreach (FleetCopierRow row in kvp.Value)
+                {
+                    int rank = RankOfCopierRow(row.Severity);
+                    childRanks.Add(rank);
+
+                    FleetNode existing;
+                    if (byFollower.TryGetValue(row.FollowerAccountName ?? "", out existing))
+                    {
+                        if (rank < existing.Rank) existing.Rank = rank;
+                        continue;
+                    }
+
+                    FleetNode child = new FleetNode
+                    {
+                        Kind = "account",
+                        Name = row.FollowerAccountName,
+                        Role = "follower",
+                        Rank = rank,
+                        Children = new List<FleetNode>()
+                    };
+                    byFollower[row.FollowerAccountName ?? ""] = child;
+                    children.Add(child);
+                }
+
+                // Worst-first within the group, then by NAME. The name is not decoration:
+                // List<T>.Sort is documented UNSTABLE, so without a total order two equally
+                // ranked rows swap places between refreshes of a page that polls.
+                children.Sort(CompareNodes);
+
+                groupNodes.Add(new FleetNode
+                {
+                    Kind = "group",
+                    Name = kvp.Key,
+                    Children = children,
+                    Rank = WorstOf(childRanks)
+                });
+            }
+
+            // Worst-first among groups; unlinked node is appended afterwards so it is always last.
+            // The name tie-break matters more here than anywhere: `groups` is a Dictionary, whose
+            // enumeration order is explicitly unspecified, so an unstable sort over equal ranks
+            // would order the fleet differently on runs that saw identical data.
+            groupNodes.Sort(CompareNodes);
+
+            List<FleetNode> unlinkedChildren = new List<FleetNode>();
+            List<int> unlinkedRanks = new List<int>();
+            foreach (string account in safeAccounts)
+            {
+                if (!linked.Contains(account))
+                {
+                    // No copier row, so the copier scale does not APPLY -- which is not the same
+                    // as unreadable. See NotApplicableRank for why fail-closed is the wrong
+                    // instinct here and what replaces this in the next slice.
+                    unlinkedChildren.Add(new FleetNode
+                    {
+                        Kind = "account",
+                        Name = account,
+                        Rank = NotApplicableRank,
+                        Children = new List<FleetNode>()
+                    });
+                    unlinkedRanks.Add(NotApplicableRank);
+                }
+            }
+
+            // Every unlinked child currently ties, which is exactly when an unstable sort shows:
+            // 95 accounts on this box, ordered arbitrarily and re-ordered on refresh. The name is
+            // what makes the list the same list twice.
+            unlinkedChildren.Sort(CompareNodes);
+
+            FleetNode unlinkedNode = new FleetNode
+            {
+                Kind = "unlinked",
+                Name = UnlinkedName,
+                Children = unlinkedChildren,
+                Rank = WorstOf(unlinkedRanks)
+            };
+
+            groupNodes.Add(unlinkedNode);
+            return groupNodes;
         }
     }
 }

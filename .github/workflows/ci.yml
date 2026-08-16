@@ -193,6 +193,17 @@ jobs:
       - name: Mutation P1-125 (the copier's own mode, and which refusal binds)
         run: python mutation/mutate_p1125.py
 
+      # P2-127 slice 1: the FLEET tree and the one ordering it sorts by. The class exists at all
+      # because ui/index.html is in no test build -- the decisions move somewhere the harness can
+      # EXECUTE them before anything renders them.
+      # ⚠️ Two mutants to know. The first scale mutant makes ONE shared conversion serve both
+      # inputs, which is the defect this class was written for: a copier row's severity is
+      # 0-is-worst and the system cell's is 0-is-BEST, in the same payload. The last mutant was
+      # found by PROBING a 15/15 green -- dropping the Unlinked node when it is empty survived
+      # the whole suite, because every other test supplied a spare account.
+      - name: Mutation P2-127 (the fleet tree, and the one ordering)
+        run: python mutation/mutate_p2127.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core

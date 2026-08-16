@@ -1,0 +1,58 @@
+{
+  "plan": "../nt8-riskguard/docs/RISKGUARD_COPIER_HARDENING_PLAN.md",
+  "note": "P2-127 slice 1 of N -- the FLEET pane's decision class only. The 15 acceptance tests are already in the suite and were VERIFIED RED at the 444/15 baseline before this ticket was written. The HTML that consumes this class is a LATER slice and is out of scope here.",
+  "tickets": [
+    {
+      "id": "T1",
+      "title": "P2-127: build the fleet tree and the ONE ordering it sorts by, in a class the harness executes",
+      "defect": "Section 4 of docs/UI_REDESIGN_DESIGN.md in nt8-riskguard -- 'Layout: one window, two panes, zero nav tabs' -- was never built. What shipped is four sections stacked on one scroll, and the operator called it 'cluttered'. Shown the design against their own counter-proposal of left-hand nav tabs, they re-confirmed section 4 on 2026-08-16: 'lets stick to 4 which is what was the original design.' Section 4.2 lists top-level navigation tabs among the things 'killed by the operator's constraints, recorded so nobody re-adds them'. THE LAYOUT IS SETTLED. Do not re-derive it and do not propose tabs.\n\nThis ticket is the FIRST slice: the decision class. It is first because ui/index.html is in no test build and no mutation battery, exactly like TradeCopierWindow.cs was before P1-121, and P2-127's plan entry says: 'Move the decisions -- which badge, which severity, what the tree contains -- into a class the harness compiles ... Otherwise this grows a third untested surface, and it will be the one the operator actually uses.'\n\nMEASURED ON THE LIVE BOX before any of this was designed, one payload, both scales at once:\n\n    \"rows\": [ { \"verdict\": \"Idle\", \"severity\": 5 } ]\n    \"system\": { \"severity\": \"warn\", \"headline\": \"[ COPIER LIVE - NOTHING ENABLED ]\" }\n\nThe row severity is CopierSnapshotJson.SeverityRank, in which 0 is WORST -- that class exists precisely because casting CopierConformance would sort an ORPHAN (a follower holding a live position nobody manages) into the middle. The system severity is CopierStatusSeverity, Ok=0 Info=1 Warn=2 Critical=3, in which 0 is BEST. Opposite polarity, one page, and a tree that sorts both by 'the severity number' is silently wrong for one of them and looks plausible either way.\n\nAlso measured: 97 accounts, 2 relationships, both with groupName null and both led by Sim101. So the 'Unlinked accounts' node holds 95 rows on this box today.",
+      "spec": "ONE FILE: `addons/BridgeFleetView.cs`. The types, the constants, the doc comments and the method signatures are already there and are CORRECT -- do not change them, do not rename anything, do not add parameters. Four method bodies currently return a valid-but-wrong value so the tests compile and fail. Replace those four bodies and nothing else.\n\nA. `RankOfCopierRow(int copierSeverity)`. CopierSnapshotJson.SeverityRank already runs 0-is-worst over the range 0..5, so a value in range passes through unchanged. A value OUTSIDE 0..5 returns `UnknownRank`. Fail closed: an unreadable state must sort as the worst thing on the page, never as the best.\n\nB. `RankOfSystemSeverity(string severityName)`. This scale runs the other way, so this method INVERTS it: 'critical' is the worst and must map to `WorstRank`; 'ok' must map above 'warn'. Match case-insensitively and trim, because the value arrives from JSON. Null, empty and any unrecognised name return `UnknownRank`. Use the four names the system cell actually emits -- ok, info, warn, critical -- which is what CopierEnforcementView.SeverityName produces.\n\nC. `WorstOf(IEnumerable<int> ranks)`. The SMALLEST value, because 0 is worst. An empty sequence, and a null sequence, return `UnknownRank`.\n\nD. `Build(IList<FleetCopierRow> rows, IList<string> allAccounts)`. Returns the tree:\n\n  * One node per GROUP KEY. The key is `GroupName` when it is present and non-blank, otherwise the row's `LeaderAccountName` -- section 4 decision 2, 'groups are the only grouping, a 1:1 pair is a group of one'. Two ungrouped rows sharing a leader are therefore ONE group with two followers, which is the shape on the live box today.\n  * A group node has `Kind = \"group\"`, `Name` = the group key, and one child per follower with `Kind = \"account\"` and `Role = \"follower\"`.\n  * A group node's `Rank` is `WorstOf` its children's ranks. It must not be computed from its own counters or restated -- fold it out of the same children the node renders. That is F-9's rule and the reason P2-103 recounts from the detail rows.\n  * Each follower child's `Rank` is `RankOfCopierRow(row.Severity)`.\n  * Then ONE node with `Kind = \"unlinked\"` and `Name = UnlinkedName`, whose children are every entry of `allAccounts` that appears in no row as either leader or follower, each `Kind = \"account\"`. Its `Rank` is `WorstOf` its children too.\n  * ORDER: groups first, sorted worst-first (ascending Rank), then the unlinked node LAST -- always last, even when its rank is worse than every group's. Within every node, children sorted worst-first.\n  * No account appears twice. A leader is its group's leader and is not also unlinked.\n\nHandle a null `rows` and a null `allAccounts` as empty. Emit the unlinked node even when it has no children -- a caller that has to distinguish 'absent' from 'empty' is the CF-9 shape, and an always-present node with a visible rank is cheaper than a special case.",
+      "context": "SCOPE. This ticket does NOT touch ui/index.html, McpBridgeAddOn.cs, any route, or any other addon. No endpoint changes. The HTML that renders this tree, and the wiring of the `system` cell into it, are later slices of P2-127 and are deliberately not in this one -- the class has to be executable and tested before anything consumes it.\n\nWHY THE TESTS ARE SHAPED THE WAY THEY ARE. `P2-127: the same number means opposite things on the two scales` is the discriminator. Every other assertion in that test method passes under a single shared scale; only that one fails. If you find yourself writing one conversion that serves both inputs, that assertion is the reason not to.\n\n`P2-127: no account is listed in two places in the tree` carries a `seen.Count > 0` guard. Without it, it passes against an empty tree -- which is what the unimplemented stub returns. Do not remove that guard to make anything easier.\n\nFAIL-CLOSED IS NOT DECORATION HERE. This page's stated value, in section 4.2, is that a bad state is visible WITHOUT being looked for; GuardSnapshot.UnevaluatedRules exists so that a box with no accounts loaded cannot render a clean, empty, reassuring page. Every 'unknown is the worst' rule in this spec is that same argument, and CopierEnforcementView.SeverityName in this repo already answers 'critical' rather than 'ok' for an unrecognised rank.\n\nSTYLE. The file names no NinjaTrader type and must keep naming none -- that is the only reason tests/BridgeTests.csproj can execute it (P2-27). Plain C# and System.Collections.Generic / System.Linq only. Match the file's existing comment density: say WHY a decision has its value, not what the line does.",
+      "expect_green": [
+        "P2-127: a copier row's severity keeps 0 as the worst",
+        "P2-127: an out-of-range copier severity is the worst rank, not a sorted one",
+        "P2-127: the system severity scale is INVERTED on the way in, not shared",
+        "P2-127: an unrecognised system severity is the WORST, not the best",
+        "P2-127: the same number means opposite things on the two scales",
+        "P2-127: the worst of a set is the SMALLEST rank",
+        "P2-127: a group with no children is not healthy",
+        "P2-127: two ungrouped relationships with one leader are ONE group of two",
+        "P2-127: a named group is keyed by its name, not by its leader",
+        "P2-127: every account in no relationship lands under Unlinked accounts",
+        "P2-127: no account is listed in two places in the tree",
+        "P2-127: groups sort worst-first",
+        "P2-127: followers inside a group sort worst-first",
+        "P2-127: a group carries the WORST of its children, so nothing hides under it",
+        "P2-127: Unlinked accounts comes last, so its rank must be read off the node"
+      ],
+      "note_expect_green": "All FIFTEEN were VERIFIED RED at the 444 passed / 15 failed baseline, by building and running the suite before this ticket was written. The list is complete -- there is no P2-127 assertion in the suite that is not on it.\n\nDELIBERATELY ABSENT, because it is GREEN NOW and must STAY green: `all 73 declared tests were invoked`, the harness self-check. It passes at baseline because the five new test methods are already registered; it is the gate that catches a test silently not running, not an acceptance criterion for this ticket.",
+      "regions": [
+        {
+          "id": "TheRankConversions",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static int RankOfCopierRow(int copierSeverity)",
+          "kind": "decl",
+          "note": "This method only. RankOfSystemSeverity and WorstOf follow it and have their own regions."
+        },
+        {
+          "id": "TheSystemSeverityConversion",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static int RankOfSystemSeverity(string severityName)",
+          "kind": "decl"
+        },
+        {
+          "id": "TheWorstOf",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static int WorstOf(IEnumerable<int> ranks)",
+          "kind": "decl"
+        },
+        {
+          "id": "TheTreeBuilder",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static List<FleetNode> Build(IList<FleetCopierRow> rows, IList<string> allAccounts)",
+          "kind": "decl"
+        }
+      ]
+    }
+  ]
+}

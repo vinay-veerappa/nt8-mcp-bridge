@@ -1380,11 +1380,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2127_TheTreeGroupsByGroupThenByLeader();
             TestP2127_EveryAccountAppearsExactlyOnce();
             TestP2127_EverythingSortsWorstFirstAndNothingHidesUnderAParent();
+            TestP2127_OneNodePerFollowerNotOnePerRow();
+            TestP2127_TheOrderIsTOTALSoTheSameDataGivesTheSameList();
+            TestP2127_AnAccountWithNoCopierRelationshipIsNotRankedWORST();
+            TestP2127_TheUnlinkedNodeIsPresentEvenWhenItIsEmpty();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 73;
+            const int declared = 77;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3287,6 +3291,137 @@ namespace NinjaTrader.NinjaScript.AddOns
             var last = At(withBadUnlinked, withBadUnlinked.Count - 1);
             Assert(last != null && last.Name == BridgeFleetView.UnlinkedName,
                 "P2-127: Unlinked accounts comes last, so its rank must be read off the node");
+        }
+
+        // -------------------------------------------------------------------------------
+        // P2-127, the three decisions arbitrated BY HAND after the loop returned
+        // NOT_CONVERGING. Two came from findings the panel raised, one of which the arbiter
+        // had REJECTED as "stable and correct"; the third is a design call the ticket was
+        // silent on, which is how the model came to make it by default.
+        // -------------------------------------------------------------------------------
+
+        private static FleetCopierRow RowOn(string leader, string follower, string group,
+                                            int severity, string instrument)
+        {
+            var r = Row(leader, follower, group, severity);
+            r.InstrumentFullName = instrument;
+            return r;
+        }
+
+        private static void TestP2127_OneNodePerFollowerNotOnePerRow()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: one node per follower, not one per row");
+
+            // A leader and a follower may hold more than one relationship, one per instrument.
+            // Both live rows are instrument-less, so a tree built per ROW passes every test
+            // written against the box as it stands today.
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow>
+                {
+                    RowOn("Sim101", "SimCopy2", null, 5, "MNQ 09-26"),
+                    RowOn("Sim101", "SimCopy2", null, 0, "MES 09-26")
+                },
+                new List<string> { "Sim101", "SimCopy2" });
+
+            var g = Named(tree, "Sim101");
+            Assert(g != null && g.Children.Count == 1,
+                "P2-127: two relationships with the same follower are ONE row in the tree");
+
+            // And it keeps the WORST of them -- the same argument as a group keeping its worst
+            // child. Displaying the reassuring one is the whole failure mode.
+            Assert(g != null && At(g.Children, 0) != null
+                   && At(g.Children, 0).Rank == BridgeFleetView.WorstRank,
+                "P2-127: a follower on two relationships keeps its WORST rank");
+        }
+
+        private static void TestP2127_TheOrderIsTOTALSoTheSameDataGivesTheSameList()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the ordering is total, not merely by rank");
+
+            // List<T>.Sort is documented UNSTABLE and `groups` is a Dictionary, whose
+            // enumeration order is unspecified. Equal ranks are the NORMAL case here -- all 95
+            // unlinked accounts on the live box tie -- so without a name tie-break the page
+            // re-orders itself between refreshes that saw identical data.
+            var rows = new List<FleetCopierRow>
+            {
+                Row("gamma", "g1", "gamma", 5),
+                Row("alpha", "a1", "alpha", 5),
+                Row("beta",  "b1", "beta",  5)
+            };
+            var accounts = new List<string> { "gamma", "g1", "alpha", "a1", "beta", "b1", "zz", "aa", "mm" };
+
+            var first = BridgeFleetView.Build(rows, accounts);
+
+            // Same data, different presentation order in -- the answer must not move.
+            var shuffled = new List<FleetCopierRow> { rows[2], rows[0], rows[1] };
+            var shuffledAccounts = new List<string> { "mm", "b1", "zz", "alpha", "beta", "a1", "aa", "gamma", "g1" };
+            var second = BridgeFleetView.Build(shuffled, shuffledAccounts);
+
+            var firstNames = string.Join(",", first.Select(n => n.Name).ToArray());
+            var secondNames = string.Join(",", second.Select(n => n.Name).ToArray());
+            Assert(firstNames == secondNames && firstNames.StartsWith("alpha,beta,gamma"),
+                "P2-127: equally ranked groups come back in the same order every time");
+
+            var u1 = Named(first, BridgeFleetView.UnlinkedName);
+            var u2 = Named(second, BridgeFleetView.UnlinkedName);
+            Assert(u1 != null && u2 != null
+                   && string.Join(",", u1.Children.Select(n => n.Name).ToArray())
+                      == string.Join(",", u2.Children.Select(n => n.Name).ToArray())
+                   && At(u1.Children, 0) != null && At(u1.Children, 0).Name == "aa",
+                "P2-127: equally ranked unlinked accounts come back in the same order every time");
+        }
+
+        private static void TestP2127_AnAccountWithNoCopierRelationshipIsNotRankedWORST()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: an inapplicable state is not an unreadable one");
+
+            // 95 of 97 accounts on the live box are in no copier relationship. Ranking them
+            // WORST paints 95 permanent red rows -- an alarm that is always on, which is off.
+            // Ranking them "ok" is the opposite lie. So the rank is a third thing, above every
+            // real rank, that a renderer can colour as neither.
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5) },
+                new List<string> { "Sim101", "SimCopy2", "Spare1" });
+
+            var u = Named(tree, BridgeFleetView.UnlinkedName);
+            Assert(u != null && At(u.Children, 0) != null
+                   && At(u.Children, 0).Rank == BridgeFleetView.NotApplicableRank
+                   && BridgeFleetView.NotApplicableRank != BridgeFleetView.UnknownRank,
+                "P2-127: an account in no relationship is NOT APPLICABLE, not unknown-and-worst");
+
+            // It must also not sort as the worst thing on the page, or the distinction is a
+            // name with no behaviour behind it.
+            Assert(u != null && u.Rank > BridgeFleetView.WorstRank
+                   && BridgeFleetView.NotApplicableRank > BridgeFleetView.RankOfCopierRow(5),
+                "P2-127: not-applicable sorts as the least severe thing, below every real rank");
+        }
+
+        private static void TestP2127_TheUnlinkedNodeIsPresentEvenWhenItIsEmpty()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the unlinked node is present even when empty");
+
+            // FOUND BY PROBING A 15/15 BATTERY, not by review: dropping the node when it has no
+            // children survived the whole suite. Every other test here supplies a spare account,
+            // so the empty case was never driven.
+            //
+            // It matters because an ABSENT node and an EMPTY one read identically to whatever
+            // renders this -- the operator cannot tell "no unlinked accounts" from "that section
+            // failed to load". Same shape as the loop's own CF-9.
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5) },
+                new List<string> { "Sim101", "SimCopy2" });
+
+            var u = Named(tree, BridgeFleetView.UnlinkedName);
+            Assert(u != null && u.Kind == "unlinked" && u.Children.Count == 0,
+                "P2-127: the Unlinked node is emitted even with nothing under it");
+
+            Assert(At(tree, tree.Count - 1) != null
+                   && At(tree, tree.Count - 1).Name == BridgeFleetView.UnlinkedName,
+                "P2-127: and an empty Unlinked node is still LAST");
         }
 
         public static int Main(string[] args)
