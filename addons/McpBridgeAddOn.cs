@@ -6576,10 +6576,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var cfg = RiskConfigMerge.Apply(RiskGuardAddOn.Instance.Config, req, out mergedJson);
                 if (cfg == null)
                     return new { error = "Could not deserialize merged body to RiskConfig." };
-                RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
+                // P2-120. This used to discard the return value and answer `success = true`
+                // unconditionally, because SaveAndReloadConfig returned void and swallowed its
+                // own exception. So a refused write and a failed write both reported "applied":
+                // the API returned the NEGATION of its own outcome, which is worse than
+                // returning nothing, because a script acting on it proceeds.
+                var saved = RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);
+                if (saved == null)
+                    return new { error = "The config save returned no result, which should be impossible." };
+
+                if (!string.IsNullOrEmpty(saved.Refusal))
+                    return new { success = false, status = "refused", refusal = saved.Refusal, config = RiskGuardAddOn.Instance.Config, requested = req, note = "REFUSED before writing -- nothing was persisted and the live config is unchanged. `config` is the live config as it remains." };
+
+                if (!saved.Saved)
+                    return new { success = false, status = "failed", error = saved.Error, config = RiskGuardAddOn.Instance.Config, requested = req, note = "The write or the reload threw. Nothing reliable was persisted; `config` is whatever the guard is running now." };
+
                 // Echo the RESULT, not the request. The old reply looked identical whether the
                 // fields the caller omitted survived or were flattened to their defaults.
-                return new { success = true, status = "applied", config = RiskGuardAddOn.Instance.Config, requested = req, note = "Partial body merged onto the live config, written to RiskGuard/config.json and reloaded. `config` is the RESULTING live config; `requested` is what you sent." };
+                return new { success = true, status = "applied", warning = saved.Warning, config = RiskGuardAddOn.Instance.Config, requested = req, note = "Partial body merged onto the live config, written to RiskGuard/config.json and reloaded. `config` is the RESULTING live config; `requested` is what you sent. A non-null `warning` means the save succeeded but the resulting config still holds a value the guard considers unsafe." };
             }
             catch (Exception ex)
             {

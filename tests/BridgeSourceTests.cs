@@ -1229,12 +1229,63 @@ namespace NinjaTrader.NinjaScript.AddOns
         // rather than reflected at a maybe-absent type, plus `mutation/mutate_p227.py` at 11
         // mutants / 0 survivors. Two of those mutants are the specs these tests encoded.
         //
-        // WHAT IS GENUINELY MISSING, and it comes back with P2-119: the three ROUTE assertions
-        // -- that `RiskGuardConfig` consults the validator, tests the verdict with a real
-        // condition, and does so BEFORE SaveAndReloadConfig. There is nothing to assert against
-        // until the route calls it, and the vendored core is pinned to v1.30.0, which predates
-        // the class. Re-add them in the commit that wires the route, not before.
+        // WHAT WAS GENUINELY MISSING came back with P2-120, below: the ROUTE assertions. The
+        // shape changed on the way, and the change is worth reading. The plan was to assert that
+        // the route CONSULTS the validator. It does not, and should not -- the validator moved
+        // INSIDE `SaveAndReloadConfig`, so all three writers get it whether they remember to ask
+        // or not. A route-level call would have been a fourth copy of a decision that now has
+        // exactly one home. What the route owns is the OUTCOME, so that is what is pinned.
         // ============================================================================
+
+        /// <summary>
+        /// P2-120. The route discarded SaveAndReloadConfig's return value and answered
+        /// `success = true` whatever happened, because the method used to return void and
+        /// swallow its own exception. A refusal and a failed write both reported "applied" --
+        /// the API returning the NEGATION of its own outcome, which is worse than returning
+        /// nothing, because a script acting on it proceeds.
+        ///
+        /// ⚠️ A SOURCE gate, and it proves less than an executed test would: McpBridgeAddOn.cs
+        /// is in no test build (P2-27). It carries a NEGATIVE CONTROL for that reason -- a
+        /// pattern that must be ABSENT as well as ones that must be present, so the gate cannot
+        /// pass by looking at nothing.
+        /// </summary>
+        private static void TestP2120_TheConfigRouteReportsWhatTheSaveDid()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-120: the config POST route reports the save's real outcome");
+            // Comments STRIPPED, per this file's convention: the doc comment above quotes the
+            // defective reply verbatim, and the negative control below forbids exactly that
+            // string. Without stripping, this test would fail on its own documentation -- and
+            // the fix somebody would reach for is deleting the explanation.
+            string src = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            Assert(src.IndexOf("SaveAndReloadConfig", StringComparison.Ordinal) >= 0,
+                "Positive control: the route still calls SaveAndReloadConfig at all.");
+
+            Assert(src.IndexOf("var saved = RiskGuardAddOn.Instance.SaveAndReloadConfig(cfg);",
+                               StringComparison.Ordinal) >= 0,
+                "P2-120: the route CAPTURES the result. Discarding it is the defect, and it "
+                + "compiles silently either way because C# lets a return value be dropped.");
+
+            Assert(src.IndexOf("if (!saved.Saved)", StringComparison.Ordinal) >= 0,
+                "P2-120: the route BRANCHES on the outcome. A gate that a value is captured is "
+                + "not a gate that it is used -- four mutants in this project have beaten that "
+                + "assumption.");
+
+            Assert(src.IndexOf("saved.Refusal", StringComparison.Ordinal) >= 0,
+                "P2-120: a refusal is surfaced to the caller rather than folded into a generic "
+                + "failure. The refusal names the field, and that sentence is the whole point of "
+                + "GuardConfigEdit.");
+
+            // ⚠️ THE NEGATIVE CONTROL. Every assertion above is satisfiable by a file that also
+            // still contains the old unconditional literal somewhere on the success path. This
+            // is the one that fails if the defect is left in place beside the fix.
+            Assert(src.IndexOf("return new { success = true, status = \"applied\", config =",
+                               StringComparison.Ordinal) < 0,
+                "P2-120: the old unconditional `success = true, status = \"applied\"` reply is "
+                + "GONE, not merely bypassed. Leaving it reachable is how a fix and its defect "
+                + "ship together.");
+        }
 
         public static int Run()
         {
@@ -1317,11 +1368,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP3_111_HasMoreIsNotStartGreaterThanZero();
             TestP1_102_AnUnknownLockoutActionIsREFUSEDNotAnsweredAsAStatus();
             TestEveryResolverSiteACTSOnTheRefusal();
+            TestP2120_TheConfigRouteReportsWhatTheSaveDid();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 61;
+            const int declared = 62;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
