@@ -100,6 +100,19 @@
     display: block; margin-top: 6px; color: var(--text);
     font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap;
   }
+
+  /* The editable config form. Deliberately the same table as everything else --
+     an input that looks like a control invites clicking; one that looks like the
+     value it replaced invites reading first. */
+  .cfg td { vertical-align: middle; }
+  .cfg input, .cfg select { width: 150px; padding: 3px 6px; }
+  .cfg input.dirty, .cfg select.dirty { border-color: var(--amber); color: var(--amber); }
+  .cfg .k { font-family: Consolas, monospace; font-size: 11px; color: var(--dim); }
+  .cfg .was { color: var(--dim); font-size: 12px; }
+  .cfg tr.grp td { background: #23272e; color: var(--dim); font-size: 11px;
+                   text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+  .cfgbar { margin: 10px 0 0; display: flex; gap: 8px; align-items: center; }
+  .cfgbar .note { margin-left: auto; }
 </style>
 </head>
 <body>
@@ -116,6 +129,11 @@
   <!-- Outcomes live OUTSIDE #copier on purpose. The page re-renders every 5s, so
        anything written inside a section is gone before it can be read. -->
   <div id="outcome"></div>
+  <!-- The config form is OUTSIDE everything load() touches, and load() runs every
+       5 seconds. A form re-rendered under the operator's cursor loses whatever
+       they were halfway through typing, which is the same reason #outcome sits
+       here. It is fetched once and on an explicit Reload, never on the poll. -->
+  <div id="config"></div>
   <div id="copier"></div>
   <div id="content"></div>
 </main>
@@ -604,6 +622,317 @@ function wireActions(rows) {
   });
 }
 
+// ======================================================================
+//  The editable guard config.
+//
+//  WHAT IT DELIBERATELY DOES NOT SHOW. The live payload is 7,276 bytes, and
+//  most of it is not an operator knob: AccountFirmMap is ~120 account->plan
+//  rows, FirmProfiles is 8 plans x 12 fields, plus WindowsET and Profiles.
+//  Rendering those as inputs would bury the twenty numbers somebody actually
+//  changes under a hundred they never do -- the P2-41 shape, where per-account
+//  repetition hides the one finding. They are reported as counts instead, and
+//  the form SAYS it is partial, because a form showing twenty fields reads as
+//  a config that has twenty fields.
+//
+//  WHY EVERY REQUEST IS A DIFF. Same rule as the copier above: a request names
+//  ONLY the fields it is changing, and the engine merges it over what is
+//  stored (P2-41). Here it is load-bearing rather than tidy -- a full-object
+//  round trip through a form that cannot see AccountFirmMap would reset ~120
+//  account mappings to nothing, which is P?-65 with two more zeros.
+//
+//  WHY THE SELECTS ARE SELECTS. Three of these fields have a whitelist that
+//  something downstream enforces, and a free text box is how you get the value
+//  it refuses:
+//    * Mode -- preflight refuses anything outside shadow/live (P1-72, P2-93).
+//    * StopGuard.OnMissing -- preflight refuses anything but AutoStop/Flatten
+//      (P1-87), and the fallback used to be a silent Flatten.
+//    * Alerts.MinSeverity -- F-6's floor is FAIL-OPEN: RankOf answers 0 for an
+//      unrecognised string, so a typo'd "warn" pushes the ENTIRE audit stream
+//      and the channel gets muted. The config is hand-edited JSON today, which
+//      is exactly why a typo is the expected input.
+//  ⚠️ These lists are hand-typed HERE and enforced THERE. That is the P1-72
+//  shape and the only honest thing to say about it is that the refusal is the
+//  real gate -- the select narrows the mistake, it does not prevent it.
+// ======================================================================
+
+// path -> label. Order is the order rendered; "" starts a new group.
+var CFG_FIELDS = [
+  ["", "Mode and arming"],
+  ["Mode", "Mode", "select", ["shadow", "live"]],
+  ["MinShadowSessions", "Shadow sessions before live", "int"],
+  ["EnableWindowGate", "Trading-window gate", "bool"],
+  ["AuditIntervalSeconds", "Audit sweep interval (s)", "int"],
+
+  ["", "Loss limits"],
+  ["PnLRules.DailyLossLimit", "Daily loss limit ($)", "num"],
+  ["PnLRules.TrailingDrawdown", "Trailing drawdown ($)", "num"],
+  ["PnLRules.LockoutMinutes", "Lockout after a breach (min)", "int"],
+
+  ["", "Position sizing"],
+  ["Sizing.MaxContractsPerAccount", "Max contracts / account", "int"],
+  ["Sizing.MaxContractsAggregate", "Max contracts / aggregate", "int"],
+  ["Sizing.ExpectedCopies", "Expected copies", "int"],
+
+  ["", "Overtrading"],
+  ["Overtrading.MaxTradesPerSession", "Max trades / session", "int"],
+  ["Overtrading.MaxConsecutiveLosses", "Max consecutive losses", "int"],
+  ["Overtrading.MaxOrdersPerSecond", "Max orders / second", "int"],
+  ["Overtrading.CooldownMinutes", "Cooldown (min)", "int"],
+  ["Overtrading.LockoutMinutes", "Lockout (min)", "int"],
+
+  ["", "Stop guard"],
+  ["StopGuard.OnMissing", "Action on a missing stop", "select", ["Flatten", "AutoStop"]],
+  ["StopGuard.StopAttachSeconds", "Grace before it acts (s)", "int"],
+  ["StopGuard.MaxAutoStopAttempts", "Max auto-stop attempts", "int"],
+
+  ["", "Alerts"],
+  ["Alerts.Enabled", "Push alerts", "bool"],
+  ["Alerts.MinSeverity", "Minimum severity", "select", ["info", "warning", "critical"]]
+];
+
+var loadedCfg = null;   // the config as last READ, for diffing
+
+function dig(obj, path) {
+  var parts = path.split("."), v = obj;
+  for (var i = 0; i < parts.length; i++) {
+    if (v === null || typeof v !== "object") return undefined;
+    v = v[parts[i]];
+  }
+  return v;
+}
+
+// A dotted path back into a nested body, creating only what it must. This is
+// what keeps a request a DIFF: {"PnLRules":{"TrailingDrawdown":2000}} touches
+// one leaf and the merge leaves DailyLossLimit and LockoutMinutes alone.
+function plant(obj, path, value) {
+  var parts = path.split("."), o = obj;
+  for (var i = 0; i < parts.length - 1; i++) {
+    if (!o[parts[i]]) o[parts[i]] = {};
+    o = o[parts[i]];
+  }
+  o[parts[parts.length - 1]] = value;
+}
+
+function cfgInput(path, kind, options, value) {
+  var id = 'cf_' + path.replace(/\./g, '_');
+  if (kind === "select" || kind === "bool") {
+    var opts = kind === "bool" ? ["true", "false"] : options;
+    var cur = kind === "bool" ? String(!!value) : String(value === undefined ? "" : value);
+    var seen = false, h = '<select id="' + id + '" data-path="' + esc(path) + '" data-kind="' + kind + '">';
+    for (var i = 0; i < opts.length; i++) {
+      if (opts[i].toLowerCase() === cur.toLowerCase()) seen = true;
+      h += '<option' + (opts[i].toLowerCase() === cur.toLowerCase() ? ' selected' : '') + '>' + esc(opts[i]) + '</option>';
+    }
+    // ⚠️ A stored value this page does not offer must stay VISIBLE and stay
+    // SELECTED. Dropping it would silently rewrite the operator's config to
+    // whatever happened to be first the next time they saved something else --
+    // and a value outside the list is the single most interesting thing on the
+    // row, because it is what preflight is about to refuse.
+    if (!seen && cur !== "") {
+      h += '<option selected>' + esc(cur) + '</option>';
+    }
+    return h + '</select>' + (seen || cur === "" ? '' : ' <span class="bad">not a value the guard accepts</span>');
+  }
+  return '<input id="' + id + '" data-path="' + esc(path) + '" data-kind="' + kind
+       + '" value="' + esc(String(value === undefined ? "" : value)) + '">';
+}
+
+function renderConfig(data) {
+  var el = document.getElementById("config");
+  if (!el) return;
+
+  if (data && data.error) {
+    el.innerHTML = '<section><h2>Configuration</h2><div class="banner bad">'
+      + esc(data.error) + '</div></section>';
+    return;
+  }
+  var cfg = data && data.config;
+  if (!cfg) {
+    el.innerHTML = '<section><h2>Configuration</h2><div class="banner bad">The bridge '
+      + 'answered without a config object, so there is nothing to edit. That is not an '
+      + 'empty configuration -- it is an unreadable one.</div></section>';
+    return;
+  }
+  loadedCfg = cfg;
+
+  var html = '<section><h2>Configuration</h2>'
+    + '<table class="cfg"><thead><tr><th>Setting</th><th>Value</th><th>Stored</th>'
+    + '<th>Path</th></tr></thead><tbody>';
+
+  CFG_FIELDS.forEach(function (f) {
+    if (f[0] === "") {
+      html += '<tr class="grp"><td colspan="4">' + esc(f[1]) + '</td></tr>';
+      return;
+    }
+    var v = dig(cfg, f[0]);
+    html += '<tr><td>' + esc(f[1]) + '</td>'
+          + '<td>' + cfgInput(f[0], f[2], f[3], v) + '</td>'
+          + '<td class="was">' + (v === undefined ? '<span class="bad">absent</span>' : esc(String(v))) + '</td>'
+          + '<td class="k">' + esc(f[0]) + '</td></tr>';
+  });
+
+  html += '</tbody></table>'
+    + '<div class="cfgbar">'
+    + '<button id="cfgsave">Review and save</button>'
+    + '<button id="cfgreload">Reload</button>'
+    + '<span class="note">' + cfgOmitted(cfg) + '</span>'
+    + '</div></section>';
+
+  el.innerHTML = html;
+  wireConfig();
+}
+
+// ⚠️ Say what is NOT on the form. Twenty inputs read as "this is the config",
+// and the operator's model of their own protection is the thing this whole page
+// exists to keep correct.
+function cfgOmitted(cfg) {
+  var bits = [];
+  var map = cfg.FirmMirror && cfg.FirmMirror.AccountFirmMap;
+  var plans = cfg.FirmMirror && cfg.FirmMirror.FirmProfiles;
+  if (map) bits.push(Object.keys(map).length + " account-to-plan mappings");
+  if (plans) bits.push(Object.keys(plans).length + " firm plans");
+  if (cfg.WindowsET) bits.push(cfg.WindowsET.length + " trading windows");
+  if (cfg.Profiles) bits.push(cfg.Profiles.length + " per-account overrides");
+  if (!bits.length) return "";
+  return "Not editable here, and left untouched by a save: " + bits.join(", ") + ".";
+}
+
+function wireConfig() {
+  var save = document.getElementById("cfgsave");
+  var reload = document.getElementById("cfgreload");
+  if (save) save.addEventListener("click", saveConfig);
+  if (reload) reload.addEventListener("click", loadConfig);
+
+  Array.prototype.forEach.call(document.querySelectorAll(".cfg [data-path]"), function (i) {
+    var initial = i.value;
+    var mark = function () {
+      if (i.value === initial) i.classList.remove("dirty");
+      else i.classList.add("dirty");
+    };
+    i.addEventListener("input", mark);
+    i.addEventListener("change", mark);
+  });
+}
+
+function loadConfig() {
+  api("/api/riskguard/config")
+    .then(renderConfig)
+    .catch(function (e) { renderConfig({ error: e.message }); });
+}
+
+// Read every input, parse it, and report the FIRST unparseable one -- without
+// having touched anything.
+//
+// ⚠️ THIS IS P1-117 ON THE OTHER WRITER, AND IT IS THE WHOLE POINT OF DOING IT
+// THIS WAY. RiskGuardWindow.OnSaveConfigClick does `var cfg = _addOn.Config`
+// -- a LIVE reference -- and then applies seventeen assignments to it with
+// thirteen bare Parse calls in between. A typo throws partway down, everything
+// above it is already live on the running guard, and the operator is shown
+// "Failed to parse settings", which means nothing happened. Parse into locals,
+// validate the whole set, THEN send: a failure here is a failure that changed
+// nothing, which is what the message already claims.
+function collectConfig() {
+  var body = {}, changes = [], bad = null;
+
+  Array.prototype.forEach.call(document.querySelectorAll(".cfg [data-path]"), function (i) {
+    if (bad) return;
+    var path = i.getAttribute("data-path");
+    var kind = i.getAttribute("data-kind");
+    var raw = i.value;
+    var stored = dig(loadedCfg, path);
+    var val;
+
+    if (kind === "bool") {
+      val = (raw === "true");
+    } else if (kind === "select") {
+      val = raw;
+    } else {
+      var s = String(raw).trim();
+      if (s === "") { bad = { path: path, raw: raw, why: "is empty" }; return; }
+      var n = Number(s);
+      if (!isFinite(n)) { bad = { path: path, raw: raw, why: "is not a number" }; return; }
+      if (kind === "int" && Math.floor(n) !== n) {
+        bad = { path: path, raw: raw, why: "must be a whole number" }; return;
+      }
+      val = n;
+    }
+
+    // Unchanged fields are not sent. That is what makes the request a diff, and
+    // the diff is what leaves AccountFirmMap's ~120 rows alone.
+    if (val === stored) return;
+    plant(body, path, val);
+    changes.push(path + ":  " + JSON.stringify(stored) + "  ->  " + JSON.stringify(val));
+  });
+
+  return { body: body, changes: changes, bad: bad };
+}
+
+function saveConfig() {
+  if (!loadedCfg) {
+    outcome("bad", "Nothing has been read yet, so there is nothing to compare a change against.");
+    return;
+  }
+
+  var c = collectConfig();
+
+  if (c.bad) {
+    outcome("bad",
+      "Nothing was sent. " + c.bad.path + " " + c.bad.why + ".",
+      c.bad.path + " = " + JSON.stringify(c.bad.raw));
+    return;
+  }
+  if (!c.changes.length) {
+    outcome("ok", "Nothing has changed, so nothing was sent.");
+    return;
+  }
+
+  var lines = ["Apply " + c.changes.length + " change(s) to the live guard configuration?", ""];
+  lines = lines.concat(c.changes);
+
+  // ⚠️ Arming is not on this form and a mode change is not arming -- but it is
+  // still the most consequential edit here, so it gets said out loud rather
+  // than sitting in a list of numbers. Going to `live` is what makes every
+  // other limit on this page start flattening positions instead of noting them.
+  var nextMode = dig(c.body, "Mode");
+  if (nextMode) {
+    lines.push("");
+    lines.push(String(nextMode).toLowerCase() === "live"
+      ? "MODE -> LIVE. Breaches will act on the broker instead of being observed. "
+        + "The guard still has to pass preflight and be armed before that takes effect."
+      : "MODE -> " + String(nextMode).toUpperCase() + ".");
+  }
+
+  lines.push("");
+  lines.push("This is written to RiskGuard/config.json and hot-reloaded. It does NOT "
+           + "re-run preflight, so a value the guard cannot accept leaves it disarmed at "
+           + "the next restart.");
+
+  if (!window.confirm(lines.join("\n"))) return;
+
+  apiPost("/api/riskguard/config", c.body)
+    .then(function (res) {
+      // ⚠️ Read the ANSWER, not the fact that a call returned. `success: false`
+      // with a reason is exactly what a validator refusal looks like, and it
+      // arrives with HTTP 200 -- reporting "applied" here because the fetch
+      // resolved is report-the-call-not-the-outcome, which this project has
+      // shipped four times.
+      if (res && res.success === false) {
+        outcome("bad", "The guard REFUSED the change. Nothing was applied.",
+                res.error || res.reason || res.message || JSON.stringify(res));
+      } else {
+        outcome("ok", "Applied " + c.changes.length + " change(s).", c.changes.join("\n"));
+      }
+      // Re-read either way. After a refusal this proves nothing landed; after a
+      // success it shows what the merge actually stored, which is not always
+      // what was sent.
+      loadConfig();
+    })
+    .catch(function (e) {
+      outcome("bad", "The change was not applied.", e.message);
+      loadConfig();
+    });
+}
+
 function loadCopier() {
   api("/api/copier/snapshot")
     .then(renderCopier)
@@ -646,8 +975,18 @@ function load() {
   loadCopier();
 }
 
-document.getElementById("refresh").addEventListener("click", load);
+document.getElementById("refresh").addEventListener("click", function () {
+  load();
+  loadConfig();   // an explicit Refresh is the operator asking; the 5s poll is not
+});
 load();
+loadConfig();
+// ⚠️ loadConfig is deliberately NOT in here. The poll re-renders #content and
+// #copier every five seconds, and a form rebuilt under the cursor loses what
+// was being typed -- and worse, silently reverts a field the operator had
+// already changed but not yet saved, so they save a diff that no longer says
+// what they meant. Config is read on load and on Refresh, and re-read after
+// every write.
 setInterval(load, 5000);
 </script>
 </body>

@@ -1,0 +1,120 @@
+{
+  "success": true,
+  "config": {
+    "Profiles": [],
+    "ExcludedAccounts": [],
+    "LockoutBypassWhileDisarmedAccounts": [],
+    "Mode": "shadow",
+    "EnableWindowGate": false,
+    "MinShadowSessions": 5,
+    "AuditIntervalSeconds": 10,
+    "InstrumentLimits": {},
+    "BlockedInstruments": [],
+    "Alerts": {
+      "Enabled": true,
+      "MinSeverity": "warning"
+    },
+    "Sizing": {
+      "MaxContractsPerAccount": 10,
+      "MaxContractsAggregate": 20,
+      "ExpectedCopies": 1
+    },
+    "Overtrading": {
+      "MaxTradesPerSession": 8,
+      "CooldownMinutes": 5,
+      "MaxConsecutiveLosses": 3,
+      "MaxOrdersPerSecond": 5,
+      "LockoutMinutes": 60
+    },
+    "StopGuard": {
+      "OnMissing": "Flatten",
+      "StopAttachSeconds": 15,
+      "MaxAutoStopAttempts": 2,
+      "Offsets": {
+        "NQ": 40,
+        "MNQ": 40,
+        "ES": 16,
+        "MES": 16,
+        "default": 30
+      }
+    },
+    "PnLRules": {
+      "DailyLossLimit": 1000.0,
+      "TrailingDrawdown": 1500.0,
+      "LockoutMinutes": 60
+    },
+    "FirmMirror": {
+      "Enabled": true,
+      "TrailingDD": {
+        "Enabled": false,
+        "Type": "intraday",
+        "IncludesUnrealized": true,
+        "Amount": 2500.0,
+        "Buffer": 300.0,
+        "LockAtProfit": 0.0
+      },
+      "DailyLoss": {
+        "Enabled": false,
+        "Basis": "realized",
+        "Amount": 1500.0,
+        "Buffer": 200.0
+      },
+      "DailyResetHourUtc": 22,
+      "DailyResetMinuteUtc": 0,
+      "AccountFirmMap": {
+        "TAKEPROFITPRO524207503": "TPT-50K-PRO",
+        "TAKEPROFITPRO4945748": "TPT-50K-PRO"
+      },
+      "FirmProfiles": {
+        "TPT-50K-PRO": {
+          "Name": "TPT-50K-PRO",
+          "AccountSize": 50000.0,
+          "TrailingDD": {
+            "Enabled": true,
+            "Type": "intraday",
+            "IncludesUnrealized": true,
+            "Amount": 2000.0,
+            "Buffer": 200.0,
+            "LockAtProfit": 2000.0
+          },
+          "DailyLoss": {
+            "Enabled": false,
+            "Basis": "realized",
+            "Amount": 0.0,
+            "Buffer": 0.0
+          }
+        }
+      }
+    },
+    "Override": {
+      "ConfirmPhrase": "I understand locked means locked",
+      "WaitSeconds": 120
+    },
+    "WindowsET": [
+      {
+        "Name": "NY_AM_Macro",
+        "Start": "09:50",
+        "End": "11:10",
+        "Days": [
+          "Monday",
+          "Tuesday",
+          "Wednesday",
+          "Thursday",
+          "Friday"
+        ]
+      },
+      {
+        "Name": "NY_PM_Macro",
+        "Start": "13:50",
+        "End": "15:10",
+        "Days": [
+          "Monday",
+          "Tuesday",
+          "Wednesday",
+          "Thursday",
+          "Friday"
+        ]
+      }
+    ]
+  }
+}

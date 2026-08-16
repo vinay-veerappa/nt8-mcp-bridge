@@ -9,3 +9,8 @@ obj/
 __pycache__/
 *.pyc
 .venv/
+
+# agent-loop run artifacts (transcripts, panel findings, final.patch). Per-run and
+# per-machine, and a rejected patch committed here would read as a proposal that stands.
+# The DURABLE record of a run belongs in the handover, not in a log nobody re-reads.
+logs/
