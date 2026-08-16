@@ -1375,11 +1375,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1_102_AnUnknownLockoutActionIsREFUSEDNotAnsweredAsAStatus();
             TestEveryResolverSiteACTSOnTheRefusal();
             TestP2120_TheConfigRouteReportsWhatTheSaveDid();
+            TestP2127_TheTwoIncomingSeverityScalesAreConvertedNotShared();
+            TestP2127_TheWorstOfASetIsTheSmallestAndEmptyIsNotHealthy();
+            TestP2127_TheTreeGroupsByGroupThenByLeader();
+            TestP2127_EveryAccountAppearsExactlyOnce();
+            TestP2127_EverythingSortsWorstFirstAndNothingHidesUnderAParent();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 68;
+            const int declared = 73;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3108,6 +3113,180 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Assert(Regex.IsMatch(body, @"stillLocked\s*=\s*IsAccountLocked"),
                     "it RE-READS the enforcer after unlocking and reports what it found");
             }
+        }
+
+        // ================================================================================
+        // P2-127, section 4 of the UI redesign design: the FLEET pane's tree and the ONE
+        // ordering it is sorted by. EXECUTED, not grepped -- BridgeFleetView names no NT8
+        // type. See addons/BridgeFleetView.cs for why it is a compiled class at all: the
+        // page it feeds, ui/index.html, is in no test build and no mutation battery, and
+        // P2-127's plan entry says that is the thing to fix FIRST.
+        //
+        // The hazard being defended is measured, from one live payload: a copier row's
+        // `severity` runs 0-is-WORST while the `system` cell's runs Ok=0..Critical=3, which
+        // is 0-is-BEST. Sorting a tree that merges them by "the severity number" is wrong
+        // for one of the two, silently, and reads as a plausible order either way.
+        // ================================================================================
+
+        private static FleetCopierRow Row(string leader, string follower, string group, int severity)
+        {
+            return new FleetCopierRow
+            {
+                LeaderAccountName = leader,
+                FollowerAccountName = follower,
+                GroupName = group,
+                Severity = severity,
+                Enforcing = false,
+                NotEnforcingLabel = "disabled"
+            };
+        }
+
+        private static FleetNode Named(List<FleetNode> nodes, string name)
+        {
+            if (nodes == null) return null;
+            foreach (var n in nodes) if (n != null && n.Name == name) return n;
+            return null;
+        }
+
+        private static FleetNode At(List<FleetNode> nodes, int i)
+        {
+            if (nodes == null || i < 0 || i >= nodes.Count) return null;
+            return nodes[i];
+        }
+
+        private static void TestP2127_TheTwoIncomingSeverityScalesAreConvertedNotShared()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the two incoming severity scales are converted, not shared");
+
+            Assert(BridgeFleetView.RankOfCopierRow(0) == 0
+                   && BridgeFleetView.RankOfCopierRow(5) == 5,
+                "P2-127: a copier row's severity keeps 0 as the worst");
+
+            // Fail-closed: a value outside the known range is the WORST, not the best. A
+            // clamp toward "healthy" is how an unreadable state reads as fine.
+            Assert(BridgeFleetView.RankOfCopierRow(-3) == BridgeFleetView.UnknownRank
+                   && BridgeFleetView.RankOfCopierRow(99) == BridgeFleetView.UnknownRank,
+                "P2-127: an out-of-range copier severity is the worst rank, not a sorted one");
+
+            Assert(BridgeFleetView.RankOfSystemSeverity("critical") == BridgeFleetView.WorstRank
+                   && BridgeFleetView.RankOfSystemSeverity("ok") > BridgeFleetView.RankOfSystemSeverity("warn"),
+                "P2-127: the system severity scale is INVERTED on the way in, not shared");
+
+            Assert(BridgeFleetView.RankOfSystemSeverity("banana") == BridgeFleetView.UnknownRank
+                   && BridgeFleetView.RankOfSystemSeverity(null) == BridgeFleetView.UnknownRank,
+                "P2-127: an unrecognised system severity is the WORST, not the best");
+
+            // THE DISCRIMINATOR. Both scales carry a 3. On the system scale that is
+            // `Critical`, the worst thing it can say; on a copier row it is `Shadow`, which
+            // is not a fault at all. A single shared scale passes every other assertion here
+            // and fails this one.
+            Assert(BridgeFleetView.RankOfSystemSeverity("critical") == BridgeFleetView.WorstRank
+                   && BridgeFleetView.RankOfCopierRow(3) != BridgeFleetView.WorstRank,
+                "P2-127: the same number means opposite things on the two scales");
+        }
+
+        private static void TestP2127_TheWorstOfASetIsTheSmallestAndEmptyIsNotHealthy()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the worst of a set, and what an empty set means");
+
+            Assert(BridgeFleetView.WorstOf(new List<int> { 5, 1, 4 }) == 1,
+                "P2-127: the worst of a set is the SMALLEST rank");
+
+            Assert(BridgeFleetView.WorstOf(new List<int>()) == BridgeFleetView.UnknownRank,
+                "P2-127: a group with no children is not healthy");
+        }
+
+        private static void TestP2127_TheTreeGroupsByGroupThenByLeader()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: how the tree is grouped");
+
+            // The live box: two ungrouped relationships sharing one leader. Section 4
+            // decision 2 -- groups are the only grouping, a 1:1 pair is a group of one --
+            // so these key by LEADER and become one node, not two.
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5), Row("Sim101", "Sim-ORB", null, 5) },
+                new List<string> { "Sim101", "SimCopy2", "Sim-ORB" });
+            var g = Named(tree, "Sim101");
+            Assert(g != null && g.Kind == "group" && g.Children.Count == 2,
+                "P2-127: two ungrouped relationships with one leader are ONE group of two");
+
+            var named = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("NT_9451", "follower_1", "Group A", 4) },
+                new List<string> { "NT_9451", "follower_1" });
+            var ga = Named(named, "Group A");
+            Assert(ga != null && ga.Kind == "group" && ga.Children.Count == 1,
+                "P2-127: a named group is keyed by its name, not by its leader");
+        }
+
+        private static void TestP2127_EveryAccountAppearsExactlyOnce()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: every account appears exactly once");
+
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5) },
+                new List<string> { "Sim101", "SimCopy2", "Spare1", "Spare2" });
+
+            var unlinked = Named(tree, BridgeFleetView.UnlinkedName);
+            Assert(unlinked != null && unlinked.Children.Count == 2
+                   && Named(unlinked.Children, "Spare1") != null
+                   && Named(unlinked.Children, "Spare2") != null,
+                "P2-127: every account in no relationship lands under Unlinked accounts");
+
+            // A leader is its group's leader and is NOT also unlinked. Collecting every name
+            // in the whole tree is the assertion that catches a double-listing anywhere.
+            var seen = new List<string>();
+            foreach (var n in tree)
+            {
+                if (n.Kind == "group") seen.Add(n.Name);
+                foreach (var c in n.Children) seen.Add(c.Name);
+            }
+            var dupes = seen.GroupBy(x => x).Where(x => x.Count() > 1).Select(x => x.Key).ToList();
+            Assert(seen.Count > 0 && dupes.Count == 0,
+                "P2-127: no account is listed in two places in the tree");
+        }
+
+        private static void TestP2127_EverythingSortsWorstFirstAndNothingHidesUnderAParent()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: worst-first, and a parent carries its worst child");
+
+            // Group "Bad" holds an Orphan (0, the worst row this system emits); group "Good"
+            // holds only Idle rows (5).
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow>
+                {
+                    Row("Good", "g1", "Good", 5),
+                    Row("Bad",  "b1", "Bad",  5),
+                    Row("Bad",  "b2", "Bad",  0)
+                },
+                new List<string> { "Good", "g1", "Bad", "b1", "b2", "Spare1" });
+
+            Assert(At(tree, 0) != null && At(tree, 0).Name == "Bad",
+                "P2-127: groups sort worst-first");
+
+            var bad = Named(tree, "Bad");
+            Assert(bad != null && At(bad.Children, 0) != null && At(bad.Children, 0).Name == "b2",
+                "P2-127: followers inside a group sort worst-first");
+
+            // Section 4.2 killed navigation tabs because this page's value is that a bad
+            // state is visible WITHOUT being looked for. A collapsed parent showing a
+            // healthy rank over a bad child is that hazard by another route.
+            Assert(bad != null && bad.Rank == BridgeFleetView.WorstRank,
+                "P2-127: a group carries the WORST of its children, so nothing hides under it");
+
+            // The sketch in section 4 puts Unlinked below the groups. It stays there even
+            // when it holds the worst thing on the page -- so its own rank has to be visible
+            // on the node, because its POSITION no longer tells you.
+            var withBadUnlinked = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Good", "g1", "Good", 5) },
+                new List<string> { "Good", "g1", "Spare1" });
+            var last = At(withBadUnlinked, withBadUnlinked.Count - 1);
+            Assert(last != null && last.Name == BridgeFleetView.UnlinkedName,
+                "P2-127: Unlinked accounts comes last, so its rank must be read off the node");
         }
 
         public static int Main(string[] args)
