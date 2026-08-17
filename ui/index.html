@@ -124,6 +124,30 @@
                    text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
   .cfgbar { margin: 10px 0 0; display: flex; gap: 8px; align-items: center; }
   .cfgbar .note { margin-left: auto; }
+
+  /* P2-138. Section 4's two panes. The fleet is ALWAYS visible and the inspector
+     is what the selection drives -- that is the whole layout, and the reason the
+     page needs no navigation tabs. */
+  .shell { display: flex; gap: 16px; align-items: flex-start; }
+  #fleetpane { flex: 0 0 300px; width: 300px; position: sticky; top: 8px; }
+  #inspector { flex: 1; min-width: 0; }
+  #fleettree ul { list-style: none; margin: 0; padding: 0; }
+  #fleettree li { padding: 0; margin: 0; }
+  .fnode { display: flex; align-items: baseline; gap: 6px; padding: 3px 6px;
+           border-radius: 3px; cursor: pointer; }
+  .fnode:hover { background: rgba(255,255,255,0.06); }
+  .fnode.sel { background: rgba(255,255,255,0.14); font-weight: 600; }
+  .fnode .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fnode .fbadge { font-size: 11px; opacity: 0.85; white-space: nowrap; }
+  .fkids { margin-left: 14px; border-left: 1px solid rgba(255,255,255,0.12); padding-left: 6px; }
+  .fgroup { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+            opacity: 0.7; margin-top: 10px; }
+  /* The badge is coloured by the NAME core sent, never by the rank. Two incoming
+     severity scales disagree about which end is bad, which is why the ONE ordering
+     is computed in a class the harness executes and this file only paints it. */
+  .fbadge.b-disabled, .fbadge.b-shadow, .fbadge.b-notarmed { color: #d7a13b; }
+  .fbadge.b-quarantined, .fbadge.b-orphan, .fbadge.b-diverged { color: #d9534f; }
+  .fbadge.b-match { color: #5cb85c; }
 </style>
 </head>
 <body>
@@ -140,18 +164,31 @@
   <button id="refresh">Refresh</button>
 </header>
 
-<main>
-  <div id="banner"></div>
-  <!-- Outcomes live OUTSIDE #copier on purpose. The page re-renders every 5s, so
-       anything written inside a section is gone before it can be read. -->
-  <div id="outcome"></div>
-  <!-- The config form is OUTSIDE everything load() touches, and load() runs every
-       5 seconds. A form re-rendered under the operator's cursor loses whatever
-       they were halfway through typing, which is the same reason #outcome sits
-       here. It is fetched once and on an explicit Reload, never on the poll. -->
-  <div id="config"></div>
-  <div id="copier"></div>
-  <div id="content"></div>
+<!-- P2-138. UI_REDESIGN_DESIGN.md section 4: "one window, two panes, zero nav tabs".
+     The left column lists ENTITIES -- groups with their followers nested, then
+     unlinked accounts -- and selecting one drives the inspector on the right.
+     Section 4.2 kills top-level navigation tabs explicitly, "recorded so nobody
+     re-adds them", and the operator re-confirmed section 4 against a live challenge
+     on 2026-08-16 after calling the stacked-sections page "cluttered". What they
+     were reacting to is the ABSENCE of section 4, not section 4. -->
+<main class="shell">
+  <div id="fleetpane">
+    <div class="note" id="fleettree">loading the fleet…</div>
+  </div>
+
+  <div id="inspector">
+    <div id="banner"></div>
+    <!-- Outcomes live OUTSIDE #copier on purpose. The page re-renders every 5s, so
+         anything written inside a section is gone before it can be read. -->
+    <div id="outcome"></div>
+    <!-- The config form is OUTSIDE everything load() touches, and load() runs every
+         5 seconds. A form re-rendered under the operator's cursor loses whatever
+         they were halfway through typing, which is the same reason #outcome sits
+         here. It is fetched once and on an explicit Reload, never on the poll. -->
+    <div id="config"></div>
+    <div id="copier"></div>
+    <div id="content"></div>
+  </div>
 </main>
 
 <script>
@@ -322,7 +359,20 @@ function renderFleet(data) {
   });
   var hidden = all.length - shown.length;
 
-  if (hidden > 0 || showAll) {
+  // P2-138. A selection in the fleet pane wins over the empty-account filter: an
+  // operator who clicked an account wants THAT account, and one with no equity and
+  // no trades would otherwise be hidden by a filter they did not touch -- selecting
+  // a row and getting an empty table is indistinguishable from a broken page.
+  if (selectedAccount) {
+    shown = all.filter(function (a) { return a.accountName === selectedAccount; });
+    hidden = all.length - shown.length;
+  }
+
+  if (selectedAccount) {
+    html += '<div class="filter note">Inspecting <b>' + esc(selectedAccount)
+         + '</b> — ' + hidden + ' of ' + all.length + ' accounts hidden by the fleet '
+         + 'selection.</div>';
+  } else if (hidden > 0 || showAll) {
     html += '<div class="filter note">'
          + (showAll
             ? 'Showing all ' + all.length + ' accounts. <a id="tog">Hide the empty ones</a>'
@@ -466,7 +516,91 @@ function copierBanner(sys) {
        + '<div class="detail">' + esc(sys.detail || "") + '</div></div>';
 }
 
+// P2-138. Section 4's left pane.
+//
+// The selection is what the inspector is filtered by. Null means "nothing selected",
+// which section 4 decision 4 says shows the system row -- i.e. everything, unfiltered.
+// It is a NAME rather than an index because the tree is rebuilt from a fresh payload
+// every five seconds and an index would silently select a different account.
+var selectedAccount = null;
+
+// The tree arrives already ordered and already ranked. BridgeFleetView owns the ONE
+// ordering -- 199 lines with a mutation battery, because two incoming severity scales
+// disagree about which end is bad -- so this renders the list it is given, in the order
+// it is given, and re-derives nothing. The badge is coloured by the NAME core sent.
+function fleetNodeHtml(n) {
+  var sel = (n.kind === "account" && n.name === selectedAccount) ? " sel" : "";
+  var badgeClass = "b-" + String(n.badge || "").toLowerCase().replace(/[^a-z]/g, "");
+  var role = n.role ? '<span class="meta">' + esc(n.role) + "</span>" : "";
+
+  var html = '<li><div class="fnode' + sel + '" data-kind="' + escAttr(n.kind)
+           + '" data-name="' + escAttr(n.name) + '">'
+           + '<span class="fname">' + esc(n.name) + "</span>"
+           + role
+           + (n.badge ? '<span class="fbadge ' + badgeClass + '">' + esc(n.badge) + "</span>" : "")
+           + "</div>";
+
+  var kids = n.children || [];
+  if (kids.length) {
+    html += '<ul class="fkids">';
+    for (var i = 0; i < kids.length; i++) html += fleetNodeHtml(kids[i]);
+    html += "</ul>";
+  }
+  return html + "</li>";
+}
+
+function renderFleetTree(data) {
+  var el = document.getElementById("fleettree");
+  if (!el) return;
+
+  var nodes = data && data.fleet;
+  if (!nodes || !nodes.length) {
+    // Not an absence: a page that renders nothing here reads as "no accounts",
+    // and this box has 97. Same reason the copier indicator never goes blank.
+    el.innerHTML = '<div class="note">The bridge sent no fleet tree.</div>';
+    return;
+  }
+
+  var html = "<ul>";
+  for (var i = 0; i < nodes.length; i++) html += fleetNodeHtml(nodes[i]);
+  html += "</ul>";
+
+  if (selectedAccount) {
+    html += '<div class="note" style="margin-top:10px">Inspecting <b>'
+          + esc(selectedAccount) + "</b> — <a id=\"fclear\">show the whole fleet</a></div>";
+  }
+  el.innerHTML = html;
+
+  var clear = document.getElementById("fclear");
+  if (clear) clear.addEventListener("click", function () {
+    selectedAccount = null;
+    load();
+  });
+
+  var rows = el.querySelectorAll(".fnode");
+  for (var j = 0; j < rows.length; j++) {
+    rows[j].addEventListener("click", function () {
+      if (this.getAttribute("data-kind") !== "account") return;
+      var name = this.getAttribute("data-name");
+      // Clicking the selected row clears it, so the operator can always get back
+      // to the whole fleet without hunting for a control.
+      selectedAccount = (selectedAccount === name) ? null : name;
+      load();
+    });
+  }
+}
+
+// The selection filter, stated once. Both halves of the inspector consult THIS --
+// a second copy of "does this row belong to the selected account?" is how the two
+// panes come to disagree about what is selected.
+function selectedHas(leader, follower) {
+  if (!selectedAccount) return true;
+  return leader === selectedAccount || follower === selectedAccount;
+}
+
 function renderCopier(data) {
+  renderFleetTree(data);
+
   var el = document.getElementById("copier");
   if (!el) return;
 
@@ -487,14 +621,32 @@ function renderCopier(data) {
     return;
   }
 
-  var rows = data.rows.slice().sort(function (a, b) {
+  // P2-138. The selection filter. `all` is kept so the heading can say how many rows
+  // were hidden -- a table that silently shrinks when something is selected reads as
+  // relationships having disappeared, which is the defect d0a9e27 fixed for the 89
+  // empty accounts.
+  var all = data.rows.slice().sort(function (a, b) {
     return (a.severity - b.severity) ||
            a.followerAccountName.localeCompare(b.followerAccountName);
+  });
+  var rows = all.filter(function (r) {
+    return selectedHas(r.leaderAccountName, r.followerAccountName);
   });
 
   lastCopierRows = rows;
 
-  var html = '<section><h2>Copier (' + rows.length + ')</h2>'
+  var heading = selectedAccount
+    ? 'Copier (' + rows.length + ' of ' + all.length + ', for ' + esc(selectedAccount) + ')'
+    : 'Copier (' + rows.length + ')';
+
+  if (!rows.length) {
+    el.innerHTML = '<section><h2>' + heading + '</h2>' + copierBanner(data.system)
+                 + '<div class="banner"><b>' + esc(selectedAccount) + '</b> is in no copier '
+                 + 'relationship. Nothing is mirrored to or from it.</div></section>';
+    return;
+  }
+
+  var html = '<section><h2>' + heading + '</h2>'
     + copierBanner(data.system)
     + '<table><thead><tr>'
     + '<th>Verdict</th><th>Leader &rarr; Follower</th><th>Instrument</th>'

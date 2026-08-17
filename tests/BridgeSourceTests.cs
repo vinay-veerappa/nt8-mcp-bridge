@@ -3625,6 +3625,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(mapped[0].Enforcing == false && mapped[0].NotEnforcingLabel == "disabled",
                 "P2-138: the bridge's own enrichment survives the mapping, so the tree can say "
                 + "WHY a row is not enforcing without a second derivation");
+
+            // FleetNode.Badge is DECLARED AND ASSIGNED NOWHERE -- the same never-set field as
+            // P3-137's ActiveBracket.IsComplete, in the fleet view itself. Section 4's rows read
+            // "follower_1 1.0x ✔MATCH", so a tree of bare names is not that pane. The label is
+            // already on the row and needs no second derivation to become the badge.
+            var tree = BridgeFleetView.Build(mapped, new List<string> { "Sim101", "Sim-ORB" });
+            FleetNode follower = null;
+            foreach (var g in tree)
+                foreach (var c in g.Children)
+                    if (c.Name == "Sim-ORB") follower = c;
+
+            Assert(follower != null && !string.IsNullOrEmpty(follower.Badge), string.Format(
+                "P2-138: a follower node carries the badge section 4's row shows (badge={0})",
+                follower == null ? "<no node>" : (follower.Badge ?? "<null>")));
+            Assert(follower != null && follower.Badge == "disabled",
+                "P2-138: and the badge is the label the row already carried, not a fourth "
+                + "vocabulary invented for the page");
         }
 
         /// <summary>
@@ -3692,8 +3709,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(Regex.IsMatch(html, @"\.children") && Regex.IsMatch(html, @"\.kind"),
                 "P2-138: and it renders the tree as a TREE -- groups with their followers "
                 + "nested, which is UI_REDESIGN_DESIGN.md section 4's left pane");
-            Assert(Regex.IsMatch(html, @"\.badge") && Regex.IsMatch(html, @"\.rank"),
-                "P2-138: and each node shows the badge and sorts by the rank core computed");
+            Assert(Regex.IsMatch(html, @"\.badge"),
+                "P2-138: and each node shows the badge section 4's row shows");
+
+            // ⚠️ THIS ASSERTION FIRST DEMANDED THE PAGE READ `.rank`, WHICH IS THE OPPOSITE OF
+            // THE DESIGN. Core sorts the tree -- that is what BridgeFleetView's 199 lines and
+            // its mutation battery are FOR -- so a page that touched the rank at all would be
+            // the second copy of an ordering this file exists to keep single. The page renders
+            // the list in the order it was handed. Corrected before the loop was asked to
+            // satisfy it, or it would have implemented a defect to turn a gate green.
+            int fs = html.IndexOf("function renderFleetTree(");
+            int fe = fs < 0 ? -1 : html.IndexOf("\nfunction ", fs + 10);
+            string renderer = (fs >= 0 && fe > fs) ? html.Substring(fs, fe - fs) : "";
+            Assert(renderer.Length > 100, string.Format(
+                "P2-138: the fleet renderer is locatable for inspection ({0} chars read)",
+                renderer.Length));
+            Assert(renderer.Length > 100 && !renderer.Contains(".sort("), string.Format(
+                "P2-138: and it renders the tree in the ORDER core gave it, sorting nothing "
+                + "itself ({0} chars inspected)", renderer.Length));
 
             // The negative control, and the reason the class exists at all. §4's ordering is
             // the whole point and two incoming severity scales disagree about which end is bad.
