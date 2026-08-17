@@ -221,15 +221,18 @@ MUTANTS = [
     (BRIDGE,
      "SOURCE GATE: the per-row refusal is dropped, so P3-122's ordering goes back to being a\n"
      "     defect in a string nothing displays -- correct, and unreachable by the operator",
-     '                row["notEnforcingLabel"] = refusal == null ? null : refusal.Label;\n'
-     '                row["notEnforcingReason"] = refusal == null ? null : refusal.Sentence;',
-     '                row["enforcingChecked"] = true;'),
+     # P2-138 renamed the loop variable to rowObj when it added the JObject cast.
+     '                rowObj["notEnforcingLabel"] = refusal == null ? null : refusal.Label;\n'
+     '                rowObj["notEnforcingReason"] = refusal == null ? null : refusal.Sentence;',
+     '                rowObj["enforcingChecked"] = true;'),
 
     (BRIDGE,
      "SOURCE GATE: the null-engine branch is removed, so a box with no copier throws instead\n"
      "     of answering. The route is reached by a 5-second poll; an exception there is a page\n"
      "     that says nothing at all about a system that is doing nothing at all",
+     # P2-138 added the empty-fleet assignment between these two lines.
      '                payload["system"] = JObject.FromObject(CopierEnforcementView.NotLoadedCell(), camel);\n'
+     '                payload["fleet"] = new JArray();\n'
      '                return payload;',
      '                return payload;'),
 

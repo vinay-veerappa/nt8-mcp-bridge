@@ -115,17 +115,10 @@ MUTANTS = [
      "one node per ROW instead of per FOLLOWER, so a leader/follower pair holding two\n"
      "     per-instrument relationships is listed TWICE. Both live rows are instrument-less,\n"
      "     so every test written against the box as it stands passes under this",
-     '                    FleetNode existing;\n'
-     '                    if (byFollower.TryGetValue(row.FollowerAccountName ?? "", out existing))\n'
-     '                    {\n'
-     '                        if (rank < existing.Rank) existing.Rank = rank;\n'
-     '                        continue;\n'
-     '                    }',
-     '                    FleetNode existing;\n'
-     '                    if (false && byFollower.TryGetValue(row.FollowerAccountName ?? "", out existing))\n'
-     '                    {\n'
-     '                        continue;\n'
-     '                    }'),
+     # P2-138 rewrote this block to merge the BADGE as well as the rank, so the mutant now
+     # disables the lookup rather than replacing the body. Same effect: one node per ROW.
+     '                    if (byFollower.TryGetValue(key, out existing))',
+     '                    if (false && byFollower.TryGetValue(key, out existing))'),
 
     (FLEET,
      "a de-duplicated follower keeps its FIRST rank rather than its worst, so which of two\n"
