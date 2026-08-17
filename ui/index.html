@@ -131,6 +131,20 @@
   .shell { display: flex; gap: 16px; align-items: flex-start; }
   #fleetpane { flex: 0 0 300px; width: 300px; position: sticky; top: 8px; }
   #inspector { flex: 1; min-width: 0; }
+  /* P2-127 slice 3. The tab strip is ALWAYS visible; only the PANES swap. That is
+     the difference between these and the top-level nav tabs section 4.2 killed: a
+     warning on an unselected tab is still on screen, in its badge. */
+  #tabstrip { display: flex; gap: 6px; margin: 10px 0 6px; flex-wrap: wrap; }
+  .tab { display: flex; align-items: baseline; gap: 6px; padding: 4px 10px;
+         border: 1px solid #333; border-radius: 4px 4px 0 0; cursor: pointer;
+         background: #1b1b1b; }
+  .tab.on { background: #262626; border-bottom-color: #262626; font-weight: 600; }
+  .tab .tbadge { font-size: 11px; opacity: 0.95; }
+  /* Worst-first colouring, from the RANK the class computed -- never re-derived here. */
+  .tab.r0 { border-color: #a33; } .tab.r0 .tbadge { color: #ff8a8a; }
+  .tab.r1 { border-color: #a63; } .tab.r1 .tbadge { color: #ffbe76; }
+  .tab.r2, .tab.r3 { border-color: #886; } .tab.r2 .tbadge, .tab.r3 .tbadge { color: #ddd18a; }
+  .tab.r5 .tbadge { color: #8ad18a; }
   #fleettree ul { list-style: none; margin: 0; padding: 0; }
   #fleettree li { padding: 0; margin: 0; }
   .fnode { display: flex; align-items: baseline; gap: 6px; padding: 3px 6px;
@@ -185,9 +199,21 @@
          5 seconds. A form re-rendered under the operator's cursor loses whatever
          they were halfway through typing, which is the same reason #outcome sits
          here. It is fetched once and on an explicit Reload, never on the poll. -->
-    <div id="config"></div>
-    <div id="copier"></div>
-    <div id="content"></div>
+    <!-- P2-127 slice 3. Section 4's three tabs, and the ONLY tabs in the app: they
+         are inside the inspector and scoped to the selection, not the top-level nav
+         that section 4.2 killed and recorded "so nobody re-adds them".
+
+         ⚠️ EVERY BADGE AND RANK HERE COMES FROM BridgeInspectorTabs, over
+         /api/ui/inspector. This file is in no test build and no mutation battery, so
+         a decision taken here is a decision nothing can check -- which is what
+         P2-127's entry warns grows "a third untested surface, and it will be the one
+         the operator actually uses". The strip renders what the route returns. -->
+    <div id="tabstrip"></div>
+    <div id="tabpanes">
+      <div id="config"></div>
+      <div id="copier"></div>
+      <div id="content"></div>
+    </div>
   </div>
 </main>
 
@@ -1201,11 +1227,70 @@ function api(url) {
   });
 }
 
+// P2-127 slice 3. Which pane is on screen. A NAME, not an index, and kept outside
+// everything the 5s poll re-renders -- the same reason selectedAccount is a name:
+// the strip is rebuilt every poll and an index would land on whatever moved into
+// that slot.
+var activeTab = "copier";
+
+// ⚠️ THE PANES ARE HIDDEN, NOT UNRENDERED. Section 4.2 killed top-level tabs because
+// they HIDE state; the compensation is that the strip's badges stay on screen for all
+// three. Unrendering a pane would also drop the config form's in-progress edits,
+// which is the hazard the #config comment above already records.
+function renderTabs(data) {
+  var el = document.getElementById("tabstrip");
+  var tabs = (data && data.tabs) || [];
+  if (!tabs.length) {
+    el.innerHTML = '<div class="banner bad">The bridge returned no inspector tabs. '
+      + 'Three are expected; none means the route or the fold is broken, not that '
+      + 'everything is clean.</div>';
+    return;
+  }
+  // No sorting here: section 4's order is the class's decision and it already made it.
+  el.innerHTML = tabs.map(function (t) {
+    var on = t.id === activeTab ? " on" : "";
+    return '<div class="tab r' + Number(t.rank) + on + '" data-tab="' + esc(t.id)
+      + '" title="' + esc(t.reason || "") + '"><span>' + esc(t.label || t.id)
+      + '</span><span class="tbadge">' + esc(t.badge || "") + '</span></div>';
+  }).join("");
+
+  Array.prototype.forEach.call(el.querySelectorAll(".tab"), function (n) {
+    n.addEventListener("click", function () {
+      activeTab = n.getAttribute("data-tab");
+      applyTabs();
+      renderTabs(data);          // repaint so the .on class follows the click
+    });
+  });
+  applyTabs();
+}
+
+// copier -> #copier, risk -> #content (the per-account rule rows), rare -> #config
+// (the set-rarely guard config, which section 4 puts in the inspector and nowhere else).
+function applyTabs() {
+  var paneOf = { copier: "copier", risk: "content", rare: "config" };
+  Object.keys(paneOf).forEach(function (id) {
+    var pane = document.getElementById(paneOf[id]);
+    if (pane) pane.style.display = (id === activeTab) ? "" : "none";
+  });
+}
+
+function loadTabs() {
+  var q = selectedAccount ? ("?account=" + encodeURIComponent(selectedAccount)) : "";
+  api("/api/ui/inspector" + q)
+    .then(renderTabs)
+    .catch(function (e) {
+      document.getElementById("tabstrip").innerHTML =
+        '<div class="banner bad">Inspector tabs unavailable: ' + esc(e.message)
+        + '. The panes below are unfiltered.</div>';
+    });
+}
+
 function load() {
   api("/api/riskguard/inventory?view=summary")
     .then(renderFleet)
     .catch(function (e) { renderFleet({ error: e.message }); });
   loadCopier();
+  loadTabs();
 }
 
 document.getElementById("refresh").addEventListener("click", function () {

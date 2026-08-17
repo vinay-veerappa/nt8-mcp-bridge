@@ -1396,6 +1396,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2127_TheRiskTabFoldsInertNotJustUnevaluated();
             TestP2127_TheBadgeIsRecountedFromTheRowsAndFollowsTheSelection();
             TestP2127_TheLiveInventoryMapsOntoTheTabsInput();
+            // Both written from arbitrating the panel by hand: one finding of five held.
+            TestP2127_TheRouteServesTheTabsAndDecidesNothing();
+            TestP2127_AKnownCleanTabDoesNotRankAsTheWorst();
+            TestP2127_AnUnreadableRuleStateRanksWorstNotBest();
+            TestP2127_TheAccountFilterIgnoresCaseLikeTheCoreDoes();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
@@ -1404,7 +1409,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 89;
+            const int declared = 93;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3760,6 +3765,195 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(rows.Count(r => r.AccountName == "Sim101") == 1,
                 "P2-127: and each row carries the account it belongs to, which is what makes the "
                 + "selection filter possible at all");
+        }
+
+        /// <summary>
+        /// P2-127 slice 3. A KNOWN-CLEAN state must not rank as the worst thing on the strip.
+        ///
+        /// ⚠️ WRITTEN FROM ARBITRATING THE LOOP'S PANEL, and it was the one finding of five that
+        /// held. The implementation folded `BridgeFleetView.WorstOf(new int[0])` for a rare tab with
+        /// no config conflicts. That returns `UnknownRank`, which IS `WorstRank` — so the tab
+        /// rendered as the worst item on the always-visible strip while its own badge read
+        /// "No conflicts". What a surface REPORTS disagreeing with what it RANKS is the defect, and
+        /// this direction is the one that trains an operator to discount the strip.
+        ///
+        /// `WorstOf`'s pessimistic empty answer is right for a set it could not read — slice 1's
+        /// "a group with no children is not healthy". Zero conflicts is a set that WAS read and was
+        /// empty. [[an-inapplicable-state-is-not-unreadable]], which painted 95 of 97 accounts worst
+        /// for the same reason.
+        /// </summary>
+        /// <summary>
+        /// P2-127 slice 3. The route SERVES the tabs it builds, and decides nothing itself.
+        ///
+        /// ⚠️ THIS GATE EXISTS BECAUSE P2-138 WAS EXACTLY THE OPPOSITE. `BridgeFleetView.Build` had
+        /// 199 lines of logic, 137 lines of acceptance tests, a 253-line mutation battery, CI-green —
+        /// and NO CALLER outside its own test file. Coverage measures whether a thing is CORRECT,
+        /// never whether anything CALLS it, and the only surface it was detectable on was the
+        /// operator saying they still could not see it. [[dead-safety-machinery-gate]].
+        ///
+        /// A SOURCE gate rather than a behavioural one because `McpBridgeAddOn.cs` is the one bridge
+        /// source `BridgeTests.csproj` cannot compile. The negative controls matter more than the
+        /// presence checks: the route must not invent a rank or an order, because anything it decides
+        /// is untestable by construction.
+        /// </summary>
+        private static void TestP2127_TheRouteServesTheTabsAndDecidesNothing()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the inspector route serves the tabs, and decides nothing (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+            int s = code.IndexOf("case \"/api/ui/inspector\":", StringComparison.Ordinal);
+            Assert(s >= 0, "P2-127: the /api/ui/inspector route exists at all -- a decision class "
+                + "with no route is P2-138 repeated");
+            if (s < 0) return;
+
+            int e = code.IndexOf("\n                case \"", s + 10);
+            string handler = e > s ? code.Substring(s, e - s) : code.Substring(s);
+            Assert(handler.Length > 200, string.Format(
+                "P2-127: the handler is locatable for inspection ({0} chars read)", handler.Length));
+
+            Assert(handler.Contains("BridgeInspectorTabs.Build("), string.Format(
+                "P2-127: the route SERVES the tabs -- Build must have a caller outside its test "
+                + "file, which is the whole content of P2-138 ({0} chars inspected)", handler.Length));
+            Assert(handler.Contains("BridgeInspectorTabs.RuleRowsFromInventory("), string.Format(
+                "P2-127: and the rule rows come from the mapper, not from a second hand-rolled read "
+                + "of the guard snapshot ({0} chars inspected)", handler.Length));
+            Assert(handler.Contains("BridgeFleetView.RowsFromSnapshot("), string.Format(
+                "P2-127: and the copier rows come from the SAME mapping the fleet tree uses, so the "
+                + "strip and the tree cannot disagree ({0} chars inspected)", handler.Length));
+
+            // ⚠️ THE NEGATIVE CONTROLS. Anything this file decides can only ever be gated by a
+            // regex, so the rule is that it decides nothing: no rank, no badge text, no ordering.
+            Assert(!Regex.IsMatch(handler, @"Rank\s*=\s*\d"), string.Format(
+                "P2-127: the route assigns no rank of its own -- ranks come from the class the "
+                + "harness compiles ({0} chars inspected)", handler.Length));
+            Assert(!Regex.IsMatch(handler, @"""(copier|risk|rare)"""), string.Format(
+                "P2-127: and it does not name a tab id, which would be a second definition of the "
+                + "set of tabs and could drift from the class's ({0} chars inspected)",
+                handler.Length));
+            Assert(!handler.Contains(".Sort(") && !handler.Contains("OrderBy("), string.Format(
+                "P2-127: and it does not re-order them -- section 4's order is the class's decision "
+                + "and one copy of it is enough ({0} chars inspected)", handler.Length));
+        }
+
+        private static void TestP2127_AKnownCleanTabDoesNotRankAsTheWorst()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: a known-clean tab does not rank as the worst");
+
+            var clean = BridgeInspectorTabs.Build(
+                new List<FleetCopierRow>(), new List<InspectorRuleRow>(), null, 0);
+            var rare = clean == null ? null : clean.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RareTab);
+            Assert(rare != null, "P2-127: precondition -- the rare tab is present");
+            if (rare == null) return;
+
+            Assert(rare.Rank != BridgeFleetView.UnknownRank,
+                string.Format("P2-127: zero config conflicts is CLEAN, not unknown, so the rare tab "
+                    + "must not carry UnknownRank ({0}) -- which is WorstRank, and would paint the "
+                    + "strip's worst item over a tab whose own badge says there is nothing wrong "
+                    + "(got {1})", BridgeFleetView.UnknownRank, rare.Rank));
+
+            Assert(rare.Rank == BridgeInspectorTabs.CleanRank
+                   && rare.Rank < BridgeFleetView.NotApplicableRank,
+                string.Format("P2-127: and it is CleanRank ({0}), below NotApplicableRank ({1}) -- "
+                    + "the question DOES apply to this box and the answer is 'nothing wrong', which "
+                    + "is not the same as 'does not apply' (got {2})",
+                    BridgeInspectorTabs.CleanRank, BridgeFleetView.NotApplicableRank, rare.Rank));
+
+            var conflicted = BridgeInspectorTabs.Build(
+                new List<FleetCopierRow>(), new List<InspectorRuleRow>(), null, 2);
+            var badRare = conflicted.First(t => t.Id == BridgeInspectorTabs.RareTab);
+            Assert(badRare.Rank == BridgeFleetView.WorstRank
+                   && badRare.Rank < rare.Rank,
+                string.Format("P2-127: and a real conflict IS the worst, strictly worse than clean "
+                    + "({0} vs {1}) -- the negative control, because a fix that ranked everything "
+                    + "clean would pass every assertion above", badRare.Rank, rare.Rank));
+        }
+
+        /// <summary>
+        /// P2-127 slice 3. The account filter is case-insensitive, matching how the core compares
+        /// account names everywhere (`OrdinalIgnoreCase`). A case-sensitive compare returns a
+        /// well-formed "No data" tab for an account that is present — a quiet wrong answer rather
+        /// than a visible one. [[weigh-the-quiet-failure-above-the-loud]].
+        /// </summary>
+        /// <summary>
+        /// P2-127 slice 3. A rule state this code CANNOT READ must rank worst, not best.
+        ///
+        /// ⚠️ WRITTEN FROM TWO BATTERY SURVIVORS, and the gap was real: nothing here exercised an
+        /// unrecognised or empty state, so both mutants that made them read as CLEAN survived a green
+        /// suite. That is the fail-OPEN direction — a rule state this class has never heard of is the
+        /// one case where it genuinely cannot know, and calling it healthy is an alarm that stays off.
+        ///
+        /// This is the DISTINCTION `BridgeFleetView` already draws, and it draws it twice:
+        /// `RankOfSystemSeverity` returns `UnknownRank` for a name it does not recognise, while
+        /// `NotApplicableRank` is deliberately NOT `UnknownRank` because "does not apply" is a
+        /// different fact from "could not be read". A guard rule whose state is a string from the
+        /// future is unreadable, not inapplicable. [[an-inapplicable-state-is-not-unreadable]] is the
+        /// other half — do not confuse them, or you get the 95-of-97-accounts-painted-worst defect.
+        /// </summary>
+        private static void TestP2127_AnUnreadableRuleStateRanksWorstNotBest()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: an unreadable rule state ranks worst, not best");
+
+            Assert(BridgeInspectorTabs.RankOfRuleState("SomethingCoreAddedLater")
+                   == BridgeFleetView.UnknownRank,
+                string.Format("P2-127: a state this class does not recognise is UnknownRank ({0}), "
+                    + "not clean. A rule whose state is a string from the future is the one case it "
+                    + "cannot know, and reading it as healthy is the fail-OPEN direction (got {1})",
+                    BridgeFleetView.UnknownRank,
+                    BridgeInspectorTabs.RankOfRuleState("SomethingCoreAddedLater")));
+
+            Assert(BridgeInspectorTabs.RankOfRuleState(null) == BridgeFleetView.UnknownRank
+                   && BridgeInspectorTabs.RankOfRuleState("") == BridgeFleetView.UnknownRank,
+                "P2-127: and so are null and empty -- a row the producer sent without a state is a "
+                + "row nothing is known about, not a healthy one");
+
+            Assert(BridgeInspectorTabs.RankOfRuleState("SomethingCoreAddedLater")
+                   < BridgeInspectorTabs.RankOfRuleState("EvaluatedNotEnforcing"),
+                "P2-127: so an unreadable state is strictly WORSE than the healthiest real one, and "
+                + "sorts above it on a worst-first strip");
+
+            // It must reach the TAB, not just the ranker: a strip is only as honest as what it folds.
+            var tabs = BridgeInspectorTabs.Build(
+                new List<FleetCopierRow>(),
+                new List<InspectorRuleRow>
+                {
+                    new InspectorRuleRow { AccountName = "A", RuleName = "r1", State = "EvaluatedNotEnforcing" },
+                    new InspectorRuleRow { AccountName = "A", RuleName = "r2", State = "WhoKnows" },
+                },
+                null, 0);
+            var risk = tabs == null ? null : tabs.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RiskTab);
+            Assert(risk != null && risk.Rank == BridgeFleetView.UnknownRank,
+                string.Format("P2-127: and one unreadable row drags the whole tab to UnknownRank, "
+                    + "because the fold is worst-wins (got {0})", risk == null ? -99 : risk.Rank));
+            Assert(risk != null && !string.IsNullOrEmpty(risk.Badge),
+                "P2-127: and it still carries a badge -- the worst case is exactly when the strip "
+                + "must not go blank");
+        }
+
+        private static void TestP2127_TheAccountFilterIgnoresCaseLikeTheCoreDoes()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the account filter ignores case, as the core does");
+
+            var rules = new List<InspectorRuleRow>
+            {
+                new InspectorRuleRow { AccountName = "Sim101", RuleName = "r1", State = "Inert" },
+                new InspectorRuleRow { AccountName = "Sim101", RuleName = "r2", State = "Inert" },
+            };
+
+            var tabs = BridgeInspectorTabs.Build(new List<FleetCopierRow>(), rules, "SIM101", 0);
+            var risk = tabs == null ? null : tabs.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RiskTab);
+            Assert(risk != null, "P2-127: precondition -- the risk tab is present for a cased selection");
+            if (risk == null) return;
+
+            Assert(risk.Rank == BridgeInspectorTabs.RankOfRuleState("Inert"),
+                string.Format("P2-127: 'SIM101' selects 'Sim101''s rows, so the tab carries Inert "
+                    + "({0}) rather than an empty-set answer (got {1})",
+                    BridgeInspectorTabs.RankOfRuleState("Inert"), risk.Rank));
+            Assert(risk.Badge.IndexOf("2", StringComparison.Ordinal) >= 0,
+                "P2-127: and it counts both of that account's rows (got '" + risk.Badge + "')");
         }
 
         private static void TestP2138_TheLivePayloadMapsOntoTheTreesInput(

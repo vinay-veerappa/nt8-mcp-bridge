@@ -565,6 +565,42 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/copier/snapshot":
                     return GetCopierSnapshot();
 
+                // P2-127 slice 3. The inspector's three tabs, folded SERVER-SIDE and deliberately on
+                // its own route rather than bolted onto the snapshot above: the risk tab needs the
+                // guard inventory, which measured 549,271 bytes for 97 accounts x 23 rules on this
+                // box, and the page polls every 5 seconds. Folding here ships three objects instead.
+                //
+                // ⚠️ EVERY DECISION IS IN BridgeInspectorTabs, NOT HERE. This file is the ONE bridge
+                // source BridgeTests.csproj cannot compile, so anything decided in it can only be
+                // gated by a source scan. The glue below acquires and hands over; it must never
+                // choose a rank, a badge or an order. P2-127's own entry: "move the decisions into a
+                // class the harness compiles ... otherwise this grows a third untested surface, and
+                // it will be the one the operator actually uses."
+                case "/api/ui/inspector":
+                {
+                    string selected = query["account"];
+
+                    var guardJson = JObject.Parse(GuardSnapshotJson.ToJson(
+                        RiskGuardAddOn.Instance == null ? null : RiskGuardAddOn.Instance.BuildGuardSnapshot()));
+                    var ruleRows = BridgeInspectorTabs.RuleRowsFromInventory(guardJson["accounts"]);
+
+                    var snapshot = GetCopierSnapshot() as JObject;
+                    var copierRows = BridgeFleetView.RowsFromSnapshot(
+                        snapshot == null ? null : snapshot["rows"]);
+                    int conflicts = snapshot == null || snapshot["system"] == null
+                        ? 0
+                        : ((int?)snapshot["system"]["configConflicts"] ?? 0);
+
+                    var tabCamel = JsonSerializer.Create(GuardSnapshotJson.UiJsonSettings);
+                    return new JObject
+                    {
+                        ["takenUtc"] = DateTime.UtcNow.ToString("o"),
+                        ["selectedAccount"] = selected,
+                        ["tabs"] = JArray.FromObject(
+                            BridgeInspectorTabs.Build(copierRows, ruleRows, selected, conflicts), tabCamel)
+                    };
+                }
+
                 // P0-9 targets/OCO research: what does each connection actually support?
                 // Whether the copier can mirror a profit target under a REAL broker-side OCO, or
                 // must simulate the pairing itself, is a per-connection fact -- NT8 exposes
