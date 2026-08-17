@@ -1,0 +1,39 @@
+{
+  "tickets": [
+    {
+      "id": "T1",
+      "title": "P2-138: the fleet tree reaches the wire, from the rows the route already enriched",
+      "defect": "BridgeFleetView.Build has had no caller outside its own test file since it landed. 199 lines of view logic, 137 lines of acceptance tests and a 253-line mutation battery, all green in CI, and NOTHING SERVES IT: no endpoint returns the tree and the commit that added the class did not touch ui/index.html. P2-127 was scoped to 'build the class' and the wiring slice was never filed -- BridgeFleetView.cs says so itself in the doc comment on NotApplicableRank: 'TEMPORARY, AND THE NEXT SLICE OF P2-127 REPLACES IT.' The only surface on which this was detectable was the operator reporting that they still could not see the copier UI changes. Second finding, folded in because it is the same slice: FleetNode.Badge is DECLARED AND ASSIGNED NOWHERE -- one write site would make it real and there is none, so every node's badge is null. UI_REDESIGN_DESIGN.md section 4's rows read 'follower_1 1.0x MATCH', so a tree of bare names is not that pane.",
+      "spec": "Two changes in addons/BridgeFleetView.cs and one in addons/McpBridgeAddOn.cs.\n\n(1) IMPLEMENT RowsFromSnapshot. It takes the `rows` array of /api/copier/snapshot as a JToken and returns one FleetCopierRow per element. The field names are NOT to be guessed: tests/fixtures/copier_snapshot_live_20260817.json was captured from the deployed box and the acceptance test maps it, so read the names from that file. The row carries leaderAccountName, followerAccountName, groupName, instrumentFullName and severity from core, plus enforcing and notEnforcingLabel which THE BRIDGE adds after core serialises -- that is precisely why this takes the already-enriched array and must not re-read TradeCopierEngine to reconstruct them. A null or absent element must be skipped rather than producing a row of nulls: a node named 'null' in the fleet pane is worse than an absent one. Severity must cross unchanged -- 0 is WORST on this scale and nothing here re-derives it.\n\n(2) SET FleetNode.Badge IN Build. The badge is the label the row already carries (FleetCopierRow.NotEnforcingLabel), not a fourth vocabulary invented for this pane -- CopierEnforcementView already ranks those labels by what BINDS and a second wording would drift from it. A row that IS enforcing has no refusal label; give those the badge that says so, and keep it a NAME rather than a number because the page colours off the name. Group and unlinked nodes are not relationships and need no badge. Do NOT change the ordering, the ranks, or which nodes exist -- ten acceptance tests and mutation/mutate_p2127.py pin all three, and this ticket adds a field to nodes that already sort correctly.\n\n(3) WIRE IT IN GetCopierSnapshot. After the existing loop that adds `enforcing`, `notEnforcingLabel` and `notEnforcingReason` to each row -- after, because the tree must see the enrichment -- build the tree from THAT SAME `rows` variable via BridgeFleetView.RowsFromSnapshot(rows), pass the full account list, and assign the result to payload[\"fleet\"] using the same camel-case serializer the `system` block uses. Deriving the tree from the rows the detail view already returns is the whole point: a summary computed independently is this codebase's recurring defect, and the fleet counts must not be able to disagree with the rows beneath them. The account list is every account NT8 knows, not only those in a relationship -- the tree's 'Unlinked accounts' node exists for exactly that and an acceptance test says every account appears exactly once. Measured on the live box: 97 accounts, 2 relationships.\n\nDo not add a new endpoint. The page already polls /api/copier/snapshot every 5 seconds and a second poll for a tree derived from the first payload would be a second read of the same state.",
+      "regions": [
+        {
+          "id": "TheMapping",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static List<FleetCopierRow> RowsFromSnapshot(JToken rows)",
+          "kind": "decl",
+          "note": "Currently returns an empty list on purpose so the acceptance tests are red. It lives in this file and not inline in the route because addons/McpBridgeAddOn.cs is the ONE bridge source BridgeTests.csproj cannot compile -- a mistyped field name mapped there deserialises to null/0 and the tree renders a healthy-looking lie with every test still green."
+        },
+        {
+          "id": "TheTreeBuilder",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static List<FleetNode> Build(IList<FleetCopierRow> rows, IList<string> allAccounts)",
+          "kind": "decl",
+          "note": "Granted ONLY to set Badge on the follower nodes it already creates. Its ordering, ranks and node set are pinned by ten tests and a 253-line mutation battery; changing any of them is out of scope. If an anchor in mutation/mutate_p2127.py stops matching, that battery scores a SURVIVOR as a SKIP -- tools/check_anchors.py is what catches it and CI runs it."
+        },
+        {
+          "id": "TheRoute",
+          "file": "addons/McpBridgeAddOn.cs",
+          "anchor": "private object GetCopierSnapshot()",
+          "kind": "decl",
+          "note": "In no test build, so the acceptance gate over it is a SOURCE gate that reads comment-stripped text over a stated 2012-char region. That means a comment describing the wiring cannot satisfy it -- and it also means a green suite proves less here than elsewhere. The `rows` variable it must use is the JArray it has just finished enriching."
+        }
+      ],
+      "expect_green": [
+        "P2-138: every relationship becomes exactly one fleet row",
+        "P2-138: the route SERVES the tree",
+        "P2-138: and the tree reaches the wire on the payload the page already polls",
+        "P2-138: the tree is built from the rows the route already enriched"
+      ]
+    }
+  ]
+}

@@ -4627,6 +4627,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (engine == null)
             {
                 payload["system"] = JObject.FromObject(CopierEnforcementView.NotLoadedCell(), camel);
+                payload["fleet"] = new JArray();
                 return payload;
             }
 
@@ -4650,15 +4651,37 @@ namespace NinjaTrader.NinjaScript.AddOns
             var rows = payload["rows"] as JArray;
             foreach (var row in rows ?? new JArray())
             {
-                bool isEnabled = (bool?)row["isEnabled"] ?? false;
-                bool armedForLive = (bool?)row["armedForLive"] ?? false;
+                if (!(row is JObject rowObj))
+                    continue;
+
+                bool isEnabled = (bool?)rowObj["isEnabled"] ?? false;
+                bool armedForLive = (bool?)rowObj["armedForLive"] ?? false;
                 var refusal = CopierEnforcementView.WhyNotEnforcing(
                     isEnabled, armedForLive, acting, copierMode);
 
-                row["enforcing"] = CopierEnforcementView.IsEnforcing(isEnabled, armedForLive, acting);
-                row["notEnforcingLabel"] = refusal == null ? null : refusal.Label;
-                row["notEnforcingReason"] = refusal == null ? null : refusal.Sentence;
+                rowObj["enforcing"] = CopierEnforcementView.IsEnforcing(isEnabled, armedForLive, acting);
+                rowObj["notEnforcingLabel"] = refusal == null ? null : refusal.Label;
+                rowObj["notEnforcingReason"] = refusal == null ? null : refusal.Sentence;
             }
+
+            // Build the fleet tree from the same enriched rows the detail view serves so the
+            // summary cannot disagree with the rows beneath it.
+            List<string> allAccounts = new List<string>();
+            if (NinjaTrader.Cbi.Account.All != null)
+            {
+                // .ToList() for the same reason GetConnectionFeatures does it: NT8 mutates
+                // Account.All on its own thread and this runs on an HTTP one, so enumerating
+                // it live can throw mid-payload. Copy, then read.
+                foreach (NinjaTrader.Cbi.Account account in NinjaTrader.Cbi.Account.All.ToList())
+                {
+                    if (account != null && !string.IsNullOrEmpty(account.Name))
+                        allAccounts.Add(account.Name);
+                }
+            }
+
+            payload["fleet"] = JArray.FromObject(
+                BridgeFleetView.Build(BridgeFleetView.RowsFromSnapshot(rows), allAccounts),
+                camel);
 
             return payload;
         }

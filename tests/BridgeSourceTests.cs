@@ -1392,13 +1392,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1131_AnUnknownStateNameFailsSAFE();
             TestP1131_NoBridgePathKeepsItsOwnStateList();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
+            TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
             TestP2138_ThePageRendersTheFleetTree();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 84;
+            const int declared = 85;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3642,6 +3643,89 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(follower != null && follower.Badge == "disabled",
                 "P2-138: and the badge is the label the row already carried, not a fourth "
                 + "vocabulary invented for the page");
+        }
+
+        /// <summary>
+        /// The badge merge, for a follower holding MORE THAN ONE relationship -- one per
+        /// instrument, the case FleetCopierRow.InstrumentFullName exists to make representable.
+        /// Both live rows on the box are instrument-less, so production exercises none of this
+        /// and only a test can.
+        ///
+        /// The rule: a refusal already seen is never displaced by an enforcing row. "This
+        /// follower is refusing on one of its instruments" is the fact the operator needs, and
+        /// showing the reassuring badge beside the worse rank is precisely the defect the RANK
+        /// merge beside it exists to prevent.
+        /// </summary>
+        private static void TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-138: a follower holding two relationships shows the refusing one");
+
+            Func<string, bool, string, int, FleetCopierRow> row =
+                (instrument, enforcing, label, severity) => new FleetCopierRow
+                {
+                    LeaderAccountName = "Sim101",
+                    FollowerAccountName = "Sim-ORB",
+                    GroupName = "G",
+                    InstrumentFullName = instrument,
+                    Severity = severity,
+                    Enforcing = enforcing,
+                    NotEnforcingLabel = label
+                };
+
+            Func<List<FleetCopierRow>, FleetNode> followerIn = rs =>
+            {
+                foreach (var g in BridgeFleetView.Build(rs, new List<string> { "Sim101", "Sim-ORB" }))
+                    foreach (var c in g.Children)
+                        if (c.Name == "Sim-ORB") return c;
+                return null;
+            };
+
+            // Enforcing first, then a refusal at the SAME rank. Arrival order must not decide.
+            var enforcingThenRefusal = followerIn(new List<FleetCopierRow> {
+                row("NQ 12-26", true,  null,       4),
+                row("ES 12-26", false, "disabled", 4) });
+            Assert(enforcingThenRefusal != null && enforcingThenRefusal.Badge == "disabled", string.Format(
+                "P2-138: at an equal rank the refusal is shown, not the enforcing row that "
+                + "happened to arrive first (badge={0})",
+                enforcingThenRefusal == null ? "<no node>" : (enforcingThenRefusal.Badge ?? "<null>")));
+
+            // The same two rows the other way round must give the SAME answer, or the page
+            // renders differently on two polls of identical data.
+            var refusalThenEnforcing = followerIn(new List<FleetCopierRow> {
+                row("ES 12-26", false, "disabled", 4),
+                row("NQ 12-26", true,  null,       4) });
+            Assert(refusalThenEnforcing != null && refusalThenEnforcing.Badge == "disabled",
+                "P2-138: and the answer does not depend on the order the rows arrive in");
+
+            // An enforcing row at a WORSE rank still must not erase a refusal already seen.
+            var refusalThenWorseEnforcing = followerIn(new List<FleetCopierRow> {
+                row("ES 12-26", false, "quarantined", 4),
+                row("NQ 12-26", true,  null,          1) });
+            Assert(refusalThenWorseEnforcing != null
+                   && refusalThenWorseEnforcing.Badge == "quarantined"
+                   && refusalThenWorseEnforcing.Rank == 1, string.Format(
+                "P2-138: a worse-ranked ENFORCING row takes the rank but never erases a refusal "
+                + "already seen (badge={0}, rank={1})",
+                refusalThenWorseEnforcing == null ? "<no node>" : (refusalThenWorseEnforcing.Badge ?? "<null>"),
+                refusalThenWorseEnforcing == null ? -1 : refusalThenWorseEnforcing.Rank));
+
+            // Two refusals: the worse-ranked one is the one to show.
+            var twoRefusals = followerIn(new List<FleetCopierRow> {
+                row("ES 12-26", false, "disabled",    4),
+                row("NQ 12-26", false, "quarantined", 1) });
+            Assert(twoRefusals != null && twoRefusals.Badge == "quarantined", string.Format(
+                "P2-138: between two refusals the WORSE-ranked one is displayed (badge={0})",
+                twoRefusals == null ? "<no node>" : (twoRefusals.Badge ?? "<null>")));
+
+            // Negative control: an all-enforcing follower still gets a badge, or the pane shows
+            // a bare name and the operator cannot tell it from a node with no state at all.
+            var bothEnforcing = followerIn(new List<FleetCopierRow> {
+                row("ES 12-26", true, null, 4),
+                row("NQ 12-26", true, null, 4) });
+            Assert(bothEnforcing != null && bothEnforcing.Badge == BridgeFleetView.EnforcingBadge,
+                "P2-138: and a follower enforcing on every relationship says so, rather than "
+                + "rendering as a bare name");
         }
 
         /// <summary>

@@ -114,6 +114,27 @@ namespace NinjaTrader.NinjaScript.AddOns
         public const int NotApplicableRank = 6;
 
         /// <summary>
+        /// P2-138. The badge section 4's rows show: `follower_1 1.0x ✔MATCH`.
+        ///
+        /// A refusing row's badge is the label it ALREADY CARRIES. CopierEnforcementView folds
+        /// that label out of the same relationships this tree is built from and ranks the reasons
+        /// by what BINDS, so reusing it keeps one vocabulary; inventing a second wording here
+        /// would drift from the sentence the row's own tooltip shows.
+        ///
+        /// Only the enforcing case needs a word of its own, because an enforcing row has no
+        /// refusal to name. It is a NAME and not a number: the page colours off it, and a numeric
+        /// severity crossing the wire is what this file's header warns about at length.
+        /// </summary>
+        public const string EnforcingBadge = "MATCH";
+
+        /// <summary>The badge for one relationship row. See <see cref="EnforcingBadge"/>.</summary>
+        public static string BadgeForRow(FleetCopierRow row)
+        {
+            if (row == null) return null;
+            return row.Enforcing ? EnforcingBadge : row.NotEnforcingLabel;
+        }
+
+        /// <summary>
         /// A copier row's severity, converted to the unified rank. `CopierSnapshotJson`
         /// already uses 0-is-worst, so this is near-identity -- it exists so the conversion
         /// is NAMED and so an out-of-range value is clamped rather than sorted.
@@ -246,16 +267,48 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // keeps its worst child: the reassuring one must not be the one displayed.
                 List<FleetNode> children = new List<FleetNode>();
                 Dictionary<string, FleetNode> byFollower = new Dictionary<string, FleetNode>();
+                // P2-138. Whether the badge currently displayed came from a REFUSING row, tracked
+                // as the fact rather than re-read from the badge string. The first draft asked
+                // `existing.Badge != "MATCH"`, which decides "is this a refusal?" by comparing a
+                // DISPLAY string to a literal -- so the day an enforcing row gains a second badge
+                // wording, or a refusal label happens to read "MATCH", the merge silently inverts.
+                // The row already carries the answer. [[a-second-reader-of-the-same-state]].
+                Dictionary<string, bool> followerIsRefusing = new Dictionary<string, bool>();
                 List<int> childRanks = new List<int>();
                 foreach (FleetCopierRow row in kvp.Value)
                 {
                     int rank = RankOfCopierRow(row.Severity);
                     childRanks.Add(rank);
 
+                    string key = row.FollowerAccountName ?? "";
+                    string newBadge = BadgeForRow(row);
+                    bool newIsRefusal = !row.Enforcing;
+
                     FleetNode existing;
-                    if (byFollower.TryGetValue(row.FollowerAccountName ?? "", out existing))
+                    if (byFollower.TryGetValue(key, out existing))
                     {
+                        bool existingIsRefusal;
+                        followerIsRefusing.TryGetValue(key, out existingIsRefusal);
+
+                        // The worse rank wins the badge, EXCEPT that a refusal already seen is
+                        // never displaced by an enforcing row: "this follower is refusing on one
+                        // of its instruments" is the fact the operator needs, and a reassuring
+                        // badge beside a worse rank is the reassuring-one-displayed defect the
+                        // rank merge two lines up exists to prevent.
+                        bool take = rank < existing.Rank
+                            ? (newIsRefusal || !existingIsRefusal)
+                            // At an equal rank the order rows arrive in must not decide what is
+                            // shown, or the same data renders differently on two polls.
+                            : rank == existing.Rank
+                                && ((newIsRefusal && !existingIsRefusal)
+                                    || string.IsNullOrEmpty(existing.Badge));
+
                         if (rank < existing.Rank) existing.Rank = rank;
+                        if (take)
+                        {
+                            existing.Badge = newBadge;
+                            followerIsRefusing[key] = newIsRefusal;
+                        }
                         continue;
                     }
 
@@ -265,9 +318,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         Name = row.FollowerAccountName,
                         Role = "follower",
                         Rank = rank,
+                        Badge = newBadge,
                         Children = new List<FleetNode>()
                     };
-                    byFollower[row.FollowerAccountName ?? ""] = child;
+                    byFollower[key] = child;
+                    followerIsRefusing[key] = newIsRefusal;
                     children.Add(child);
                 }
 
@@ -349,8 +404,45 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// </summary>
         public static List<FleetCopierRow> RowsFromSnapshot(JToken rows)
         {
-            // Deliberately unimplemented: the acceptance tests are red first.
-            return new List<FleetCopierRow>();
+            List<FleetCopierRow> result = new List<FleetCopierRow>();
+            if (rows == null)
+                return result;
+
+            foreach (JToken element in rows)
+            {
+                if (element == null || element.Type == JTokenType.Null)
+                    continue;
+
+                JObject row = element as JObject;
+                if (row == null)
+                    continue;
+
+                string leader = row["leaderAccountName"]?.ToString();
+                string follower = row["followerAccountName"]?.ToString();
+                if (string.IsNullOrWhiteSpace(leader) || string.IsNullOrWhiteSpace(follower))
+                    continue;
+
+                JToken severityToken = row["severity"];
+                if (severityToken == null || severityToken.Type == JTokenType.Null)
+                    continue;
+
+                JToken enforcingToken = row["enforcing"];
+                if (enforcingToken == null || enforcingToken.Type == JTokenType.Null)
+                    continue;
+
+                result.Add(new FleetCopierRow
+                {
+                    LeaderAccountName = leader,
+                    FollowerAccountName = follower,
+                    GroupName = row["groupName"]?.ToString(),
+                    InstrumentFullName = row["instrumentFullName"]?.ToString(),
+                    Severity = severityToken.Value<int>(),
+                    Enforcing = enforcingToken.Value<bool>(),
+                    NotEnforcingLabel = row["notEnforcingLabel"]?.ToString()
+                });
+            }
+
+            return result;
         }
     }
 }
