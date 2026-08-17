@@ -1,0 +1,49 @@
+{
+  "_comment": "P2-127 slice 3 of section 4: the inspector's three tabs. THE DECISIONS GO IN THIS CLASS, NOT IN ui/index.html -- that file is in no test build and no mutation battery, and P2-127's own entry says to move the decisions into a class the harness compiles or 'this grows a third untested surface, and it will be the one the operator actually uses'. The page wiring (the route and the HTML) is done by hand in the same commit, because P2-138 was exactly the defect of building a decision class and never wiring it: 199 lines, 137 test lines, a 253-line battery, CI-green, and no caller. Do NOT touch BridgeFleetView.cs -- it is slice 1, pinned by 16 mutants.",
+  "tickets": [
+    {
+      "id": "T1",
+      "title": "The inspector's three tabs, each carrying its own worst state into the always-visible strip",
+      "defect": "Section 4 of docs/UI_REDESIGN_DESIGN.md specifies an inspector with three tabs -- [copier] [risk] [rare] -- and they do not exist. Everything the inspector shows is stacked on one scroll inside the right pane. That is only half a defect on its own; the dangerous half is what building tabs naively does. This page's whole value is that Inert, ConfiguredNotEvaluated and a non-acting copier are visible WITHOUT BEING LOOKED FOR, which is why section 4.2 killed top-level nav tabs and recorded the decision 'so nobody re-adds them'. Anything that puts a section behind a click must therefore carry that section's worst state into the always-visible strip. MEASURED on the deployed box 2026-08-17: GET /api/riskguard/inventory returns 97 accounts x 23 rules = 2231 rule rows, `unevaluatedRules` is EMPTY, and the state histogram is EvaluatedNotEnforcing 1129 / Inert 559 / Disabled 543. So on a box with accounts loaded, Inert is the worst state that exists, and a strip watching only unevaluatedRules renders three clean tabs over exactly the condition the page exists to make unmissable. BridgeInspectorTabs currently exists as a STUB returning empty lists, so all four acceptance tests are red on their own assertions.",
+      "spec": "Implement RankOfRuleState, Build and RuleRowsFromInventory in addons/BridgeInspectorTabs.cs. RankOfRuleState ranks a guard rule's state on the SAME scale BridgeFleetView already uses -- LOWER IS WORSE -- so one comparator serves the tree and the strip; two scales in one page is two things to keep in step, and BridgeFleetView.cs's own header warns that the copier and system severities already disagree. Inert must rank WORSE than EvaluatedNotEnforcing: a rule that cannot fire is a worse answer to 'is the guard protecting me' than one that is evaluating and has not tripped. An UNRECOGNISED state must rank WORST, never best -- BridgeFleetView.RankOfSystemSeverity does exactly this and the reason is in its comment. Build returns exactly THREE tabs, always, in section 4's order (copier, risk, rare), even when every input list is empty: an absent tab and an empty one read identically to whatever renders them, which is the sixteenth mutant of slice 1's battery. Every tab must carry a non-empty Badge AND a non-empty Reason even when nothing is wrong, because a blank badge over a state nobody has looked at is the hiding hazard. Each tab's Rank is the WORST of the rows it would show, folded with BridgeFleetView.WorstOf so the empty-set answer stays the one that method already decided. The risk tab's badge must NAME the worst state and COUNT the rows in it, recomputed from ruleRows -- never a number a producer supplied. When selectedAccount is non-null the risk tab counts only that account's rows; when it is null it counts the whole fleet. The copier tab folds copierRows through the existing BridgeFleetView.RankOfCopierRow; the rare tab folds configConflicts. RuleRowsFromInventory maps the live payload: accounts[] each with accountName and rules[], each rule with name and state. Be tolerant of a missing field the way BridgeFleetView.RowsFromSnapshot is, and skip nothing silently that would change a count.",
+      "regions": [
+        {
+          "id": "TheTabsClass",
+          "file": "addons/BridgeInspectorTabs.cs",
+          "anchor": "public static class BridgeInspectorTabs",
+          "kind": "decl",
+          "note": "The three stubbed methods. ⚠️ The stubs return benign empties rather than throwing ON PURPOSE, so the acceptance tests fail on their own assertions and the suite still prints a RESULTS line -- do not reintroduce a throw. The class comment records the measurement that decides what the risk tab folds; do not reword it."
+        },
+        {
+          "id": "TheTabDtos",
+          "file": "addons/BridgeInspectorTabs.cs",
+          "anchor": "public class InspectorTab",
+          "kind": "decl",
+          "note": "Fields only, and the tests name every one of them. Add a field if the implementation needs one, but Id/Label/Rank/Badge/Reason must keep their names and meanings."
+        },
+        {
+          "id": "TheFleetViewsScale",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static int RankOfCopierRow(int copierSeverity)",
+          "kind": "decl",
+          "readonly": true,
+          "note": "READ ONLY, and it holds all three things the new code must CALL rather than re-derive: RankOfCopierRow, RankOfSystemSeverity and WorstOf, in that order. Take the rank scale (LOWER IS WORSE) and the unrecognised-value convention from them. ⚠️ BridgeFleetView.cs is slice 1 and is pinned by 16 mutants -- do not edit it."
+        },
+        {
+          "id": "TheWorstOfFold",
+          "file": "addons/BridgeFleetView.cs",
+          "anchor": "public static int WorstOf(IEnumerable<int> ranks)",
+          "kind": "decl",
+          "readonly": true,
+          "note": "READ ONLY. This is the fold to use for every tab's rank, including the EMPTY case -- what an empty set means was already decided here and must not be decided a second time. ⚠️ Do not edit this file."
+        }
+      ],
+      "expect_green": [
+        "P2-127: three tabs even with nothing loaded",
+        "P2-127: precondition -- a risk tab exists to fold Inert into",
+        "P2-127: precondition -- the risk tab is present",
+        "P2-127: every rule of every account becomes one row"
+      ]
+    }
+  ]
+}
