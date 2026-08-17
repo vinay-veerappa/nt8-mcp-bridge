@@ -1391,6 +1391,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1131_TheThreeTerminalStatesAndOnlyThose();
             TestP1131_AnUnknownStateNameFailsSAFE();
             TestP1131_NoBridgePathKeepsItsOwnStateList();
+            // P2-127 slice 3: the inspector's three tabs, the only tabs in the app.
+            TestP2127_AllThreeTabsAlwaysExistInSectionFoursOrder();
+            TestP2127_TheRiskTabFoldsInertNotJustUnevaluated();
+            TestP2127_TheBadgeIsRecountedFromTheRowsAndFollowsTheSelection();
+            TestP2127_TheLiveInventoryMapsOntoTheTabsInput();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
@@ -1399,7 +1404,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 85;
+            const int declared = 89;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3588,6 +3593,175 @@ namespace NinjaTrader.NinjaScript.AddOns
         /// The mapping half, EXECUTED against a payload captured from the deployed box on
         /// 2026-08-17 rather than one written from memory. Two relationships, 97 accounts.
         /// </summary>
+        /// <summary>
+        /// P2-127 slice 3. All THREE tabs, always, in §4's order -- even when a tab has nothing to
+        /// show.
+        ///
+        /// ⚠️ THIS IS SLICE 1'S SIXTEENTH MUTANT, ONE LEVEL UP. That battery went 15/15 and the
+        /// sixteenth mutant is the lesson: dropping the `Unlinked` node when it was EMPTY survived
+        /// the whole suite, because "an absent node and an empty one read identically to whatever
+        /// renders them". A tab strip that omits the risk tab on a box with no rules loaded is the
+        /// same defect, and the operator reads three tabs as "I have seen everything".
+        /// </summary>
+        private static void TestP2127_AllThreeTabsAlwaysExistInSectionFoursOrder()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: all three inspector tabs exist, in section 4's order");
+
+            var tabs = BridgeInspectorTabs.Build(
+                new List<FleetCopierRow>(), new List<InspectorRuleRow>(), null, 0);
+
+            Assert(tabs != null && tabs.Count == 3, string.Format(
+                "P2-127: three tabs even with nothing loaded (got {0}). Section 4 names exactly "
+                + "[copier] [risk] [rare]; a strip that hides an empty one reads as 'nothing to see' "
+                + "on precisely the box where nothing has been evaluated.",
+                tabs == null ? -1 : tabs.Count));
+            if (tabs == null || tabs.Count != 3) return;
+
+            Assert(tabs[0].Id == BridgeInspectorTabs.CopierTab
+                   && tabs[1].Id == BridgeInspectorTabs.RiskTab
+                   && tabs[2].Id == BridgeInspectorTabs.RareTab,
+                string.Format("P2-127: in section 4's order -- copier, risk, rare (got {0}, {1}, {2})",
+                    tabs[0].Id, tabs[1].Id, tabs[2].Id));
+
+            foreach (var t in tabs)
+                Assert(!string.IsNullOrEmpty(t.Badge) && !string.IsNullOrEmpty(t.Reason),
+                    "P2-127: every tab carries a badge AND a reason, even an empty one ('" + t.Id
+                    + "' badge='" + t.Badge + "' reason='" + t.Reason + "'). A blank badge over a "
+                    + "state nobody has looked at is the hiding hazard §4.2 killed tabs for.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 3. The risk tab must fold `Inert`.
+        ///
+        /// ⚠️ MEASURED ON THE DEPLOYED BOX, 2026-08-17, and this is the whole reason the test exists:
+        /// `/api/riskguard/inventory` reports `unevaluatedRules` EMPTY while **559 of 2231 rule rows
+        /// are `Inert`**. A strip that folds only `ConfiguredNotEvaluated` -- the state the page was
+        /// built to make unmissable -- renders a clean risk tab over the condition that actually
+        /// exists. The badge has to come from the rule ROWS.
+        /// </summary>
+        private static void TestP2127_TheRiskTabFoldsInertNotJustUnevaluated()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the risk tab folds Inert, which is what the live box has");
+
+            var rules = new List<InspectorRuleRow>
+            {
+                new InspectorRuleRow { AccountName = "A", RuleName = "Daily loss limit", State = "EvaluatedNotEnforcing" },
+                new InspectorRuleRow { AccountName = "A", RuleName = "Trailing drawdown", State = "Inert" },
+                new InspectorRuleRow { AccountName = "A", RuleName = "Peak equity giveback", State = "Inert" },
+                new InspectorRuleRow { AccountName = "A", RuleName = "Max size", State = "Disabled" },
+            };
+
+            var tabs = BridgeInspectorTabs.Build(new List<FleetCopierRow>(), rules, null, 0);
+            var risk = tabs == null ? null : tabs.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RiskTab);
+            Assert(risk != null, "P2-127: precondition -- a risk tab exists to fold Inert into");
+            if (risk == null) return;
+
+            Assert(risk.Rank == BridgeInspectorTabs.RankOfRuleState("Inert"),
+                string.Format("P2-127: the tab's rank is the WORST of its rows, and Inert is the "
+                    + "worst here (tab rank {0}, Inert ranks {1})",
+                    risk.Rank, BridgeInspectorTabs.RankOfRuleState("Inert")));
+
+            Assert(risk.Badge.IndexOf("2", StringComparison.Ordinal) >= 0
+                   && risk.Badge.IndexOf("INERT", StringComparison.OrdinalIgnoreCase) >= 0,
+                "P2-127: and the badge NAMES the state and COUNTS the rows in it -- 2 inert -- "
+                + "recomputed from the rows, never from a counter the producer supplied (F-9, "
+                + "P2-103). Got '" + risk.Badge + "'");
+
+            Assert(BridgeInspectorTabs.RankOfRuleState("Inert")
+                   < BridgeInspectorTabs.RankOfRuleState("EvaluatedNotEnforcing"),
+                "P2-127: Inert is WORSE than EvaluatedNotEnforcing -- a rule that cannot fire is a "
+                + "worse answer to 'is the guard protecting me' than one that is evaluating and has "
+                + "not tripped. Lower rank is worse, matching the fleet tree's scale.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 3. A count folded from the detail rows, not taken from a counter -- and the
+        /// SELECTION narrows it.
+        ///
+        /// `F-9`'s class in the optimistic direction is the one that has cost real sessions here:
+        /// `P2-116` was measured on the hour the broker was reconnected, with 89 prop accounts
+        /// subscribed, 1 reporting equity and all 89 reading `EvaluatedNotEnforcing`. A tab whose
+        /// badge is a producer's number cannot disagree with the producer, which is the point of
+        /// recomputing.
+        /// </summary>
+        private static void TestP2127_TheBadgeIsRecountedFromTheRowsAndFollowsTheSelection()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the badge is recounted from the rows, and follows the selection");
+
+            var rules = new List<InspectorRuleRow>
+            {
+                new InspectorRuleRow { AccountName = "A", RuleName = "r1", State = "Inert" },
+                new InspectorRuleRow { AccountName = "A", RuleName = "r2", State = "Inert" },
+                new InspectorRuleRow { AccountName = "B", RuleName = "r1", State = "Inert" },
+                new InspectorRuleRow { AccountName = "B", RuleName = "r2", State = "EvaluatedNotEnforcing" },
+            };
+
+            var all = BridgeInspectorTabs.Build(new List<FleetCopierRow>(), rules, null, 0);
+            var allRisk = all == null ? null : all.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RiskTab);
+            // ⚠️ FirstOrDefault + an early return, NOT First(). First() on an empty result throws
+            // InvalidOperationException, which takes the whole runner down and prints no RESULTS
+            // line -- and a suite with no result line is not a red test, it is an unusable baseline.
+            Assert(allRisk != null, "P2-127: precondition -- the risk tab is present");
+            if (allRisk == null) return;
+
+            Assert(allRisk.Badge.IndexOf("3", StringComparison.Ordinal) >= 0,
+                "P2-127: with nothing selected the badge counts the whole fleet -- 3 inert rows "
+                + "across two accounts (got '" + allRisk.Badge + "')");
+
+            var oneAccount = BridgeInspectorTabs.Build(new List<FleetCopierRow>(), rules, "B", 0);
+            var bRisk = oneAccount == null ? null : oneAccount.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RiskTab);
+            Assert(bRisk != null, "P2-127: precondition -- the risk tab is present when an account is selected");
+            if (bRisk == null) return;
+
+            Assert(bRisk.Badge.IndexOf("1", StringComparison.Ordinal) >= 0
+                   && bRisk.Badge.IndexOf("3", StringComparison.Ordinal) < 0,
+                "P2-127: selecting account B narrows it to B's own rows -- 1 inert, not 3. The "
+                + "inspector follows the selection; a strip that keeps showing fleet-wide totals "
+                + "beside one account's config is answering a question nobody asked (got '"
+                + bRisk.Badge + "')");
+        }
+
+        /// <summary>
+        /// P2-127 slice 3. The live inventory payload maps onto Build's input.
+        ///
+        /// The same reason `TestP2138_TheLivePayloadMapsOntoTheTreesInput` exists: a field rename in
+        /// core has to land HERE, in a failing test, rather than as a blank badge on the page. Field
+        /// names are the ones measured off `GET /api/riskguard/inventory` on 2026-08-17.
+        /// </summary>
+        private static void TestP2127_TheLiveInventoryMapsOntoTheTabsInput()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the live guard inventory maps onto the tab strip's input");
+
+            // Shape measured on the deployed box: accounts[] each with accountName and rules[],
+            // and every rule carrying name / state among its nine fields.
+            var accounts = JArray.Parse(@"[
+              { ""accountName"": ""APEX10121500000148"", ""rules"": [
+                  { ""name"": ""Daily loss limit"", ""state"": ""EvaluatedNotEnforcing"" },
+                  { ""name"": ""Trailing drawdown"", ""state"": ""Inert"" } ] },
+              { ""accountName"": ""Sim101"", ""rules"": [
+                  { ""name"": ""Max size"", ""state"": ""Disabled"" } ] }
+            ]");
+
+            var rows = BridgeInspectorTabs.RuleRowsFromInventory(accounts);
+            Assert(rows != null && rows.Count == 3, string.Format(
+                "P2-127: every rule of every account becomes one row ({0} of 3)",
+                rows == null ? -1 : rows.Count));
+            if (rows == null || rows.Count != 3) return;
+
+            Assert(rows[0].AccountName == "APEX10121500000148" && rows[0].State == "EvaluatedNotEnforcing"
+                   && rows[0].RuleName == "Daily loss limit",
+                "P2-127: the mapping reads the field names the deployed box actually sends -- "
+                + "accountName, rules[].name, rules[].state");
+
+            Assert(rows.Count(r => r.AccountName == "Sim101") == 1,
+                "P2-127: and each row carries the account it belongs to, which is what makes the "
+                + "selection filter possible at all");
+        }
+
         private static void TestP2138_TheLivePayloadMapsOntoTheTreesInput(
             [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
         {
