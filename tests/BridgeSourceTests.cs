@@ -17,6 +17,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+// P2-138 parses a payload CAPTURED from the deployed box, so the field names the tree
+// reads are executed rather than typed a second time.
+using Newtonsoft.Json.Linq;
 
 namespace NinjaTrader.NinjaScript.AddOns
 {
@@ -1388,11 +1391,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1131_TheThreeTerminalStatesAndOnlyThose();
             TestP1131_AnUnknownStateNameFailsSAFE();
             TestP1131_NoBridgePathKeepsItsOwnStateList();
+            TestP2138_TheLivePayloadMapsOntoTheTreesInput();
+            TestP2138_TheRouteServesTheTreeItBuilds();
+            TestP2138_ThePageRendersTheFleetTree();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 81;
+            const int declared = 84;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3562,6 +3568,138 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "P1-131: both workingOrders counts consult the shared predicate");
             Assert(Regex.Matches(code, @"BridgeOrderLiveness\.IsTerminal\b").Count == 1,
                 "P1-131: the orders filter consults it too");
+        }
+
+        // ================================================================================
+        // P2-138. BridgeFleetView.Build had NO CALLER outside this file. 199 lines of view
+        // logic, 137 lines of tests, a 253-line mutation battery, all green in CI -- and no
+        // endpoint served it and ui/index.html was never touched by the commit that added it.
+        // P2-127 was scoped to "build the class"; the wiring slice was never filed, and the
+        // file's own comment says so at NotApplicableRank: "TEMPORARY, AND THE NEXT SLICE OF
+        // P2-127 REPLACES IT."
+        //
+        // This is dead-safety-machinery in the bridge repo: written, tested, deployed, and
+        // wired to nothing. The operator's report -- "I still don't see the UI changes for
+        // the copier" -- is the only surface on which it was detectable.
+        // ================================================================================
+
+        /// <summary>
+        /// The mapping half, EXECUTED against a payload captured from the deployed box on
+        /// 2026-08-17 rather than one written from memory. Two relationships, 97 accounts.
+        /// </summary>
+        private static void TestP2138_TheLivePayloadMapsOntoTheTreesInput(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-138: the live copier payload maps onto the fleet tree's input");
+
+            string fixture = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "fixtures", "copier_snapshot_live_20260817.json"));
+            Assert(File.Exists(fixture), "the captured live payload is readable at " + fixture);
+            if (!File.Exists(fixture)) return;
+
+            var payload = JObject.Parse(File.ReadAllText(fixture));
+            var rows = payload["rows"] as JArray;
+            Assert(rows != null && rows.Count == 2,
+                string.Format("the fixture holds the two relationships the box reported ({0})",
+                    rows == null ? -1 : rows.Count));
+
+            var mapped = BridgeFleetView.RowsFromSnapshot(rows);
+            Assert(mapped != null && mapped.Count == 2, string.Format(
+                "P2-138: every relationship becomes exactly one fleet row ({0} of {1})",
+                mapped == null ? -1 : mapped.Count, rows == null ? -1 : rows.Count));
+            if (mapped == null || mapped.Count != 2) return;
+
+            // The names the deployed box actually sends. A rename in core lands HERE and not
+            // as a blank column on the page.
+            Assert(mapped[0].LeaderAccountName == "Sim101" && mapped[0].FollowerAccountName == "Sim-ORB",
+                "P2-138: the mapping reads the field names the deployed box actually sends");
+
+            // 0 is WORST on the way in and must stay 0-is-worst: this is the scale the file
+            // header warns disagrees with the `system` block's.
+            Assert(mapped[0].Severity == 5,
+                "P2-138: a row's severity crosses the mapping unchanged, 0 still worst");
+
+            // The two fields the BRIDGE adds after core serialises -- the reason this takes the
+            // enriched array and not a re-read of the engine.
+            Assert(mapped[0].Enforcing == false && mapped[0].NotEnforcingLabel == "disabled",
+                "P2-138: the bridge's own enrichment survives the mapping, so the tree can say "
+                + "WHY a row is not enforcing without a second derivation");
+        }
+
+        /// <summary>
+        /// The route half. A source gate, because McpBridgeAddOn.cs is the one bridge source
+        /// BridgeTests.csproj cannot compile -- stated, with the region and its size printed,
+        /// so this cannot pass by inspecting nothing.
+        /// </summary>
+        private static void TestP2138_TheRouteServesTheTreeItBuilds()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-138: the copier route serves the fleet tree (SOURCE gate)");
+
+            // Comments stripped, or a sentence ABOUT the wiring would satisfy a gate that
+            // exists to prove the wiring. Region located by index and its size printed, for
+            // the reason P1-131 records: a pattern that silently stops matching is the exact
+            // failure this class of gate exists to avoid.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+            int s = code.IndexOf("private object GetCopierSnapshot()");
+            int e = s < 0 ? -1 : code.IndexOf("\n        private ", s + 10);
+            string method = (s >= 0 && e > s) ? code.Substring(s, e - s) : "";
+            Assert(method.Length > 200, string.Format(
+                "P2-138: the copier snapshot route is locatable for inspection ({0} chars read)",
+                method.Length));
+
+            Assert(method.Contains("BridgeFleetView.Build("), string.Format(
+                "P2-138: the route SERVES the tree -- Build had no caller outside its test file "
+                + "({0} chars inspected)", method.Length));
+            Assert(Regex.IsMatch(method, @"payload\[""fleet""\]"), string.Format(
+                "P2-138: and the tree reaches the wire on the payload the page already polls "
+                + "({0} chars inspected)", method.Length));
+
+            // Derivation, not a second copy: the tree is built from the SAME rows the detail
+            // view returns, after the bridge enriched them. `measure-the-deployed-system`.
+            Assert(method.Contains("BridgeFleetView.RowsFromSnapshot(rows)"), string.Format(
+                "P2-138: the tree is built from the rows the route already enriched, so the "
+                + "summary and the detail cannot disagree ({0} chars inspected)", method.Length));
+
+            // Negative control: the route must not re-derive a rank it was given.
+            Assert(!Regex.IsMatch(method, @"Rank\s*=\s*\d"), string.Format(
+                "P2-138: and the route never assigns a rank itself -- BridgeFleetView owns the "
+                + "ONE ordering ({0} chars inspected)", method.Length));
+        }
+
+        /// <summary>
+        /// The page half. Same weak gate as P1-125's and for the same reason -- ui/index.html
+        /// is in no test build -- but THE DEFECT WAS EXACTLY THIS: the tree existed and the
+        /// page read none of it. Measured before the fix: `data.fleet` appears 0 times.
+        /// </summary>
+        private static void TestP2138_ThePageRendersTheFleetTree(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-138: the page renders the fleet tree it is now sent (SOURCE gate)");
+
+            string page = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "..", "ui", "index.html"));
+            Assert(File.Exists(page), "the served page is readable at " + page);
+            if (!File.Exists(page)) return;
+
+            string html = File.ReadAllText(page);
+
+            Assert(Regex.IsMatch(html, @"data\.fleet"), string.Format(
+                "P2-138: the page reads the fleet tree the route now sends ({0} chars read)",
+                html.Length));
+            Assert(Regex.IsMatch(html, @"\.children") && Regex.IsMatch(html, @"\.kind"),
+                "P2-138: and it renders the tree as a TREE -- groups with their followers "
+                + "nested, which is UI_REDESIGN_DESIGN.md section 4's left pane");
+            Assert(Regex.IsMatch(html, @"\.badge") && Regex.IsMatch(html, @"\.rank"),
+                "P2-138: and each node shows the badge and sorts by the rank core computed");
+
+            // The negative control, and the reason the class exists at all. §4's ordering is
+            // the whole point and two incoming severity scales disagree about which end is bad.
+            Assert(!Regex.IsMatch(html, @"rank\s*===?\s*\d"),
+                "P2-138: and the page NEVER compares a rank to a literal -- the ONE ordering is "
+                + "computed in a class the harness executes, not re-decided in JavaScript");
         }
 
         public static int Main(string[] args)

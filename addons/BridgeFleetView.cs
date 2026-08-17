@@ -30,6 +30,7 @@
 // `tools/deploy.py` globs `addons/*.cs`, so this file needs no registration to ship.
 using System;
 using System.Collections.Generic;
+using Newtonsoft.Json.Linq;
 
 namespace NinjaTrader.NinjaScript.AddOns
 {
@@ -325,6 +326,31 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             groupNodes.Add(unlinkedNode);
             return groupNodes;
+        }
+
+        /// <summary>
+        /// P2-138. The rows of `/api/copier/snapshot` as JSON, reduced to <see cref="FleetCopierRow"/>.
+        ///
+        /// ⚠️ THIS EXISTS SO THE FIELD NAMES ARE EXECUTED RATHER THAN TYPED TWICE. `Build` above is
+        /// fully tested and had NO CALLER outside its own test file for a day -- the tree was
+        /// correct and nothing served it. The obvious repair is to map the JSON inline in
+        /// `McpBridgeAddOn.GetCopierSnapshot`, which is the one bridge source `BridgeTests.csproj`
+        /// cannot compile, so a mistyped field name would deserialise to null/0 and the tree would
+        /// render a healthy-looking lie with every test still green.
+        ///
+        /// The test pins this against `tests/fixtures/copier_snapshot_live_20260817.json`, captured
+        /// from the deployed box rather than written from memory, so a field RENAME in core breaks
+        /// a test instead of blanking a column.
+        ///
+        /// Takes JToken, not a typed DTO, because the route has already parsed and ENRICHED this
+        /// array -- `enforcing` and `notEnforcingLabel` are added by the bridge after core
+        /// serialises it, and re-reading the engine to get them back would be the second
+        /// derivation this whole file exists to avoid.
+        /// </summary>
+        public static List<FleetCopierRow> RowsFromSnapshot(JToken rows)
+        {
+            // Deliberately unimplemented: the acceptance tests are red first.
+            return new List<FleetCopierRow>();
         }
     }
 }

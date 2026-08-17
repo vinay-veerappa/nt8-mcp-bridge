@@ -1,0 +1,84 @@
+{
+    "takenUtc": "2026-08-17T04:29:24.6772089Z",
+    "rows": [
+        {
+            "relationshipId": "b1537826-17a1-49a9-9c7f-7bd02936d00f",
+            "leaderAccountName": "Sim101",
+            "followerAccountName": "Sim-ORB",
+            "groupName": null,
+            "instrumentFullName": null,
+            "sizingMode": "QuantityRatio",
+            "effectiveRatio": 0.0,
+            "isEnabled": false,
+            "armedForLive": false,
+            "isQuarantined": false,
+            "quarantineReason": null,
+            "leaderSide": "Flat",
+            "leaderQuantity": 0,
+            "expectedSide": "Flat",
+            "expectedQuantity": 0,
+            "expectedIsClamped": false,
+            "actualSide": "Flat",
+            "actualQuantity": 0,
+            "latency": {
+                "value": 0.0,
+                "samples": 0,
+                "measured": false
+            },
+            "slippage": {
+                "value": 0.0,
+                "samples": 0,
+                "measured": false
+            },
+            "verdict": "Idle",
+            "severity": 5,
+            "enforcing": false,
+            "notEnforcingLabel": "disabled",
+            "notEnforcingReason": "the relationship is disabled."
+        },
+        {
+            "relationshipId": "19fb9adf-f269-476d-b87a-d3339c0bcfc8",
+            "leaderAccountName": "Sim101",
+            "followerAccountName": "SimCopy2",
+            "groupName": null,
+            "instrumentFullName": null,
+            "sizingMode": "QuantityRatio",
+            "effectiveRatio": 0.0,
+            "isEnabled": false,
+            "armedForLive": false,
+            "isQuarantined": false,
+            "quarantineReason": null,
+            "leaderSide": "Flat",
+            "leaderQuantity": 0,
+            "expectedSide": "Flat",
+            "expectedQuantity": 0,
+            "expectedIsClamped": false,
+            "actualSide": "Flat",
+            "actualQuantity": 0,
+            "latency": {
+                "value": 0.0,
+                "samples": 0,
+                "measured": false
+            },
+            "slippage": {
+                "value": 0.0,
+                "samples": 0,
+                "measured": false
+            },
+            "verdict": "Idle",
+            "severity": 5,
+            "enforcing": false,
+            "notEnforcingLabel": "disabled",
+            "notEnforcingReason": "the relationship is disabled."
+        }
+    ],
+    "system": {
+        "loaded": true,
+        "mode": "live",
+        "isActing": true,
+        "severity": "warn",
+        "headline": "[ COPIER LIVE - NOTHING ENABLED ]",
+        "detail": "Every relationship is switched off, so nothing is copied. 2 relationships, 0 enabled.",
+        "configConflicts": 0
+    }
+}
