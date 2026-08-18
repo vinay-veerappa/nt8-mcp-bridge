@@ -7,7 +7,7 @@
 //   GET /api/bars?symbol=...             - fetch bars via BarsRequest
 //   GET /api/indicator/reflect?name=...  - find indicator type in loaded assemblies
 //   GET /api/indicator/try-host?name=... - try to instantiate and drive a NinjaScript indicator
-//   GET /api/indicator/builtin?symbol=...&indicatorName=SMA|EMA|RSI|ATR - compute built-ins directly from bars
+        //   GET /api/indicator/builtin?symbol=...&indicatorName=SMA|EMA|RSI|ATR|VWAP - compute built-ins directly from bars
 
 #region Using declarations
 using System;
@@ -159,37 +159,45 @@ namespace NinjaTrader.NinjaScript.AddOns
             Bars bars = null;
             string status = null;
             var done = new ManualResetEventSlim(false);
-            var disp = System.Windows.Application.Current?.Dispatcher;
-            if (disp == null) return new { error = "no WPF dispatcher" };
-
-            disp.Invoke((Action)(() =>
+            // Match the main bridge /api/bars pattern exactly:
+            //   * run on the calling thread
+            //   * request exactly count bars (offset=0)
+            //   * use the caller-requested period/value
+            //   * wait INSIDE the using block so the Bars object is still valid when read
+            var resultBars = new List<object>();
+            using (var request = new BarsRequest(instrument, count) { BarsPeriod = barsPeriod })
             {
-                using (var request = new BarsRequest(instrument, count) { BarsPeriod = barsPeriod })
+                request.Request((req, code, msg) =>
                 {
-                    request.Request((req, code, msg) => { status = code.ToString(); bars = req.Bars; done.Set(); });
-                    if (!done.Wait(TimeSpan.FromSeconds(30))) status = "timeout";
-                }
-            }));
+                    status = $"{code} | {msg}";
+                    bars = req.Bars;
+                    Log($"BarsRequest callback: code={code}, msg={msg}, bars={(bars == null ? "null" : bars.Count.ToString())}");
+                    if (bars != null && bars.Count > 0)
+                    {
+                        int n = bars.Count;
+                        int take = Math.Min(count, n);
+                        for (int i = 0; i < take; i++)
+                        {
+                            int idx = n - take + i; // oldest of the requested window first
+                            resultBars.Add(new
+                            {
+                                time = bars.GetTime(idx).ToUniversalTime(),
+                                open = bars.GetOpen(idx),
+                                high = bars.GetHigh(idx),
+                                low = bars.GetLow(idx),
+                                close = bars.GetClose(idx),
+                                volume = bars.GetVolume(idx),
+                            });
+                        }
+                    }
+                    done.Set();
+                });
+                if (!done.Wait(TimeSpan.FromSeconds(30))) status = "timeout";
+            }
 
             if (status == "timeout") return new { error = "bars request timed out" };
-            if (bars == null || bars.Count == 0) return new { error = $"no bar data (status={status})" };
-
-            var list = new List<object>(Math.Min(count, bars.Count));
-            int n = bars.Count;
-            for (int i = 0; i < Math.Min(count, n); i++)
-            {
-                int idx = n - 1 - i;
-                list.Insert(0, new
-                {
-                    time = bars.GetTime(idx).ToUniversalTime(),
-                    open = bars.GetOpen(idx),
-                    high = bars.GetHigh(idx),
-                    low = bars.GetLow(idx),
-                    close = bars.GetClose(idx),
-                    volume = bars.GetVolume(idx),
-                });
-            }
-            return new { symbol, period = bpType.ToString(), periodValue, count = list.Count, bars = list };
+            if (resultBars.Count == 0) return new { error = $"no bar data (status={status})" };
+            return new { symbol, period = bpType.ToString(), periodValue, count = resultBars.Count, status, bars = resultBars };
         }
 
         // ─────────────────────────────────────────────────────────────────────────
@@ -212,7 +220,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             t.FullName.Equals(name, StringComparison.OrdinalIgnoreCase))
                         {
                             var baseType = t.BaseType?.FullName;
-                            var isIndicator = baseType != null && baseType.Contains("IndicatorBase");
+                            var isIndicator = baseType != null && (baseType.Contains("IndicatorBase") || baseType.Contains(".Indicators.Indicator"));
                             var methods = t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
                                 .Select(m => m.Name)
                                 .Distinct()
@@ -247,7 +255,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // First fetch bars to host the indicator on.
             var barsResult = GetBars(symbol, "Minute", "1", (barsBack + Math.Max(period * 4, 400)).ToString()) as dynamic;
-            if (barsResult.error != null) return barsResult;
+            var err = GetDynamicError(barsResult);
+            if (err != null) return new { error = err };
 
             // Find indicator type
             Type indicatorType = null;
@@ -375,10 +384,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             int barsBack = int.TryParse(barsBackStr, out int bb) ? Math.Max(1, bb) : 20;
 
             var barsResult = GetBars(symbol, "Minute", "1", (barsBack + Math.Max(period * 4, 400)).ToString()) as dynamic;
-            if (barsResult.error != null) return barsResult;
+            var err = GetDynamicError(barsResult);
+            if (err != null) return new { error = err };
 
-            // Recover the actual Bars object from a cache is not kept; re-fetch raw values.
-            // Instead, compute directly from the bar list returned by GetBars.
+            // Compute directly from the bar list returned by GetBars.
+            // GetBars returns oldest-first, which is what the math helpers expect.
             var barList = ((IEnumerable<object>)barsResult.bars).ToList();
             var closes = barList.Select(b => (double)((dynamic)b).close).ToArray();
             var highs = barList.Select(b => (double)((dynamic)b).high).ToArray();
@@ -391,7 +401,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "EMA": values = ComputeEma(closes, period, barsBack); break;
                 case "RSI": values = ComputeRsi(closes, period, barsBack); break;
                 case "ATR": values = ComputeAtr(highs, lows, closes, period, barsBack); break;
-                default: return new { error = $"unsupported built-in: {indicatorName}. Use SMA, EMA, RSI, ATR." };
+                case "VWAP": values = ComputeVwap(barList, period, barsBack); break;
+                default: return new { error = $"unsupported built-in: {indicatorName}. Use SMA, EMA, RSI, ATR, VWAP." };
             }
 
             return new { symbol, indicatorName, period, count = values.Count, values };
@@ -474,11 +485,72 @@ namespace NinjaTrader.NinjaScript.AddOns
             return list;
         }
 
+        private static List<double> ComputeVwap(List<object> bars, int period, int barsBack)
+        {
+            // Intraday anchored VWAP: reset cumulative sums at each new session day.
+            // Assumes bar time is UTC; anchor uses Date portion.
+            var list = new List<double>();
+            double cumTpVol = 0;
+            double cumVol = 0;
+            DateTime anchorDate = DateTime.MinValue;
+            int n = bars.Count;
+            for (int i = 0; i < n; i++)
+            {
+                dynamic b = bars[i];
+                DateTime t = (DateTime)b.time;
+                double high = (double)b.high;
+                double low = (double)b.low;
+                double close = (double)b.close;
+                long volume = (long)b.volume;
+                DateTime day = t.Date;
+                if (day != anchorDate)
+                {
+                    anchorDate = day;
+                    cumTpVol = 0;
+                    cumVol = 0;
+                }
+                double tp = (high + low + close) / 3.0;
+                double vol = volume;
+                cumTpVol += tp * vol;
+                cumVol += vol;
+                double vwap = cumVol > 0 ? cumTpVol / cumVol : double.NaN;
+                list.Add(vwap);
+            }
+            var result = new List<double>(barsBack);
+            int take = Math.Min(barsBack, list.Count);
+            for (int i = 0; i < take; i++)
+            {
+                double v = list[n - 1 - i];
+                if (!double.IsNaN(v)) result.Add(Math.Round(v, 4));
+            }
+            return result;
+        }
+
+        private static readonly object _logLock = new object();
+        private static string LogFile => Path.Combine(Globals.UserDataDir, "IndicatorTestAddOn.log");
+
+        private static string GetDynamicError(object result)
+        {
+            if (result == null) return null;
+            try
+            {
+                var d = (dynamic)result;
+                string err = d.error;
+                return err;
+            }
+            catch { return null; }
+        }
+
         private void Log(string message)
         {
             try
             {
-                NinjaTrader.Code.Output.Process($"[IndicatorTest] {message}", PrintTo.OutputTab1);
+                string line = $"{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ss.fffZ} [IndicatorTest] {message}";
+                NinjaTrader.Code.Output.Process(line, PrintTo.OutputTab1);
+                lock (_logLock)
+                {
+                    File.AppendAllText(LogFile, line + "\n");
+                }
             }
             catch { }
         }

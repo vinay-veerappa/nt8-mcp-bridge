@@ -9,7 +9,9 @@ The current MCP is a specialized implementation focused on **risk management, pr
 
 ## 1. Current MCP Tool Inventory (Source of Truth)
 
-The canonical list is exported from `mcp/lib/tools.js` and dispatched in `mcp/nt-mcp-server.js`:
+The canonical list is exported from `mcp/lib/tools.js` and dispatched in `mcp/nt-mcp-server.js`. As of the latest handover, the bridge pin is `v1.44.0`.
+
+The vendored core (`vendor/nt8-riskguard`) must be kept current before any deploy; the deploy tool checks the pin range and refuses to deploy if `addons/` files on the sibling repo main are not included.
 
 | # | Tool | Category |
 |---|------|----------|
