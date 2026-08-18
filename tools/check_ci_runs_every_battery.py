@@ -24,8 +24,24 @@ The name must appear in a form that actually runs something:
 It also fails on a DUPLICATE entry: two steps for one battery re-prove the same thing and
 report as if two things were proven.
 
-Exit 0 = every battery is wired exactly once. Exit 1 = at least one is not. Exit 2 = there is
-nothing to check, which is not a pass.
+⚠️ **IT ALSO COVERS THE GATE SCRIPTS, and that is not scope creep (2026-08-18).** The
+docstring above says fixing the two unwired batteries fixed the instance and not the class.
+It fixed the class *for batteries*. One directory over, `tools/check_bridge_parses.py` had
+been on disk and unwired in CI since the day it was written -- the gate covering
+`McpBridgeAddOn.cs`, the one bridge source `BridgeTests.csproj` cannot compile, so a stray
+brace there was findable only by deploying. A syntax error in ANY addon `.cs` stops **every**
+addon loading, RiskGuard included. Both meta-gates globbed `mutation/` only, so no gate
+script in either repo was ever required to run anywhere. Same shape, one directory over,
+and neither repo could see it.
+
+Gates are matched on their REPO-RELATIVE PATH, not their bare name, so invoking one from the
+wrong directory does not count as wiring it.
+
+The filename still says `battery` because the plan and the handover reference it by that name
+in a dozen places; renaming it would make those references stale to fix a cosmetic problem.
+
+Exit 0 = every battery AND every gate is wired exactly once. Exit 1 = at least one is not.
+Exit 2 = there is nothing to check, which is not a pass.
 """
 
 from __future__ import annotations
@@ -36,6 +52,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MUTATION = REPO / 'mutation'
+TOOLS = REPO / 'tools'
 WORKFLOW = REPO / '.github' / 'workflows' / 'ci.yml'
 
 
@@ -79,14 +96,42 @@ def main() -> int:
 
         print('  %-24s %s' % (name, 'wired' if total == 1 else 'PROBLEM (%d)' % total))
 
+    # ---- the gate scripts ------------------------------------------------------------
+    # Matched on the repo-relative path: `python tools/check_x.py` is wiring, and the same
+    # basename invoked from another directory is not.
+    gates = sorted(
+        set(g.relative_to(REPO).as_posix()
+            for d in (TOOLS, MUTATION) if d.is_dir()
+            for g in d.glob('check_*.py')))
+    if not gates:
+        print('REFUSING: no check_*.py under tools/ or mutation/. This half would pass '
+              'vacuously.')
+        return 2
+
+    print('')
+    for rel in gates:
+        total = len(re.findall(r'run:[^\n]*' + re.escape(rel), body))
+        if total == 0:
+            problems.append(
+                '%s is on disk and CI never runs it. A gate nobody executes is a gate that\n'
+                '    cannot fail, and it looks exactly like one that passes.' % rel)
+        elif total > 1:
+            problems.append(
+                '%s is wired %d times. The duplicate re-proves the same thing and reports\n'
+                '    as though two things were checked.' % (rel, total))
+
+        print('  %-34s %s' % (rel, 'wired' if total == 1 else 'PROBLEM (%d)' % total))
+
     print('')
     if problems:
-        print('FAIL: %d batter(y/ies) are not wired exactly once:\n' % len(problems))
+        print('FAIL: %d batter(y/ies) and/or gate(s) are not wired exactly once:\n'
+              % len(problems))
         for p in problems:
             print('  * ' + p + '\n')
         return 1
 
-    print('OK: all %d batteries are executed by ci.yml, exactly once each.' % len(batteries))
+    print('OK: all %d batteries and all %d gates are executed by ci.yml, exactly once each.'
+          % (len(batteries), len(gates)))
     return 0
 
 

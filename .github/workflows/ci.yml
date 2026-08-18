@@ -63,6 +63,14 @@ jobs:
       - name: A declared EXPECTED SURVIVOR does not make a battery unpassable
         run: python tools/check_expected_survivors.py
 
+      # ⚠️ Written long ago, and CI never ran it until 2026-08-18. It is the ONLY automated
+      # thing that reads McpBridgeAddOn.cs, which BridgeTests.csproj cannot compile -- so a
+      # stray brace there was findable only by deploying, and a syntax error in ANY addon .cs
+      # stops EVERY addon loading, RiskGuard included. This is a PARSER check (CS1xxx) only;
+      # it is not a compile and does not replace nt_compile.
+      - name: Code no test build compiles still parses
+        run: python tools/check_bridge_parses.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
