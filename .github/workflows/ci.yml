@@ -219,6 +219,24 @@ jobs:
       - name: Mutation P2-127 slice 3 (the inspector's three tabs)
         run: python mutation/mutate_p2127tabs.py
 
+      # P2-127 slice 4: the EVENTS pane and section 4 decision 4's SYSTEM ROW -- section 4's last two
+      # unbuilt regions. Every threshold in them was set by measuring the deployed box, not by reading
+      # the code, and four of those measurements changed a decision.
+      # ⚠️ The mutant to know is group 3's first: it reads section 4's "EVENTS -- filtered to
+      # selection" LITERALLY, and that hides every ERROR, ATM_MONITOR_NO_DISPATCHER and
+      # ATM_BRACKET_RESTORE_FAILED the moment an account is selected -- because those are logged with
+      # NO account, and clicking an account is the normal way to use this page. Section 4.2 killed
+      # top-level tabs over precisely that.
+      # ⚠️ Group 1's mutants are measured, not imagined: the log was 43,766,928 bytes for ONE DAY and
+      # 86% of its tail was per-tick telemetry, so a pane rendering the tail verbatim shows nothing
+      # but SUBSCRIBE. Group 6's feed mutants are the same shape in the other direction -- 91 of 97
+      # accounts are attached to no connection, so counting them paints the feed permanently red.
+      # ⚠️ And one mutant pins a REAL defect this battery's own suite found: JObject.Parse converts an
+      # ISO-8601 string to a Date TOKEN, so `timestamp_utc` was re-rendered in the machine's LOCALE
+      # and LOCAL TIME from a field whose name says UTC.
+      - name: Mutation P2-127 slice 4 (the events pane and the system row)
+        run: python mutation/mutate_p2127panes.py
+
       # P1-131: "would severing this connection strand the order?" -- the FOURTH question over
       # OrderState, after the core's OccupiesSlot / ProvidesCoverage / AcceptsModification.
       # ⚠️ Group 1's first mutant is the one to know: it restores the instinct to borrow the

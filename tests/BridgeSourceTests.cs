@@ -1401,6 +1401,20 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2127_AKnownCleanTabDoesNotRankAsTheWorst();
             TestP2127_AnUnreadableRuleStateRanksWorstNotBest();
             TestP2127_TheAccountFilterIgnoresCaseLikeTheCoreDoes();
+            // Slice 4: the events pane and section 4 decision 4's system row -- section 4's
+            // last two unbuilt regions. Every threshold in them was set by measuring the
+            // deployed box, not by reading the code; the numbers are in the block header.
+            TestP2127_TheEventsPaneDropsTheMeasuredTelemetry();
+            TestP2127_RepeatedEventsCollapseAndKeepTheirCount();
+            TestP2127_ASelectionNeverHidesABoxWideEvent();
+            TestP2127_TheNewestEventsSurviveTheCap();
+            TestP2127_AnUnknownEventTypeDoesNotRankRoutine();
+            TestP2127_TheSystemRowNeverMergesGuardAndCopier();
+            TestP2127_AnUnevaluatedRuleBeatsEveryOtherGuardState();
+            TestP2127_AnAccountOnNoConnectionIsNotAFeedFailure();
+            TestP2127_TheCopierCellDefersToItsOwnProducer();
+            TestP2127_TheRouteServesEventsAndSystemAndDecidesNeither();
+            TestP2127_ThePageRendersEventsAndTheSystemRow();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
@@ -1409,7 +1423,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 93;
+            const int declared = 104;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -4185,6 +4199,641 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(!Regex.IsMatch(html, @"rank\s*===?\s*\d"),
                 "P2-138: and the page NEVER compares a rank to a literal -- the ONE ordering is "
                 + "computed in a class the harness executes, not re-decided in JavaScript");
+        }
+
+        // ==============================================================================
+        // P2-127 slice 4: the EVENTS pane and §4 decision 4's SYSTEM ROW -- §4's last two
+        // unbuilt regions.
+        //
+        // ⚠️ EVERY NUMBER BELOW IS MEASURED ON THE DEPLOYED BOX, 2026-08-17, and the design
+        // follows the measurement rather than the shape of the code:
+        //
+        //   interventions.jsonl     43 766 928 bytes for ONE DAY
+        //     last 3 MB             10 877 lines, 8 148 of them SUBSCRIBE (75%)
+        //                           + 1 199 ORDER_UPDATE  ->  86% telemetry
+        //                           97 INTERVENTION, 20 NAKED_POSITION, 63 ATM_STOP_ORDER_NOT_FOUND
+        //                           84 ARMED_ON_START, 171 CONNECTION_CHANGE (same sentence each)
+        //   guard summary           mode "shadow", isArmed true, unevaluatedRules EMPTY
+        //   copier system           mode "live", isActing TRUE, severity "warn", conflicts 0
+        //   connections             97 accounts: 91 on connection null, 6 on "TPT" all Connected
+        //
+        // Three of those four measurements changed a decision, and the fourth is P3-34 proved:
+        // the guard enforces NOTHING while the copier is live and acting, in one process, at one
+        // instant. A single "armed" light would have been a lie on this box today.
+        // ==============================================================================
+
+        /// <summary>
+        /// P2-127 slice 4. 86% of the log is telemetry, so a pane that renders the tail verbatim
+        /// shows an operator nothing but `SUBSCRIBE`. That is the §4.2 hazard by another route: this
+        /// page exists so a bad state is seen WITHOUT BEING LOOKED FOR, and 8 148 subscribe lines
+        /// hide 20 naked positions as effectively as a nav tab would.
+        /// </summary>
+        private static void TestP2127_TheEventsPaneDropsTheMeasuredTelemetry()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the events pane drops the measured 86% telemetry");
+
+            var lines = new List<string>();
+            for (int i = 0; i < 50; i++)
+                lines.Add(EventLine("2026-08-17T23:0" + (i % 10) + ":00Z", "ACC", "SUBSCRIBE", "subscribed"));
+            lines.Add(EventLine("2026-08-17T23:10:00Z", "ACC", "NAKED_POSITION", "a position with no stop"));
+
+            var rows = BridgeEventsView.Build(lines, null, 60);
+
+            Assert(rows.Count == 1 && rows[0].EventType == "NAKED_POSITION", string.Format(
+                "P2-127: 50 SUBSCRIBE lines and one NAKED_POSITION yield ONE row (got {0}). "
+                + "SUBSCRIBE was 75% of the measured tail on its own; a pane that shows it shows "
+                + "nothing else.", rows.Count));
+
+            Assert(BridgeEventsView.IsTelemetry("ORDER_UPDATE")
+                   && BridgeEventsView.IsTelemetry("POSITION_UPDATE")
+                   && BridgeEventsView.IsTelemetry("FSM_TRANSITION"),
+                "P2-127: the other measured high-volume types are dropped too -- ORDER_UPDATE was "
+                + "1 199 lines of the 10 877, and all three are facts the fleet tree and the "
+                + "inspector already show as STATE, which is where a position's size belongs.");
+
+            // ⚠️ THE NEGATIVE CONTROL FOR THE DENYLIST, and the direction is the decision.
+            Assert(!BridgeEventsView.IsTelemetry("FSM_UNDERCOVERED"),
+                "P2-127: FSM_UNDERCOVERED is NOT telemetry even though FSM_TRANSITION is. A "
+                + "transition is the machine working; undercovered is the machine reporting a "
+                + "position with less protection than it should have. They differ by one word.");
+            Assert(!BridgeEventsView.IsTelemetry("SOMETHING_A_FUTURE_FIX_ADDS"),
+                "P2-127: an UNKNOWN event type is NOT dropped. This is the load-bearing direction: "
+                + "an allowlist would hide the events added by the most recent fix, which is exactly "
+                + "when nobody remembers to register them -- an alarm wired to a surface that will "
+                + "not show it.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. A denylist alone is not enough: `ARMED_ON_START` appeared 84 times in the
+        /// measured tail and `CONNECTION_CHANGE` 171, none of it telemetry and all of it the same
+        /// sentence. Eighty-four identical rows is an unusable pane by a different route.
+        /// </summary>
+        private static void TestP2127_RepeatedEventsCollapseAndKeepTheirCount()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: repeated events collapse, and the count survives");
+
+            var lines = new List<string>();
+            for (int i = 0; i < 84; i++)
+                lines.Add(EventLine("2026-08-17T22:00:0" + (i % 10) + "Z", "SYSTEM", "ARMED_ON_START", "armed on start"));
+
+            var rows = BridgeEventsView.Build(lines, null, 60);
+
+            Assert(rows.Count == 1, string.Format(
+                "P2-127: 84 identical ARMED_ON_START lines become ONE row (got {0}) -- the measured "
+                + "count on this box, in one tail.", rows.Count));
+            Assert(rows.Count == 1 && rows[0].Count == 84, string.Format(
+                "P2-127: and the row CARRIES the 84. 'The connection cycled 84 times' is a "
+                + "materially different fact from 'the connection cycled' -- each of those cycles "
+                + "wiped the ATM bracket registry, which is P2-136 (got {0})",
+                rows.Count == 1 ? rows[0].Count : -1));
+
+            // ⚠️ WRITTEN FROM THE BATTERY: a mutant keeping the run's OLDEST timestamp survived,
+            // because nothing here read the timestamp at all. It matters -- a condition still firing
+            // now, stamped at the time it started, reads as historical and gets ignored.
+            var run = new List<string>
+            {
+                EventLine("2026-08-17T20:00:00Z", "SYSTEM", "ARMED_ON_START", "armed"),
+                EventLine("2026-08-17T21:00:00Z", "SYSTEM", "ARMED_ON_START", "armed"),
+                EventLine("2026-08-17T22:30:00Z", "SYSTEM", "ARMED_ON_START", "armed"),
+            };
+            var collapsed = BridgeEventsView.Build(run, null, 60);
+            Assert(collapsed.Count == 1 && collapsed[0].Utc == "2026-08-17T22:30:00Z", string.Format(
+                "P2-127: a collapsed run carries its LATEST timestamp, not its first (got '{0}'). "
+                + "'When did this last happen' is the question an operator asks of a repeating "
+                + "event, and the earliest time answers a different one.",
+                collapsed.Count == 1 ? collapsed[0].Utc : "(no single row)"));
+
+            // ⚠️ CONSECUTIVE, NOT GLOBAL. A global collapse would merge this morning's naked
+            // position with one from a minute ago and stamp a single row at the wrong time, which is
+            // worse than either -- the timestamp is the actionable half.
+            var interleaved = new List<string>
+            {
+                EventLine("2026-08-17T20:00:00Z", "ACC", "NAKED_POSITION", "morning"),
+                EventLine("2026-08-17T21:00:00Z", "ACC", "INTERVENTION", "something happened"),
+                EventLine("2026-08-17T22:00:00Z", "ACC", "NAKED_POSITION", "an hour ago"),
+            };
+            var split = BridgeEventsView.Build(interleaved, null, 60);
+            Assert(split.Count == 3, string.Format(
+                "P2-127: two runs of the same event separated by anything else stay TWO rows (got "
+                + "{0} rows). Collapsing globally would report one event with count 2 at one of the "
+                + "two times, and an operator cannot act on that.", split.Count));
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. THE LOAD-BEARING DECISION IN THE FILTER.
+        ///
+        /// §4 says "EVENTS -- filtered to selection", and a literal reading HIDES the worst events on
+        /// the box the moment an operator clicks an account -- because `ATM_MONITOR_NO_DISPATCHER`,
+        /// `ATM_BRACKET_RESTORE_FAILED` and every `ERROR` are logged with NO account. Clicking an
+        /// account is the normal way to use this page. §4.2 killed top-level tabs over exactly this:
+        /// nothing may put a bad state behind an interaction.
+        /// </summary>
+        private static void TestP2127_ASelectionNeverHidesABoxWideEvent()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: selecting an account never hides a box-wide event");
+
+            var lines = new List<string>
+            {
+                EventLine("2026-08-17T23:00:00Z", "", "ATM_MONITOR_NO_DISPATCHER", "the sweep has no dispatcher"),
+                EventLine("2026-08-17T23:01:00Z", "SYSTEM", "ERROR", "something threw"),
+                EventLine("2026-08-17T23:02:00Z", "ACCOUNT_A", "INTERVENTION", "A was flattened"),
+                EventLine("2026-08-17T23:03:00Z", "ACCOUNT_B", "INTERVENTION", "B was flattened"),
+            };
+
+            var forA = BridgeEventsView.Build(lines, "ACCOUNT_A", 60);
+            var types = forA.Select(r => r.EventType).ToList();
+
+            Assert(types.Contains("ATM_MONITOR_NO_DISPATCHER") && types.Contains("ERROR"), string.Format(
+                "P2-127: both box-wide events survive a selection (got [{0}]). One is logged with an "
+                + "EMPTY account by LogFromComponent and the other with the literal string 'SYSTEM' "
+                + "by LogEvent -- both mean box-wide, and treating only one as such hides half of "
+                + "them.", string.Join(", ", types)));
+
+            Assert(!types.Contains("INTERVENTION") || forA.Count(r => r.EventType == "INTERVENTION") == 1,
+                "P2-127: and the OTHER account's events are gone -- the pane is still filtered.");
+            Assert(forA.All(r => r.IsSystemScoped || r.Account == "ACCOUNT_A"), string.Format(
+                "P2-127: nothing from ACCOUNT_B leaks through (got [{0}])",
+                string.Join(", ", forA.Select(r => r.Account))));
+
+            Assert(BridgeEventsView.IsSystemScope("") && BridgeEventsView.IsSystemScope(null)
+                   && BridgeEventsView.IsSystemScope("SYSTEM") && BridgeEventsView.IsSystemScope("system"),
+                "P2-127: blank, null and 'SYSTEM' in either case all mean box-wide.");
+            Assert(!BridgeEventsView.IsSystemScope("Sim101"),
+                "P2-127: and a real account name does not -- a scope predicate that says yes to "
+                + "everything makes the filter vacuous and every assertion above pass anyway.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. Newest first, and the CAP APPLIED LAST. Capping before collapsing would
+        /// spend the whole budget on one run of 84 identical lines, which is the measured case.
+        /// </summary>
+        private static void TestP2127_TheNewestEventsSurviveTheCap()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the newest events survive the cap, and repeats do not eat it");
+
+            var lines = new List<string>();
+            for (int i = 0; i < 84; i++)
+                lines.Add(EventLine("2026-08-17T22:00:00Z", "SYSTEM", "ARMED_ON_START", "armed"));
+            lines.Add(EventLine("2026-08-17T23:00:00Z", "ACC", "NAKED_POSITION", "the thing that matters"));
+
+            var rows = BridgeEventsView.Build(lines, null, 2);
+
+            Assert(rows.Count == 2 && rows[0].EventType == "NAKED_POSITION", string.Format(
+                "P2-127: the newest row is first and the 84-line run did not consume the cap (got "
+                + "[{0}]). Capping before collapsing leaves a pane holding one repeated startup "
+                + "message and nothing else.", string.Join(", ", rows.Select(r => r.EventType))));
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. An unrecognised event type must NOT rank clean.
+        ///
+        /// Same shape as the two battery survivors that produced
+        /// `TestP2127_AnUnreadableRuleStateRanksWorstNotBest`: the events most worth surfacing are the
+        /// ones a recent fix added, so ranking those routine puts the newest alarm at the bottom.
+        /// </summary>
+        private static void TestP2127_AnUnknownEventTypeDoesNotRankRoutine()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: an unknown event type does not rank routine");
+
+            int unknown = BridgeEventsView.RankOfEventType("SOMETHING_A_FUTURE_FIX_ADDS");
+            int routine = BridgeEventsView.RankOfEventType("INITIALIZE");
+            int critical = BridgeEventsView.RankOfEventType("INTERVENTION");
+
+            Assert(critical == BridgeFleetView.WorstRank, string.Format(
+                "P2-127: an INTERVENTION -- the guard acting -- is the worst rank ({0}, got {1})",
+                BridgeFleetView.WorstRank, critical));
+            Assert(unknown < routine, string.Format(
+                "P2-127: an UNKNOWN type ranks worse than a recognised routine one ({0} vs {1}). "
+                + "Lower is worse on this page, and an event nobody has classified is not evidence "
+                + "that nothing happened.", unknown, routine));
+
+            // ⚠️ AND THE OTHER DIRECTION, which is what stops this crying wolf on every boot: the
+            // ordinary startup lines must be routine, or 84 ARMED_ON_START rows all read as warnings.
+            Assert(BridgeEventsView.RankOfEventType("ARMED_ON_START") == routine
+                   && BridgeEventsView.RankOfEventType("ATM_BRACKET_RELEASED") == routine,
+                "P2-127: ordinary startup and a released bracket are ROUTINE. Without a routine set "
+                + "the loud default would make every boot look like a problem, and an alarm that is "
+                + "always on is off.");
+
+            Assert(BridgeEventsView.WorstRankOf(new List<EventRow>()) != BridgeFleetView.UnknownRank,
+                "P2-127: an EMPTY pane is not UNKNOWN -- UnknownRank IS WorstRank, and a log that "
+                + "was read and held nothing worth showing is not an unread log. This is the same "
+                + "call CleanRank exists for on the rare tab.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 4, §4 decision 4. THREE CELLS, AND P3-34 IS WHY.
+        ///
+        /// §2.1's table: *"`P3-34` (open) | the copier is ENFORCING regardless of guard mode | a
+        /// single 'armed' indicator would be a lie."* This test drives the state MEASURED on the
+        /// deployed box on 2026-08-17 -- guard `shadow`/armed, copier `live`/acting -- and asserts the
+        /// two cells disagree, which is the only way that box can be described truthfully.
+        /// </summary>
+        private static void TestP2127_TheSystemRowNeverMergesGuardAndCopier()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the system row never merges the guard and the copier");
+
+            var cells = BridgeSystemRow.Build(
+                Connections(("TPT", "Connected"), (null, "Disconnected")),
+                new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                new JObject
+                {
+                    ["loaded"] = true, ["mode"] = "live", ["isActing"] = true,
+                    ["severity"] = "warn", ["headline"] = "[ COPIER LIVE - NOTHING ENABLED ]",
+                    ["detail"] = "Every relationship is switched off.", ["configConflicts"] = 0
+                });
+
+            Assert(cells.Count == 3, string.Format(
+                "P2-127: always THREE cells (got {0}). An absent cell and an empty one read "
+                + "identically to whatever renders them -- that was the sixteenth mutant of slice "
+                + "1's battery and it survived a green suite.", cells.Count));
+            Assert(cells[0].Id == BridgeSystemRow.FeedCell
+                   && cells[1].Id == BridgeSystemRow.GuardCell
+                   && cells[2].Id == BridgeSystemRow.CopierCell,
+                "P2-127: in §4's order -- feed, guard, copier.");
+
+            var guard = cells[1];
+            var copier = cells[2];
+
+            Assert(guard.Rank != copier.Rank, string.Format(
+                "P2-127: on the state MEASURED on this box today -- guard 'shadow' and armed, copier "
+                + "'live' and ACTING -- the two cells rank differently (guard {0}, copier {1}). A "
+                + "single 'armed' light is a lie here whichever way it folds, which is P3-34.",
+                guard.Rank, copier.Rank));
+
+            Assert(guard.Badge.IndexOf("Shadow", StringComparison.OrdinalIgnoreCase) >= 0, string.Format(
+                "P2-127: the guard cell says SHADOW -- evaluated, enforcing nothing. §2.1 calls this "
+                + "correct and deliberate and adds 'but must be unmistakable' (got '{0}')",
+                guard.Badge));
+            Assert(copier.Badge.IndexOf("live", StringComparison.OrdinalIgnoreCase) >= 0
+                   && copier.Badge.IndexOf("acting", StringComparison.OrdinalIgnoreCase) >= 0, string.Format(
+                "P2-127: and the copier cell says live AND acting, in the same row (got '{0}'). "
+                + "That is the fact an operator seeing one indicator would have got wrong.",
+                copier.Badge));
+
+            Assert(guard.Rank != BridgeInspectorTabs.CleanRank && guard.Rank != BridgeFleetView.WorstRank,
+                string.Format("P2-127: shadow is neither CLEAN nor WORST (got {0}). Clean is how an "
+                    + "operator comes to believe a limit protects them; worst is how the page cries "
+                    + "wolf through the entire shadow-validation period this project is in.",
+                    guard.Rank));
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. §2.1's rule, stated without qualification: **"CONFIGURED and not EVALUATED
+        /// renders red, everywhere, always."** Four shipped defects were that state. It must bind over
+        /// the mode, because a rule nothing reads cannot be rescued by arming.
+        /// [[rank-refusal-reasons-by-what-binds]], [[configured-evaluated-enforcing]].
+        /// </summary>
+        private static void TestP2127_AnUnevaluatedRuleBeatsEveryOtherGuardState()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: an unevaluated rule outranks every other guard state");
+
+            var copierSystem = new JObject { ["loaded"] = true, ["mode"] = "disabled", ["isActing"] = false, ["severity"] = "ok" };
+
+            // Armed and LIVE -- the best a guard can be -- with one rule nothing reads.
+            var withUnevaluated = BridgeSystemRow.Build(
+                Connections(("TPT", "Connected")),
+                new JObject
+                {
+                    ["mode"] = "live", ["isArmed"] = true,
+                    ["unevaluatedRules"] = new JArray { "EnableNewsShield" }
+                },
+                copierSystem)[1];
+
+            Assert(withUnevaluated.Rank == BridgeFleetView.WorstRank, string.Format(
+                "P2-127: CONFIGURED-and-not-EVALUATED is the WORST rank even on an armed, LIVE guard "
+                + "(got {0}). It is the most dangerous state this system can be in because the "
+                + "config file reads as protection -- P1-77, P2-25 and the firm-mirror rules were "
+                + "all this, shipped.", withUnevaluated.Rank));
+            Assert(withUnevaluated.Badge.IndexOf("Not evaluated", StringComparison.OrdinalIgnoreCase) >= 0,
+                string.Format("P2-127: and it says so, rather than reporting the mode (got '{0}')",
+                    withUnevaluated.Badge));
+
+            // The negative control: the same guard with an EMPTY unevaluated list must not be red,
+            // or the cell is red always and says nothing. On the measured box the list IS empty.
+            var clean = BridgeSystemRow.Build(
+                Connections(("TPT", "Connected")),
+                new JObject { ["mode"] = "live", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                copierSystem)[1];
+            Assert(clean.Rank == BridgeInspectorTabs.CleanRank, string.Format(
+                "P2-127: an armed LIVE guard with nothing unevaluated is CLEAN (got {0}). "
+                + "`unevaluatedRules` was EMPTY on the measured box, so without this the cell would "
+                + "be the same colour there as on a box in the worst state it can reach.",
+                clean.Rank));
+
+            var disarmed = BridgeSystemRow.Build(
+                Connections(("TPT", "Connected")),
+                new JObject { ["mode"] = "live", ["isArmed"] = false, ["unevaluatedRules"] = new JArray() },
+                copierSystem)[1];
+            Assert(disarmed.Rank < clean.Rank && disarmed.Rank > BridgeFleetView.WorstRank, string.Format(
+                "P2-127: a DISARMED live guard is worse than an armed one and not as bad as an "
+                + "unevaluated rule (got {0}); nothing can act, but nothing is misdescribed either.",
+                disarmed.Rank));
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. THE FEED CELL IS WHERE FAIL-CLOSED WOULD LIE, and the numbers are measured:
+        /// 97 accounts, 91 of them attached to NO connection and reported `Disconnected`, 6 on "TPT"
+        /// all `Connected`. Those 91 are expired prop accounts. "Any disconnected account means the
+        /// feed is down" paints this box permanently red -- the same defect that painted 95 of 97
+        /// accounts as the worst thing on the fleet tree.
+        /// [[an-inapplicable-state-is-not-unreadable]].
+        /// </summary>
+        private static void TestP2127_AnAccountOnNoConnectionIsNotAFeedFailure()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: 91 accounts on no connection are not a feed failure");
+
+            var pairs = new List<(string, string)>();
+            for (int i = 0; i < 91; i++) pairs.Add((null, "Disconnected"));
+            for (int i = 0; i < 6; i++) pairs.Add(("TPT", "Connected"));
+
+            var feed = BridgeSystemRow.Build(Connections(pairs.ToArray()),
+                new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                new JObject { ["loaded"] = true, ["severity"] = "ok" })[0];
+
+            Assert(feed.Rank == BridgeInspectorTabs.CleanRank, string.Format(
+                "P2-127: the exact live shape -- 91 accounts on no connection, 6 on TPT all "
+                + "connected -- reads CLEAN (got {0}). Counting the 91 makes this cell red on every "
+                + "poll for the life of the box, and a cell that is always red is a cell nobody "
+                + "reads.", feed.Rank));
+
+            // A NAMED connection that is down IS a failure, or the cell can never go red.
+            var down = BridgeSystemRow.Build(
+                Connections((null, "Disconnected"), ("TPT", "Disconnected")),
+                new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                new JObject { ["loaded"] = true, ["severity"] = "ok" })[0];
+            Assert(down.Rank == BridgeFleetView.WorstRank, string.Format(
+                "P2-127: a NAMED connection that is not connected IS the worst rank (got {0}). "
+                + "Without this the cell has no input that makes it red, and a status that cannot "
+                + "go red should not exist.", down.Rank));
+
+            // ⚠️ WRITTEN FROM THE BATTERY. Every case above puts ONE account on each connection, so
+            // `existing && connected` and `existing || connected` are indistinguishable and the
+            // mutant swapping them survived. A connection is only up if EVERY account on it is: five
+            // healthy accounts and one disconnected on the same connection is a partial feed, and
+            // reporting it as fully up is the direction that hides it.
+            var mixed = BridgeSystemRow.Build(
+                Connections(("TPT", "Connected"), ("TPT", "Connected"), ("TPT", "Disconnected")),
+                new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                new JObject { ["loaded"] = true, ["severity"] = "ok" })[0];
+            Assert(mixed.Rank == BridgeFleetView.WorstRank, string.Format(
+                "P2-127: one disconnected account TAINTS its connection -- two up and one down on "
+                + "'TPT' is not a healthy feed (got {0}). With one account per connection in every "
+                + "other case here, && and || are the same function and this is unobservable.",
+                mixed.Rank));
+
+            // And NO named connection at all is unknown, not clean -- this is the genuinely
+            // unreadable case, which is the one fail-closed is for. §3: liveness is not optional
+            // because a stalled feed and an idle one look identical.
+            var none = BridgeSystemRow.Build(
+                Connections((null, "Disconnected"), (null, "Disconnected")),
+                new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() },
+                new JObject { ["loaded"] = true, ["severity"] = "ok" })[0];
+            Assert(none.Rank == BridgeFleetView.UnknownRank, string.Format(
+                "P2-127: NO named connection is UNKNOWN, not clean (got {0}). Zero readable "
+                + "connections means the cell cannot answer its own question, which is a different "
+                + "fact from 'the accounts that could answer it are not attached to anything'.",
+                none.Rank));
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. The copier cell reads the `system` object the copier's OWN producer emits
+        /// and does not re-derive the verdict. `F-9`'s standing lesson is that a REPORTED state drifted
+        /// from the ENFORCED state in both directions, and `P3-122` had to correct
+        /// `CopierEnforcementView`'s refusal precedence once already -- a second reader of one question
+        /// is how these drift. [[a-second-reader-of-the-same-state]].
+        /// </summary>
+        private static void TestP2127_TheCopierCellDefersToItsOwnProducer()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the copier cell defers to the copier's own producer");
+
+            var guardSummary = new JObject { ["mode"] = "shadow", ["isArmed"] = true, ["unevaluatedRules"] = new JArray() };
+            var conns = Connections(("TPT", "Connected"));
+
+            var critical = BridgeSystemRow.Build(conns, guardSummary,
+                new JObject { ["loaded"] = true, ["mode"] = "live", ["isActing"] = true, ["severity"] = "critical" })[2];
+            var ok = BridgeSystemRow.Build(conns, guardSummary,
+                new JObject { ["loaded"] = true, ["mode"] = "live", ["isActing"] = true, ["severity"] = "ok" })[2];
+
+            Assert(critical.Rank == BridgeFleetView.RankOfSystemSeverity("critical")
+                   && ok.Rank == BridgeFleetView.RankOfSystemSeverity("ok"),
+                string.Format("P2-127: the rank comes from BridgeFleetView.RankOfSystemSeverity, "
+                    + "which the fleet tree already speaks, rather than from a second scale here "
+                    + "(critical {0}, ok {1})", critical.Rank, ok.Rank));
+            Assert(critical.Rank < ok.Rank,
+                "P2-127: and it points the right way -- the copier's severity scale runs the OTHER "
+                + "way (Ok=0..Critical=3) and RankOfSystemSeverity inverts it. Passing the raw "
+                + "integer through would sort a critical copier as the healthiest thing on the row.");
+
+            // A config conflict IS the worst rank, whatever severity the copier reports.
+            //
+            // ⚠️ THIS ASSERTION USED TO BE VACUOUS AND THE BATTERY SAID SO. It read
+            // `conflictOnCritical.Rank <= critical.Rank`, defending a claim that a conflict "never
+            // improves" a rank -- but `WorstRank` is 0 and nothing is below it, so `0 <= 0` passed
+            // under every implementation including the one it existed to reject. The code was
+            // simplified rather than the test strengthened, because the property being defended does
+            // not exist. [[a-green-that-can-never-be-red]].
+            var conflictOnClean = BridgeSystemRow.Build(conns, guardSummary,
+                new JObject { ["loaded"] = true, ["mode"] = "live", ["isActing"] = true, ["severity"] = "ok", ["configConflicts"] = 2 })[2];
+
+            Assert(conflictOnClean.Rank == BridgeFleetView.WorstRank && ok.Rank != BridgeFleetView.WorstRank,
+                string.Format("P2-127: a config conflict makes an OTHERWISE-OK copier the worst rank "
+                    + "({0}), and the same copier without one is not ({1}) -- so the conflict is what "
+                    + "moved it.", conflictOnClean.Rank, ok.Rank));
+            Assert(conflictOnClean.Badge.IndexOf("conflict", StringComparison.OrdinalIgnoreCase) >= 0,
+                string.Format("P2-127: and the badge names it, so the rank and the text agree (got "
+                    + "'{0}')", conflictOnClean.Badge));
+
+            var notLoaded = BridgeSystemRow.Build(conns, guardSummary,
+                new JObject { ["loaded"] = false, ["severity"] = "ok" })[2];
+            Assert(notLoaded.Rank == BridgeFleetView.WorstRank,
+                "P2-127: a copier whose config did not load is worst, whatever severity it reports "
+                + "-- no relationship exists, so nothing would be mirrored.");
+
+            var missing = BridgeSystemRow.Build(conns, guardSummary, null)[2];
+            Assert(missing.Rank == BridgeFleetView.UnknownRank && !string.IsNullOrEmpty(missing.Badge),
+                "P2-127: and an ABSENT system object is unknown with a non-blank badge -- a blank "
+                + "badge over a bad state is the hiding hazard §4.2 killed top-level tabs for.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. The route serves both new regions and decides NEITHER.
+        ///
+        /// `McpBridgeAddOn.cs` is the one bridge source `BridgeTests.csproj` cannot compile, so
+        /// anything it decides can be gated only by a regex -- which is not evidence. The rule is that
+        /// it acquires and hands over. The negative controls are the substance of this test.
+        /// </summary>
+        private static void TestP2127_TheRouteServesEventsAndSystemAndDecidesNeither()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the route serves the events pane and system row, deciding neither (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+            int s = code.IndexOf("case \"/api/ui/inspector\":", StringComparison.Ordinal);
+            Assert(s >= 0, "P2-127: the /api/ui/inspector route exists at all");
+            if (s < 0) return;
+
+            int e = code.IndexOf("\n                case \"", s + 10);
+            string handler = e > s ? code.Substring(s, e - s) : code.Substring(s);
+
+            Assert(handler.Contains("BridgeEventsView.Build("), string.Format(
+                "P2-127: the route SERVES the events pane -- a decision class with no route is "
+                + "P2-138 repeated, and that one was written, tested, mutation-covered, deployed "
+                + "and served to nobody ({0} chars inspected)", handler.Length));
+            Assert(handler.Contains("BridgeSystemRow.Build("), string.Format(
+                "P2-127: and the system row ({0} chars inspected)", handler.Length));
+            Assert(handler.Contains("ReadInterventionTail("), string.Format(
+                "P2-127: and it reads a bounded TAIL of the log, not the file. It measured 43 766 "
+                + "928 bytes for one day, on a route the page polls every 5 seconds ({0} chars "
+                + "inspected)", handler.Length));
+
+            // ⚠️ NEGATIVE CONTROLS. Everything this file decides is untestable by construction.
+            Assert(!Regex.IsMatch(handler, @"""(SUBSCRIBE|ORDER_UPDATE|INTERVENTION|NAKED_POSITION)"""),
+                string.Format("P2-127: the route names NO event type. A second denylist here could "
+                    + "drift from the class's, and the class's is the measured one ({0} chars "
+                    + "inspected)", handler.Length));
+            Assert(!Regex.IsMatch(handler, @"""(feed|guard|copier)""\s*[,\]\}]"), string.Format(
+                "P2-127: and no system cell id, which would be a second definition of §4's row "
+                + "({0} chars inspected)", handler.Length));
+            Assert(!handler.Contains(".Reverse()") && !handler.Contains(".OrderByDescending("),
+                string.Format("P2-127: and it does not order the events -- newest-first is the "
+                    + "class's decision, taken after collapsing, and one copy of it is enough ({0} "
+                    + "chars inspected)", handler.Length));
+
+            // The tail reader itself: sharing WRITE is load-bearing, not habit.
+            Assert(code.Contains("FileShare.ReadWrite"),
+                "P2-127: the tail is opened with FileShare.ReadWrite. The guard's own five-second "
+                + "sweep appends to this file, and a page poll that blocks or breaks the AUDIT "
+                + "RECORD is a strictly worse trade than an empty pane.");
+        }
+
+        /// <summary>
+        /// P2-127 slice 4. The page renders both regions and re-decides nothing.
+        ///
+        /// `ui/index.html` is in no test build and no mutation battery. `P2-138`'s whole content was
+        /// view logic that existed and was served to nobody; the inverse -- a served payload no page
+        /// renders -- is the same defect from the other end.
+        /// </summary>
+        private static void TestP2127_ThePageRendersEventsAndTheSystemRow(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the page renders the events pane and the system row");
+
+            string page = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "..", "ui", "index.html"));
+            Assert(File.Exists(page), "the served page is readable at " + page);
+            if (!File.Exists(page)) return;
+            string html = File.ReadAllText(page);
+
+            Assert(html.Contains("id=\"events\""), "P2-127: the events pane exists in the DOM.");
+            Assert(html.Contains("id=\"systemrow\""), "P2-127: and §4 decision 4's system row.");
+            // ⚠️ THE DEFINITION AND THE CALL, SEPARATELY, AND THE BATTERY IS WHY. A mutant renaming
+            // `function renderSystemRow(` to `renderSystemRowNotWired(` SURVIVED, because the CALL in
+            // loadTabs still contains the text `renderSystemRow(` -- so a single Contains() check
+            // passed over a page that would throw on its first poll. Same family as an `if (false)`
+            // that leaves the call text in place. The events pane's equivalent mutant died only by
+            // luck: its region-locatable assertion below happens to look for the definition.
+            Assert(html.Contains("function renderEvents(") && html.Contains("function renderSystemRow("),
+                "P2-127: each renderer is DEFINED.");
+            Assert(html.Contains("renderEvents(data)") && html.Contains("renderSystemRow(data)"),
+                "P2-127: and each is CALLED with the payload. A definition nobody calls and a call "
+                + "with no definition are different defects and one check cannot see both.");
+            Assert(html.Contains("data.events") && html.Contains("data.system"),
+                "P2-127: and both read the fields the route serves, rather than fetching separately "
+                + "-- one payload cannot disagree with itself about which account is selected.");
+
+            // ⚠️ THE NEGATIVE CONTROLS, same as slice 3's. Every ordering and every severity is
+            // decided in a class the harness executes; JavaScript that compares a rank to a literal
+            // is a second copy of an ordering, and two incoming scales disagree about which end is
+            // bad. Ranks reach CSS as a class name, never as a comparison.
+            // ⚠️ `"\nfunction "` -- these are TOP-LEVEL declarations, and the first draft looked for
+            // an indented one. It found the next match thousands of characters away, so the "region"
+            // spanned several unrelated functions and the negative controls below were asserted over
+            // code they have no business inspecting. A gate must state the region it reads, and the
+            // length is printed for exactly that reason. [[state-the-region-a-gate-inspects]].
+            int eventsAt = html.IndexOf("function renderEvents(", StringComparison.Ordinal);
+            int endAt = eventsAt < 0 ? -1 : html.IndexOf("\nfunction ", eventsAt + 10, StringComparison.Ordinal);
+            // ⚠️ AND COMMENTS ARE STRIPPED, because this gate FAILED on its own subject's comment:
+            // the renderer carries a note reading "No .sort() and no .reverse()", and searching for
+            // `.sort(` found it. A comment ABOUT a token is not the token -- the same mistake was
+            // made the same day in `check_no_dead_safety_machinery.py`, where an `if (false)` inside a
+            // doc comment made the gate call a wired method dead.
+            // [[a-comment-recording-a-defect-goes-stale]] is the neighbouring hazard; this one is
+            // simpler and it bites the gate rather than the reader.
+            string renderer = eventsAt >= 0 && endAt > eventsAt
+                ? StripJsLineComments(html.Substring(eventsAt, endAt - eventsAt))
+                : "";
+
+            Assert(renderer.Length > 100, string.Format(
+                "P2-127: the events renderer is locatable for inspection ({0} chars read)",
+                renderer.Length));
+            Assert(renderer.Length > 100 && !renderer.Contains(".sort(") && !renderer.Contains(".reverse("),
+                string.Format("P2-127: and it renders in the ORDER the class gave it ({0} chars "
+                    + "inspected). Newest-first is applied AFTER collapsing, so a re-sort in the "
+                    + "page would undo the one decision that had to happen in a particular place.",
+                    renderer.Length));
+            Assert(renderer.Length > 100 && !Regex.IsMatch(renderer, @"rank\s*===?\s*\d"),
+                "P2-127: and it never compares a rank to a literal.");
+        }
+
+        /// <summary>
+        /// Whole-line `//` comments removed, and ONLY whole-line ones.
+        ///
+        /// Deliberately not a general JS comment stripper: a trailing `//` can sit inside a string, a
+        /// regex or a URL, and a stripper that guessed would silently delete real code and make every
+        /// negative control below pass over less and less text. A line whose first non-space
+        /// characters are `//` cannot be any of those things.
+        /// </summary>
+        private static string StripJsLineComments(string js)
+        {
+            var kept = new List<string>();
+            foreach (var line in js.Split('\n'))
+            {
+                if (line.TrimStart().StartsWith("//", StringComparison.Ordinal)) continue;
+                kept.Add(line);
+            }
+            return string.Join("\n", kept);
+        }
+
+        /// <summary>One `interventions.jsonl` line in the shape the guard really writes.</summary>
+        private static string EventLine(string utc, string account, string eventType, string message)
+        {
+            return new JObject
+            {
+                ["timestamp_utc"] = utc,
+                ["account"] = account,
+                ["eventType"] = eventType,
+                ["mode"] = "shadow",
+                ["isArmed"] = true,
+                ["data"] = new JObject { ["message"] = message }
+            }.ToString(Newtonsoft.Json.Formatting.None);
+        }
+
+        /// <summary>`/api/connections`' shape: one entry per account, `connection` null when attached to none.</summary>
+        private static JObject Connections(params (string connection, string status)[] accounts)
+        {
+            var arr = new JArray();
+            int n = 0;
+            foreach (var a in accounts)
+            {
+                arr.Add(new JObject
+                {
+                    ["account"] = "ACC" + (n++),
+                    ["connection"] = a.connection == null ? JValue.CreateNull() : new JValue(a.connection),
+                    ["connectionStatus"] = a.status
+                });
+            }
+            return new JObject { ["success"] = true, ["count"] = arr.Count, ["accounts"] = arr };
         }
 
         public static int Main(string[] args)

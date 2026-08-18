@@ -145,6 +145,41 @@
   .tab.r1 { border-color: #a63; } .tab.r1 .tbadge { color: #ffbe76; }
   .tab.r2, .tab.r3 { border-color: #886; } .tab.r2 .tbadge, .tab.r3 .tbadge { color: #ddd18a; }
   .tab.r5 .tbadge { color: #8ad18a; }
+
+  /* P2-127 slice 4. Section 4 decision 4's system row, and section 4's bottom EVENTS
+     region. The `.shell` above is a flex ROW, so the events pane takes the full width
+     by breaking the row -- section 4's ASCII drawing has it spanning both panes. */
+  .shell { flex-wrap: wrap; }
+  #eventspane { flex: 1 1 100%; width: 100%; margin-top: 14px;
+                border-top: 1px solid #333; padding-top: 8px; }
+  .paneheader { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+                color: var(--dim); margin-bottom: 6px; }
+  .scopenote { margin-left: 8px; text-transform: none; letter-spacing: 0; }
+  #systemrow { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; }
+  .scell { display: flex; align-items: baseline; gap: 6px; padding: 4px 10px;
+           border: 1px solid #333; border-radius: 4px; background: #1b1b1b; }
+  .scell .slabel { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+                   color: var(--dim); }
+  .scell .sbadge { font-size: 12px; font-weight: 600; }
+  /* Same rank-driven colouring as the tabs, from the SAME scale, and never re-derived
+     here: two severity scales on one page is two things to keep in step. */
+  .scell.r0 { border-color: #a33; } .scell.r0 .sbadge { color: #ff8a8a; }
+  .scell.r1 { border-color: #a63; } .scell.r1 .sbadge { color: #ffbe76; }
+  .scell.r2, .scell.r3 { border-color: #886; }
+  .scell.r2 .sbadge, .scell.r3 .sbadge { color: #ddd18a; }
+  .scell.r5 { border-color: #4a6; } .scell.r5 .sbadge { color: #8ad18a; }
+  #events table { width: 100%; border-collapse: collapse; }
+  #events td { padding: 2px 8px 2px 0; vertical-align: top; border-bottom: 1px solid #262626; }
+  #events .ewhen { color: var(--dim); font-family: Consolas, monospace; font-size: 11px;
+                   white-space: nowrap; }
+  #events .ewho { color: var(--dim); font-size: 11px; white-space: nowrap; }
+  #events .etype { font-family: Consolas, monospace; font-size: 11px; white-space: nowrap; }
+  #events .emsg { font-size: 12px; }
+  #events .ecount { font-size: 11px; color: var(--dim); white-space: nowrap; }
+  #events tr.r0 .etype { color: #ff8a8a; font-weight: 600; }
+  #events tr.r1 .etype { color: #ffbe76; }
+  #events tr.r2 .etype, #events tr.r3 .etype { color: #ddd18a; }
+  #events tr.r5 .etype { color: #8ad18a; }
   #fleettree ul { list-style: none; margin: 0; padding: 0; }
   #fleettree li { padding: 0; margin: 0; }
   .fnode { display: flex; align-items: baseline; gap: 6px; padding: 3px 6px;
@@ -192,6 +227,17 @@
 
   <div id="inspector">
     <div id="banner"></div>
+    <!-- P2-127 slice 4. Section 4 decision 4: "Selecting nothing shows the system row
+         (feed / guard / copier) -- which is where P3-34's two-or-three-indicator
+         problem lives."
+
+         ⚠️ THREE CELLS, NEVER ONE. Section 2.1 records the reason in a line: "P3-34
+         (open) | the copier is ENFORCING regardless of guard mode | a single 'armed'
+         indicator would be a lie". MEASURED on this box 2026-08-17: the guard was
+         mode "shadow" and armed -- evaluating everything, enforcing nothing -- while
+         the copier was mode "live" with isActing TRUE, in the same process at the
+         same instant. Every rank and badge below comes from BridgeSystemRow. -->
+    <div id="systemrow"></div>
     <!-- Outcomes live OUTSIDE #copier on purpose. The page re-renders every 5s, so
          anything written inside a section is gone before it can be read. -->
     <div id="outcome"></div>
@@ -214,6 +260,25 @@
       <div id="copier"></div>
       <div id="content"></div>
     </div>
+  </div>
+
+  <!-- P2-127 slice 4. Section 4's bottom region: "EVENTS -- filtered to selection",
+       and the last unbuilt part of that layout.
+
+       ⚠️ ALWAYS VISIBLE, never behind a tab. Section 4.2 killed top-level nav tabs
+       because they hide state, and this pane is where a box-wide problem shows up
+       without being looked for -- so it sits below both panes rather than inside
+       the inspector.
+
+       ⚠️ AND IT IS FILTERED WITHOUT BEING BLINDED. Events logged with no account
+       (LogFromComponent) or with the literal "SYSTEM" (LogEvent) are shown WHATEVER
+       is selected, because ATM_MONITOR_NO_DISPATCHER, ATM_BRACKET_RESTORE_FAILED and
+       every ERROR are logged that way -- and clicking an account is the normal way to
+       use this page. BridgeEventsView decides all of it; measured input: the log was
+       43,766,928 bytes for one day, 86% of it per-tick telemetry. -->
+  <div id="eventspane">
+    <div class="paneheader">EVENTS<span id="eventscope" class="scopenote"></span></div>
+    <div id="events" class="note">loading recent events…</div>
   </div>
 </main>
 
@@ -1274,14 +1339,91 @@ function applyTabs() {
   });
 }
 
+// P2-127 slice 4. Section 4 decision 4's system row: feed / guard / copier, three
+// cells, always. ⚠️ NEVER FOLDED INTO ONE "armed" light -- section 2.1 records that
+// as a lie, because the copier enforces regardless of guard mode, and this box was
+// measured guard-shadow / copier-live-and-acting on 2026-08-17.
+function renderSystemRow(data) {
+  var el = document.getElementById("systemrow");
+  var cells = (data && data.system) || [];
+  if (!cells.length) {
+    el.innerHTML = '<div class="banner bad">The bridge returned no system row. Three '
+      + 'cells are expected; none means the route or the fold is broken, not that the '
+      + 'feed, the guard and the copier are all fine.</div>';
+    return;
+  }
+  // No sorting: section 4's order is feed, guard, copier, and the class already made it.
+  el.innerHTML = cells.map(function (c) {
+    return '<div class="scell r' + Number(c.rank) + '" title="' + esc(c.detail || "")
+      + '"><span class="slabel">' + esc(c.label || c.id) + '</span>'
+      + '<span class="sbadge">' + esc(c.badge || "") + '</span></div>';
+  }).join("");
+}
+
+// P2-127 slice 4. Section 4's EVENTS region. Everything shown here was decided by
+// BridgeEventsView: which lines are telemetry, which repeats collapse, what the
+// selection includes, and how bad each one is. This renders the list as given.
+function renderEvents(data) {
+  var rows = (data && data.events) || [];
+  var scope = document.getElementById("eventscope");
+  scope.textContent = selectedAccount
+    ? "— " + selectedAccount + ", plus everything logged box-wide"
+    : "— all accounts";
+
+  var el = document.getElementById("events");
+  if (!rows.length) {
+    // ⚠️ SAY WHY IT IS EMPTY. The pane reads a bounded tail of a log that is 86%
+    // per-tick telemetry, so "nothing here" means "nothing notable in the recent
+    // tail", NOT "nothing has happened" -- and an operator who reads the second
+    // meaning into a blank pane has been misled by it.
+    el.className = "note";
+    el.textContent = "Nothing notable in the recent log tail. Routine per-tick "
+      + "telemetry (subscriptions, order and position updates) is not shown here — "
+      + "it is state, and it is on the rows above.";
+    return;
+  }
+  el.className = "";
+  // No .sort() and no .reverse(): newest-first is applied by the class AFTER repeats
+  // are collapsed, so re-ordering here would undo the one decision whose ORDER matters.
+  el.innerHTML = '<table>' + rows.map(function (r) {
+    var when = String(r.utc || "").replace("T", " ").replace(/\.\d+Z?$/, "").replace("Z", "");
+    var count = Number(r.count) > 1 ? ("x" + Number(r.count)) : "";
+    return '<tr class="r' + Number(r.rank) + '">'
+      + '<td class="ewhen">' + esc(when) + '</td>'
+      + '<td class="ewho">' + esc(r.isSystemScoped ? "system" : (r.account || "")) + '</td>'
+      + '<td class="etype">' + esc(r.eventType || "") + '</td>'
+      + '<td class="ecount">' + esc(count) + '</td>'
+      + '<td class="emsg">' + esc(r.message || "") + '</td>'
+      + '</tr>';
+  }).join("") + '</table>';
+}
+
 function loadTabs() {
   var q = selectedAccount ? ("?account=" + encodeURIComponent(selectedAccount)) : "";
   api("/api/ui/inspector" + q)
-    .then(renderTabs)
+    .then(function (data) {
+      // One payload, three regions. Separate fetches could disagree about which
+      // account is selected, and the strip would then describe one account while the
+      // events pane described another.
+      renderTabs(data);
+      renderSystemRow(data);
+      renderEvents(data);
+    })
     .catch(function (e) {
       document.getElementById("tabstrip").innerHTML =
         '<div class="banner bad">Inspector tabs unavailable: ' + esc(e.message)
         + '. The panes below are unfiltered.</div>';
+      // ⚠️ SAID, in both places. A stale system row and a stale events pane look
+      // exactly like a quiet, healthy box -- which is the failure this page exists
+      // to prevent, so neither region may keep rendering last poll's answer in
+      // silence after the fetch stopped working.
+      document.getElementById("systemrow").innerHTML =
+        '<div class="banner bad">System row unavailable: ' + esc(e.message)
+        + '. The feed, guard and copier states below are NOT current.</div>';
+      var ev = document.getElementById("events");
+      ev.className = "note bad";
+      ev.textContent = "Events unavailable: " + e.message
+        + ". This pane is not current, so an absence of events here means nothing.";
     });
 }
 

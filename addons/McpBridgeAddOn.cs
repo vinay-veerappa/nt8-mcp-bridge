@@ -591,13 +591,42 @@ namespace NinjaTrader.NinjaScript.AddOns
                         ? 0
                         : ((int?)snapshot["system"]["configConflicts"] ?? 0);
 
+                    // P2-127 slice 4. The last two regions of §4 -- the events pane and decision 4's
+                    // system row -- ride on THIS route rather than two new ones: the page already
+                    // polls, and one payload cannot disagree with itself about which account is
+                    // selected. Both are computed by classes the test project executes; every line
+                    // below is glue.
+                    var eventRows = BridgeEventsView.Build(
+                        ReadInterventionTail(EventsTailBytes), selected, EventsPaneMax);
+
+                    // ONCE. `GetConnectionFeatures` walks all 97 accounts and reads four OCO
+                    // capability flags off each provider; calling it twice to coalesce a cast would
+                    // double that on every 5-second poll.
+                    var connectionsRaw = GetConnectionFeatures(null);
+                    var connectionsJson = connectionsRaw as JObject
+                        ?? (connectionsRaw == null ? null : JObject.FromObject(connectionsRaw));
+
+                    var systemCells = BridgeSystemRow.Build(
+                        connectionsJson,
+                        new JObject
+                        {
+                            ["mode"] = guardJson["mode"],
+                            ["isArmed"] = guardJson["isArmed"],
+                            ["unevaluatedRules"] = guardJson["unevaluatedRules"]
+                        },
+                        snapshot == null ? null : snapshot["system"]);
+
                     var tabCamel = JsonSerializer.Create(GuardSnapshotJson.UiJsonSettings);
                     return new JObject
                     {
                         ["takenUtc"] = DateTime.UtcNow.ToString("o"),
                         ["selectedAccount"] = selected,
                         ["tabs"] = JArray.FromObject(
-                            BridgeInspectorTabs.Build(copierRows, ruleRows, selected, conflicts), tabCamel)
+                            BridgeInspectorTabs.Build(copierRows, ruleRows, selected, conflicts), tabCamel),
+                        ["events"] = JArray.FromObject(eventRows, tabCamel),
+                        ["eventsWorstRank"] = BridgeEventsView.WorstRankOf(eventRows),
+                        ["system"] = JArray.FromObject(systemCells, tabCamel),
+                        ["systemWorstRank"] = BridgeSystemRow.WorstRankOf(systemCells)
                     };
                 }
 
@@ -6169,6 +6198,73 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
             catch { }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // P2-127 slice 4: the EVENTS pane's source.
+        //
+        // `interventions.jsonl` is the guard's structured audit record and every component writes to
+        // it through `RiskGuardAddOn.LogFromComponent`. It is also the ONLY source: the bridge's
+        // `/api/events/stream` is a 15-second heartbeat carrying no events, and the core has no
+        // in-memory recent-events accessor. Reading the audit record has a property worth keeping --
+        // the pane shows exactly what an after-the-fact investigation would show.
+        //
+        // ⚠️ MEASURED BEFORE ANY OF THIS WAS SIZED, 2026-08-17: the file is 43 766 928 bytes for ONE
+        // DAY, and its last 3 MB held 10 877 lines of which 8 148 were `SUBSCRIBE`. So it is read as a
+        // bounded TAIL, never whole -- and 256 KB is roughly 900 lines, which after dropping the
+        // measured 86% telemetry and collapsing repeats is comfortably more than the pane shows. A
+        // quiet period can leave the pane empty, and that is the honest answer rather than a reason to
+        // read more on every poll.
+        private const int EventsTailBytes = 256 * 1024;
+        private const int EventsPaneMax = 60;
+
+        private static string InterventionLogFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "interventions.jsonl");
+
+        /// <summary>
+        /// The last `maxBytes` of the intervention log, oldest line first, or an empty list.
+        ///
+        /// ⚠️ `FileShare.ReadWrite` IS LOAD-BEARING, not defensive habit. The guard's own five-second
+        /// sweep appends to this file, and opening it without sharing WRITE would either throw here or
+        /// make the guard's flush fail -- a page poll costing the audit record is a strictly worse
+        /// trade than an empty pane.
+        ///
+        /// ⚠️ AND THE FIRST LINE OF A TAIL IS DROPPED. Seeking into the middle of a file lands
+        /// mid-line, so line one is a fragment; `BridgeEventsView.ParseLine` would return null for it
+        /// anyway, but dropping it here keeps that from being an accident of the parser. The LAST line
+        /// can also be partial -- the file is being appended to as it is read -- and is handled the
+        /// same way, by the parser returning null rather than by this method guessing.
+        /// </summary>
+        private static List<string> ReadInterventionTail(int maxBytes)
+        {
+            var lines = new List<string>();
+            try
+            {
+                string path = InterventionLogFile;
+                if (!File.Exists(path)) return lines;
+
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    long start = Math.Max(0, stream.Length - maxBytes);
+                    bool partialFirstLine = start > 0;
+                    stream.Seek(start, SeekOrigin.Begin);
+
+                    using (var reader = new StreamReader(stream, new UTF8Encoding(false)))
+                    {
+                        if (partialFirstLine) reader.ReadLine();
+                        string line;
+                        while ((line = reader.ReadLine()) != null)
+                            lines.Add(line);
+                    }
+                }
+            }
+            catch
+            {
+                // An unreadable log is an empty pane, never an exception into the route: this endpoint
+                // also serves the fleet tabs and the system row, and losing those to a log read would
+                // hide the guard's state to report on the reporting.
+                return lines;
+            }
+            return lines;
         }
 
         private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");
