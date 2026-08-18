@@ -4780,24 +4780,113 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // Build the fleet tree from the same enriched rows the detail view serves so the
             // summary cannot disagree with the rows beneath it.
-            List<string> allAccounts = new List<string>();
-            if (NinjaTrader.Cbi.Account.All != null)
-            {
-                // .ToList() for the same reason GetConnectionFeatures does it: NT8 mutates
-                // Account.All on its own thread and this runs on an HTTP one, so enumerating
-                // it live can throw mid-payload. Copy, then read.
-                foreach (NinjaTrader.Cbi.Account account in NinjaTrader.Cbi.Account.All.ToList())
-                {
-                    if (account != null && !string.IsNullOrEmpty(account.Name))
-                        allAccounts.Add(account.Name);
-                }
-            }
+            var accountInfo = ClassifyDormantAccounts();
+            List<string> allAccounts = accountInfo.Item1;
+            HashSet<string> dormantAccounts = accountInfo.Item2;
 
             payload["fleet"] = JArray.FromObject(
-                BridgeFleetView.Build(BridgeFleetView.RowsFromSnapshot(rows), allAccounts),
+                BridgeFleetView.Build(BridgeFleetView.RowsFromSnapshot(rows), allAccounts, dormantAccounts),
                 camel);
+            payload["dormantCount"] = dormantAccounts.Count;
+            payload["accountCount"] = allAccounts.Count;
 
             return payload;
+        }
+
+        /// <summary>
+        /// P2-127 follow-up (2026-08-18). The dormant-account classification, kept OUT of
+        /// <c>GetCopierSnapshot</c> so that method stays shallow enough for the harness's
+        /// brace-matching source gate to read it whole.
+        ///
+        /// Measured on this box: 91 of 97 accounts have `Connection == null` -- the broker
+        /// never delivered them on this login -- and the 6 that do have a connection are
+        /// exactly the 6 with a non-zero balance. The discriminator is `a.Connection == null`,
+        /// and it is MEASURED, not assumed: the bridge groups Account.All by
+        /// ReferenceEquals(a.Connection) and finds exactly one group (TPT, Connected,
+        /// accountCount 6).
+        ///
+        /// ⚠️ THE INVARIABLE, enforced here at the classification site: an account with an
+        /// open position, a working order or a live guard finding is NEVER dormant, whatever
+        /// the filter setting. A filter on a safety surface must not be able to conceal the
+        /// thing the surface exists for. `BridgeFleetView` also refuses to flag any account
+        /// in a copy relationship, so the two halves cannot disagree.
+        ///
+        /// ⚠️ NOT `netLiquidation == 0`: TAKEPROFIT812318516, 250734226 and 938288923 all
+        /// have thousands of real order updates and currently report zero equity. GuardRules
+        /// warns about exactly this -- an account momentarily reporting zero equity because
+        /// its connection has not synced must never be hidden without saying so.
+        /// </summary>
+        private Tuple<List<string>, HashSet<string>> ClassifyDormantAccounts()
+        {
+            List<string> allAccounts = new List<string>();
+            HashSet<string> dormantAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (NinjaTrader.Cbi.Account.All == null)
+                return Tuple.Create(allAccounts, dormantAccounts);
+
+            // .ToList() for the same reason GetConnectionFeatures does it: NT8 mutates
+            // Account.All on its own thread and this runs on an HTTP one, so enumerating
+            // it live can throw mid-payload. Copy, then read.
+            foreach (NinjaTrader.Cbi.Account account in NinjaTrader.Cbi.Account.All.ToList())
+            {
+                if (account == null || string.IsNullOrEmpty(account.Name))
+                    continue;
+                allAccounts.Add(account.Name);
+
+                if (account.Connection != null)
+                    continue;
+
+                // No connection object. Dormant UNLESS something live is attached: an open
+                // position, a working order, or a live guard finding (a lockout that binds,
+                // or a position-guard FSM that is not Flat). Each is checked defensively --
+                // this runs on an HTTP thread against NT8 collections.
+                // ⚠️ EVERY CATCH BELOW FAILS CLOSED, AND THE DIRECTION IS THE POINT. These flags
+                // decide whether an account may be HIDDEN. If a read throws we do not know whether
+                // anything live is attached, and "unreadable" must never resolve to "safe to hide" --
+                // that is a filter on a safety surface concealing the thing it exists to reveal.
+                // Setting the flag TRUE on failure keeps the account visible, which costs one row.
+                // An empty catch leaving it FALSE hides an account that may hold an open position.
+                bool hasPosition = false, hasWorkingOrder = false;
+                try
+                {
+                    foreach (Position p in account.Positions)
+                        if (p != null && Math.Abs(p.Quantity) > 0) { hasPosition = true; break; }
+                }
+                catch { hasPosition = true; }
+                try
+                {
+                    foreach (Order o in account.Orders)
+                        if (o != null && BridgeOrderLiveness.WouldBeStrandedByDisconnect(o.OrderState.ToString()))
+                        { hasWorkingOrder = true; break; }
+                }
+                catch { hasWorkingOrder = true; }
+
+                bool hasGuardFinding = false;
+                try
+                {
+                    if (RiskGuardAddOn.Instance != null)
+                    {
+                        if (RiskGuardAddOn.Instance.IsAccountLocked(account.Name))
+                            hasGuardFinding = true;
+                        else
+                        {
+                            foreach (var fsm in RiskGuardAddOn.Instance.GetFsmSnapshots())
+                            {
+                                if (fsm != null
+                                    && string.Equals(fsm.AccountName, account.Name, StringComparison.OrdinalIgnoreCase)
+                                    && !string.Equals(fsm.State, "Flat", StringComparison.OrdinalIgnoreCase))
+                                { hasGuardFinding = true; break; }
+                            }
+                        }
+                    }
+                }
+                catch { hasGuardFinding = true; }
+
+                if (!hasPosition && !hasWorkingOrder && !hasGuardFinding)
+                    dormantAccounts.Add(account.Name);
+            }
+
+            return Tuple.Create(allAccounts, dormantAccounts);
         }
 
         /// <summary>

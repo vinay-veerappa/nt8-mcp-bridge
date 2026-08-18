@@ -36,7 +36,13 @@
 
       Why each file is here is recorded in its own header, which is where it stays true.
     -->
-    <Compile Include="../addons/*.cs" Exclude="../addons/McpBridgeAddOn.cs" />
+    <!-- IndicatorTestAddOn.cs is excluded for the SAME reason as McpBridgeAddOn.cs: it derives
+         from AddOnBase and uses NinjaTrader.Cbi/Data/Gui/Core, none of which the harness stubs.
+         Added 2026-08-18 by bfb1c99/60bca1c, which the glob then pulled into the test build and
+         broke it with 10 CS0234/CS0246 errors. ⚠️ Neither commit had reached CI, so nothing had
+         reported the break, and a no-build run of the stale binary still printed a
+         clean pass, which is exactly what a working suite looks like. -->
+    <Compile Include="../addons/*.cs" Exclude="../addons/McpBridgeAddOn.cs;../addons/IndicatorTestAddOn.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <!-- cp1252 is native on net48 (NT8) but NOT on net8.0-windows. F-17's mojibake repair
          reads the code page, so the harness that exercises BridgeConnectionPlan must be

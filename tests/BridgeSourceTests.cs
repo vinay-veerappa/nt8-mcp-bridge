@@ -1432,11 +1432,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
             TestP2138_ThePageRendersTheFleetTree();
+            // P2-126. The page dispatches the copier actions the backend already accepts.
+            TestP2126_ThePageDispatchesTheCopierActions();
+            // P2-127 follow-up. The dormant-account filter.
+            TestP2127_DormantAccountsAreFlaggedNotHidden();
+            TestP2127_ThePageRendersTheDormantFilter();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 113;
+            const int declared = 116;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3601,9 +3606,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "P1-131: the orders route keeps no terminal-state list of its own ({0} found in {1} chars)",
                 inlineStateTests.Count, getOrders.Length));
 
-            // Both stranding call sites go through the one predicate.
-            Assert(Regex.Matches(code, @"BridgeOrderLiveness\.WouldBeStrandedByDisconnect\b").Count == 2,
-                "P1-131: both workingOrders counts consult the shared predicate");
+            // Both stranding call sites go through the one predicate. P2-127 follow-up added a
+            // THIRD legitimate site: the dormant-account classifier asks the same question of
+            // every connection-less account ("is there anything at the broker I must not hide?").
+            // The count is pinned so a future hand-rolled list is caught, and the classifier's
+            // use is asserted by name so the third site is not mistaken for a regression.
+            Assert(Regex.Matches(code, @"BridgeOrderLiveness\.WouldBeStrandedByDisconnect\b").Count == 3,
+                "P1-131: all workingOrders counts consult the shared predicate (2 report sites "
+                + "+ the dormant-account classifier)");
+            Assert(Regex.IsMatch(code, @"ClassifyDormantAccounts[\s\S]*?WouldBeStrandedByDisconnect"),
+                "P1-131: the dormant classifier uses the same predicate -- an account with a "
+                + "working order is never hidden");
             Assert(Regex.Matches(code, @"BridgeOrderLiveness\.IsTerminal\b").Count == 1,
                 "P1-131: the orders filter consults it too");
         }
@@ -3655,6 +3668,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                    && tabs[2].Id == BridgeInspectorTabs.RareTab,
                 string.Format("P2-127: in section 4's order -- copier, risk, rare (got {0}, {1}, {2})",
                     tabs[0].Id, tabs[1].Id, tabs[2].Id));
+
+            // P2-127 follow-up (2026-08-18). The tab's LABEL is "Settings", not "Rare". Commit
+            // a983455 moved the guard config editor behind this tab, and a tab labelled "Rare"
+            // whose badge read "No conflicts (0)" made the operator conclude the settings had
+            // been lost. The label is the reachability surface: it must say what the tab holds.
+            var settings = tabs.FirstOrDefault(t => t.Id == BridgeInspectorTabs.RareTab);
+            Assert(settings != null && settings.Label == "Settings",
+                "P2-127: the config tab is labelled 'Settings' -- the editor it holds is the "
+                + "guard config, and a label that does not say so is how the operator concluded "
+                + "the settings had been lost (got '" + (settings == null ? "<null>" : settings.Label) + "')");
 
             foreach (var t in tabs)
                 Assert(!string.IsNullOrEmpty(t.Badge) && !string.IsNullOrEmpty(t.Reason),
@@ -4212,6 +4235,154 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(!Regex.IsMatch(html, @"rank\s*===?\s*\d"),
                 "P2-138: and the page NEVER compares a rank to a literal -- the ONE ordering is "
                 + "computed in a class the harness executes, not re-decided in JavaScript");
+        }
+
+        /// <summary>
+        /// P2-126. The page dispatches the copier actions the backend already accepts.
+        ///
+        /// `POST /api/copier/config` accepts 14 actions; the page used to dispatch 2
+        /// (`set {isEnabled}` and `set_group {isEnabled}`), so a relationship could be
+        /// toggled and nothing else. This is a SOURCE gate over `ui/index.html` -- the
+        /// page is in no test build -- and it proves the wiring exists, not that it
+        /// behaves. The behaviour is the live check in the ticket.
+        ///
+        /// ⚠️ THE TWO RULES ARE ASSERTED AS NEGATIVES. A newly created relationship lands
+        /// `IsEnabled: false`, and arming is a separate deliberate act -- so the create
+        /// path must never send `armedForLive` and must send `isEnabled: false`. A create
+        /// that armed as a side effect would pass every positive assertion.
+        /// </summary>
+        private static void TestP2126_ThePageDispatchesTheCopierActions(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-126: the page dispatches the copier actions (SOURCE gate)");
+
+            string page = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "..", "ui", "index.html"));
+            Assert(File.Exists(page), "the served page is readable at " + page);
+            if (!File.Exists(page)) return;
+            string html = File.ReadAllText(page);
+
+            // The actions the backend accepts (McpBridgeAddOn.cs:4373-4392) that the page
+            // now dispatches. Each is asserted as the action NAME in a request body, so a
+            // rename in the page breaks the gate.
+            Assert(Regex.IsMatch(html, @"action:\s*""set""") && Regex.IsMatch(html, @"action:\s*""remove"""),
+                "P2-126: the page can create and delete a relationship (set/remove)");
+            Assert(Regex.IsMatch(html, @"action:\s*""set_group""")
+                   && Regex.IsMatch(html, @"action:\s*""remove_group"""),
+                "P2-126: and it can enable/disable and delete a group");
+            Assert(Regex.IsMatch(html, @"action:\s*""add_follower_to_group""")
+                   && Regex.IsMatch(html, @"action:\s*""remove_follower_from_group"""),
+                "P2-126: and it can add and remove a follower from a group");
+            Assert(Regex.IsMatch(html, @"action:\s*""set_mode"""),
+                "P2-126: and it can set the copier's global mode");
+
+            // The two rules, as negatives. The create path must not arm and must not
+            // enable: a new relationship lands disabled and not armed, and arming is a
+            // separate deliberate act.
+            int create = html.IndexOf("function createRelationship(", StringComparison.Ordinal);
+            int createEnd = create < 0 ? -1 : html.IndexOf("\nfunction ", create + 10, StringComparison.Ordinal);
+            string createFn = (create >= 0 && createEnd > create)
+                ? StripJsLineComments(html.Substring(create, createEnd - create)) : "";
+            Assert(createFn.Length > 100, string.Format(
+                "P2-126: the create-relationship function is locatable for inspection ({0} chars read)",
+                createFn.Length));
+            Assert(createFn.Length > 100 && !createFn.Contains("armedForLive"),
+                "P2-126: the create path NEVER sends armedForLive -- arming is a separate "
+                + "deliberate act, never a side effect of creation");
+            Assert(createFn.Length > 100 && createFn.Contains("isEnabled: false"),
+                "P2-126: and a new relationship lands IsEnabled:false -- the two rules of "
+                + "the ticket, asserted as the absence of the unsafe direction");
+
+            // The inline row actions: ratio and sizing mode are section 4 decision 3's
+            // frequent actions, so they live on the row, not in the inspector.
+            Assert(html.Contains("data-do=\"delete\"") && html.Contains("data-do=\"edit\"")
+                   && html.Contains("data-do=\"saveedit\""),
+                "P2-126: each row carries delete and the inline ratio/sizing editor");
+            Assert(html.Contains("quantityRatio") && html.Contains("sizingMode"),
+                "P2-126: and the inline editor writes ratio and sizing mode as a DIFF, "
+                + "naming only the fields the operator changed");
+        }
+
+        /// <summary>
+        /// P2-127 follow-up (2026-08-18). The dormant-account filter.
+        ///
+        /// The tree showed all 97 accounts because the caller passed every `Account.All` name
+        /// into `BridgeFleetView.Build` and the class had no filter. The discriminator is
+        /// `a.Connection == null` -- measured, not assumed: 91 of 97 accounts have no
+        /// connection object on this login, and the 6 that do are exactly the 6 with a
+        /// non-zero balance. The classification happens at the call site (it reads an NT8
+        /// type); this class receives the RESULT as data and stays testable.
+        ///
+        /// ⚠️ THE INVARIABLE: an account with an open position, a working order or a live
+        /// guard finding is NEVER dormant. And an account in a copy relationship is never
+        /// flagged either -- the flag is only ever set on UNLINKED children.
+        /// </summary>
+        private static void TestP2127_DormantAccountsAreFlaggedNotHidden()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: dormant accounts are flagged as data, never hidden by the class");
+
+            var tree = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5) },
+                new List<string> { "Sim101", "SimCopy2", "Dormant1", "Dormant2" },
+                new HashSet<string>(new[] { "Dormant1", "Dormant2" }, StringComparer.OrdinalIgnoreCase));
+
+            var unlinked = Named(tree, BridgeFleetView.UnlinkedName);
+            Assert(unlinked != null, "P2-127: precondition -- the unlinked node is present");
+            if (unlinked == null) return;
+
+            var d1 = Named(unlinked.Children, "Dormant1");
+            var d2 = Named(unlinked.Children, "Dormant2");
+            Assert(d1 != null && d1.Dormant && d2 != null && d2.Dormant,
+                "P2-127: an account the caller classified as dormant carries Dormant=true");
+
+            // The negative control: an account in a copy relationship is NEVER dormant,
+            // even if the caller's set names it. The tree exists to show configured copies.
+            var simCopy2 = Named(unlinked.Children, "SimCopy2");
+            Assert(simCopy2 == null,
+                "P2-127: SimCopy2 is in a relationship, so it is not under Unlinked at all");
+            var sim101 = Named(tree, "Sim101");
+            Assert(sim101 != null && sim101.Children.Count == 1
+                   && !sim101.Children[0].Dormant,
+                "P2-127: a follower in a copy relationship is never flagged dormant");
+
+            // The default (no dormant set) leaves every account visible -- the filter is
+            // opt-in at the call site, so a caller that does not classify changes nothing.
+            var plain = BridgeFleetView.Build(
+                new List<FleetCopierRow> { Row("Sim101", "SimCopy2", null, 5) },
+                new List<string> { "Sim101", "SimCopy2", "Dormant1" });
+            var plainUnlinked = Named(plain, BridgeFleetView.UnlinkedName);
+            Assert(plainUnlinked != null && Named(plainUnlinked.Children, "Dormant1") != null
+                   && !Named(plainUnlinked.Children, "Dormant1").Dormant,
+                "P2-127: without a dormant set, no account is flagged -- the filter is opt-in");
+        }
+
+        /// <summary>
+        /// P2-127 follow-up. The page renders the dormant filter: a stated count, a toggle,
+        /// and a hidden set that is never silent. SOURCE gate over ui/index.html.
+        /// </summary>
+        private static void TestP2127_ThePageRendersTheDormantFilter(
+            [System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-127: the page renders the dormant filter (SOURCE gate)");
+
+            string page = Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(thisFile), "..", "ui", "index.html"));
+            Assert(File.Exists(page), "the served page is readable at " + page);
+            if (!File.Exists(page)) return;
+            string html = File.ReadAllText(page);
+
+            Assert(html.Contains("data.dormantCount") && html.Contains("data.accountCount"),
+                "P2-127: the page reads the dormant and total counts the route now sends");
+            Assert(html.Contains("dormtog") && html.Contains("showDormant"),
+                "P2-127: and it renders a toggle that reveals the dormant accounts");
+            Assert(html.Contains("n.dormant"),
+                "P2-127: and each node carries the dormant flag the route classified");
+            Assert(html.Contains("not delivered by the broker on this login"),
+                "P2-127: and the filter is labelled as what it measures -- dormant means "
+                + "the broker did not deliver the account on this login, not that it is blown");
         }
 
         // ==============================================================================

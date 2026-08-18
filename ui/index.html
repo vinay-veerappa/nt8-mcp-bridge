@@ -94,6 +94,17 @@
   .act { padding: 3px 8px; font-size: 12px; margin-right: 5px; white-space: nowrap; }
   .act[disabled] { opacity: .4; cursor: not-allowed; }
   .act.warn { border-color: var(--amber); color: var(--amber); }
+  /* P2-126. Inline row editing (ratio + sizing mode) and the group cards. The
+     rowedit sits inside the Actions cell so the frequent actions stay on the row
+     (section 4 decision 3) and the set-rarely config stays in the inspector. */
+  .rowedit { display: flex; gap: 4px; margin-top: 4px; align-items: center; flex-wrap: wrap; }
+  .rowedit input.ratio { width: 64px; padding: 2px 4px; }
+  .rowedit select.sizing { width: 120px; padding: 2px 4px; }
+  .groupcard { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px;
+               margin-bottom: 8px; background: var(--panel); }
+  .groupcard ul { margin: 6px 0; padding-left: 18px; }
+  .groupcard .cfgbar { margin-top: 6px; }
+  .groupcard select.addfollower { width: 180px; padding: 2px 4px; }
   .banner.ok { border-color: var(--green); }
   /* P1-125. The system row's severity vocabulary, and it is the ONLY thing this page
      decides about the copier's state: the name comes from CopierEnforcementView, which
@@ -258,6 +269,18 @@
     <div id="tabpanes">
       <div id="config"></div>
       <div id="copier"></div>
+      <!-- P2-126. The copier's global mode and the group cards live OUTSIDE #copier
+           for the same reason #config and #newrel do: the copier pane re-renders
+           every 5s and its innerHTML would wipe anything nested inside it. Mode is
+           global (it affects every relationship) and groups are the only grouping,
+           so both render on every poll, never on a click. -->
+      <div id="copiermode" class="filter"></div>
+      <div id="groups"></div>
+      <!-- P2-126. The create-relationship form lives OUTSIDE #copier for the same
+           reason #config does: the copier pane re-renders every 5s, and a form
+           rebuilt under the operator's cursor loses whatever they were typing. It
+           is rendered on load and on Refresh, never on the poll. -->
+      <div id="newrel"></div>
       <div id="content"></div>
     </div>
   </div>
@@ -549,6 +572,24 @@ var VLABEL = {
   Shadow: "shadow", Match: "match", Idle: "idle"
 };
 
+// P2-126. The sizing modes the engine accepts, in the enum's order. The page
+// renders the CURRENT mode as selected and offers the rest; an unrecognised
+// stored mode stays visible and selected (same rule as the guard config's
+// selects -- a value outside the list is the most interesting thing on the row).
+var SIZING_MODES = ["QuantityRatio", "FixedLot", "NetLiquidationRatio",
+                    "AvailableCashPercent", "PerTickerMatrix"];
+function sizingOptions(current) {
+  var cur = String(current || "QuantityRatio");
+  var seen = false, h = "";
+  for (var i = 0; i < SIZING_MODES.length; i++) {
+    if (SIZING_MODES[i] === cur) seen = true;
+    h += '<option' + (SIZING_MODES[i] === cur ? ' selected' : '') + '>'
+       + esc(SIZING_MODES[i]) + '</option>';
+  }
+  if (!seen) h += '<option selected>' + esc(cur) + '</option>';
+  return h;
+}
+
 // ⚠️ A metric with no samples is NOT zero. These are session-scoped and reset on
 // a recompile, so `0 ms` for a copier that has never filled is the P1-22 defect
 // restored -- it was once misdiagnosed as a broken measurement and cost two
@@ -619,6 +660,12 @@ var selectedAccount = null;
 // ordering -- 199 lines with a mutation battery, because two incoming severity scales
 // disagree about which end is bad -- so this renders the list it is given, in the order
 // it is given, and re-derives nothing. The badge is coloured by the NAME core sent.
+//
+// P2-127 follow-up. A dormant account (Connection == null, no position, no order, no
+// guard finding) is hidden by default behind a stated count and a toggle. The flag is
+// DATA the route classified; this renderer only skips it.
+var showDormant = false;   // the dormant-account filter; the hidden count is always stated
+
 function fleetNodeHtml(n) {
   var sel = (n.kind === "account" && n.name === selectedAccount) ? " sel" : "";
   var badgeClass = "b-" + String(n.badge || "").toLowerCase().replace(/[^a-z]/g, "");
@@ -629,12 +676,19 @@ function fleetNodeHtml(n) {
            + '<span class="fname">' + esc(n.name) + "</span>"
            + role
            + (n.badge ? '<span class="fbadge ' + badgeClass + '">' + esc(n.badge) + "</span>" : "")
+           + (n.dormant ? '<span class="meta" title="not delivered by the broker on this login">dormant</span>' : "")
            + "</div>";
 
   var kids = n.children || [];
   if (kids.length) {
     html += '<ul class="fkids">';
-    for (var i = 0; i < kids.length; i++) html += fleetNodeHtml(kids[i]);
+    for (var i = 0; i < kids.length; i++) {
+      var kid = kids[i];
+      // P2-127 follow-up. Dormant accounts are hidden unless the toggle is on. The
+      // count is stated above the tree, so a hidden set is never silent.
+      if (kid.dormant && !showDormant) continue;
+      html += fleetNodeHtml(kid);
+    }
     html += "</ul>";
   }
   return html + "</li>";
@@ -644,6 +698,10 @@ function renderFleetTree(data) {
   var el = document.getElementById("fleettree");
   if (!el) return;
 
+  // P2-126. Kept so the group cards can build their follower picker from the same
+  // account list the tree renders, without a second fetch.
+  lastFleet = (data && data.fleet) || lastFleet;
+
   var nodes = data && data.fleet;
   if (!nodes || !nodes.length) {
     // Not an absence: a page that renders nothing here reads as "no accounts",
@@ -652,7 +710,20 @@ function renderFleetTree(data) {
     return;
   }
 
-  var html = "<ul>";
+  // P2-127 follow-up. The dormant count is stated ALWAYS, even when zero -- a hidden
+  // set with no visible count is how an erasure and a default come to look identical.
+  var dormant = Number(data.dormantCount) || 0;
+  var total = Number(data.accountCount) || 0;
+  var shown = total - (showDormant ? 0 : dormant);
+  var filter = '<div class="filter note">'
+    + (showDormant
+        ? 'Showing all ' + total + ' accounts. <a id="dormtog">Hide the ' + dormant
+          + ' dormant</a>'
+        : 'Showing ' + shown + ' of ' + total + ' accounts — ' + dormant
+          + ' dormant (not delivered by the broker on this login). <a id="dormtog">Show all</a>')
+    + '</div>';
+
+  var html = filter + "<ul>";
   for (var i = 0; i < nodes.length; i++) html += fleetNodeHtml(nodes[i]);
   html += "</ul>";
 
@@ -661,6 +732,9 @@ function renderFleetTree(data) {
           + esc(selectedAccount) + "</b> — <a id=\"fclear\">show the whole fleet</a></div>";
   }
   el.innerHTML = html;
+
+  var tog = document.getElementById("dormtog");
+  if (tog) tog.addEventListener("click", function () { showDormant = !showDormant; load(); });
 
   var clear = document.getElementById("fclear");
   if (clear) clear.addEventListener("click", function () {
@@ -691,6 +765,7 @@ function selectedHas(leader, follower) {
 
 function renderCopier(data) {
   renderFleetTree(data);
+  renderMode(data);
 
   var el = document.getElementById("copier");
   if (!el) return;
@@ -783,12 +858,222 @@ function renderCopier(data) {
       + (r.isQuarantined
           ? '<button class="act warn" data-row="' + i + '" data-do="release">Release</button>'
           : '')
+      // P2-126. Delete is a row action, not an inspector action: it is the inverse
+      // of create, and create is a frequent action. It is never offered on a row
+      // whose follower is holding a position -- the confirmation states the
+      // consequence, and a delete that strands a live position is the one thing
+      // this page must not make easy.
+      + '<button class="act warn" data-row="' + i + '" data-do="delete">Delete</button>'
+      // P2-126. Ratio and sizing mode are section 4 decision 3's "frequent actions
+      // inline on the row". The rowedit is hidden until the operator opens it, so
+      // the Actions cell does not grow a control per row.
+      + '<div class="rowedit" id="rowedit-' + i + '" style="display:none">'
+      + '<input class="ratio" data-row="' + i + '" data-field="ratio" value="'
+      + esc(r.effectiveRatio || "") + '" title="ratio">'
+      + '<select class="sizing" data-row="' + i + '" data-field="sizing">'
+      + sizingOptions(r.sizingMode) + '</select>'
+      + '<button class="act" data-row="' + i + '" data-do="saveedit">Save</button>'
+      + '</div>'
+      + '<button class="act" data-row="' + i + '" data-do="edit">Edit</button>'
       + '</td>'
       + '</tr>';
   });
 
   el.innerHTML = html + '</tbody></table></section>';
   wireActions(rows);
+}
+
+// ── P2-126: create, groups, mode ─────────────────────────────────────────────
+// The backend accepts 14 copier actions; the page used to dispatch 2. These are
+// the rest, and they follow the same three rules as every write above: a request
+// names only what it changes, nothing is armed from here, and every confirmation
+// states the consequence.
+
+// The account list for the create form and the group follower picker. Built from
+// the fleet tree the route already sends, so this page never names a file path
+// and never constructs a domain object (section 5's one rule).
+function fleetAccountNames(data) {
+  var names = [];
+  function walk(nodes) {
+    (nodes || []).forEach(function (n) {
+      if (n.kind === "account") names.push(n.name);
+      walk(n.children);
+    });
+  }
+  walk(data && data.fleet);
+  return names;
+}
+
+// The create-relationship form. Rendered into #newrel on load and Refresh, never
+// on the 5s poll -- the same reason #config sits outside the poll.
+function renderNewRel(data) {
+  var el = document.getElementById("newrel");
+  if (!el) return;
+  var names = fleetAccountNames(data);
+  if (!names.length) {
+    el.innerHTML = '<section><h2>New relationship</h2><div class="banner">The bridge '
+      + 'sent no fleet tree, so there is no account list to build a relationship '
+      + 'from.</div></section>';
+    return;
+  }
+  var opts = names.map(function (n) { return '<option>' + esc(n) + '</option>'; }).join("");
+  el.innerHTML = '<section><h2>New relationship</h2>'
+    + '<div class="legend">A new relationship lands <b>disabled</b> and <b>not armed</b>. '
+    + 'Arming is a separate deliberate act, never a side effect of creation.</div>'
+    + '<table class="cfg"><tbody>'
+    + '<tr><td>Leader</td><td><select id="newrel-leader">' + opts + '</select></td></tr>'
+    + '<tr><td>Follower</td><td><select id="newrel-follower">' + opts + '</select></td></tr>'
+    + '<tr><td>Sizing mode</td><td><select id="newrel-sizing">' + sizingOptions("QuantityRatio")
+    + '</select></td></tr>'
+    + '<tr><td>Ratio</td><td><input id="newrel-ratio" value="1.0" class="ratio"></td></tr>'
+    + '<tr><td>Max position size</td><td><input id="newrel-maxpos" value="10" class="ratio"></td></tr>'
+    + '</tbody></table>'
+    + '<div class="cfgbar"><button id="newrel-save">Create relationship</button></div>'
+    + '</section>';
+  document.getElementById("newrel-save").addEventListener("click", createRelationship);
+}
+
+function createRelationship() {
+  var leader = document.getElementById("newrel-leader").value;
+  var follower = document.getElementById("newrel-follower").value;
+  if (!leader || !follower) {
+    outcome("bad", "Both a leader and a follower are required.");
+    return;
+  }
+  if (leader === follower) {
+    outcome("bad", "Leader and follower cannot be the same account.");
+    return;
+  }
+  var ratio = parseFloat(document.getElementById("newrel-ratio").value);
+  if (isNaN(ratio) || ratio <= 0) {
+    outcome("bad", "Ratio must be a positive number.");
+    return;
+  }
+  var maxPos = parseInt(document.getElementById("newrel-maxpos").value, 10);
+  if (isNaN(maxPos) || maxPos <= 0) maxPos = 10;
+
+  // isEnabled:false and NO armedForLive field. The engine merges, so omitting
+  // armedForLive leaves the stored value alone -- and for a new relationship the
+  // default is false. Arming is a separate deliberate act.
+  dispatch({
+    action: "set",
+    leaderAccount: leader,
+    followerAccount: follower,
+    sizingMode: document.getElementById("newrel-sizing").value,
+    quantityRatio: ratio,
+    maxPositionSize: maxPos,
+    isEnabled: false
+  }, "Created " + leader + " -> " + follower + " (disabled, not armed).");
+}
+
+// The group cards: one per group, with its followers, add/remove, and delete.
+// Groups are the only grouping (section 4 decision 2), so this is where a
+// relationship that belongs to a group is managed.
+//
+// ⚠️ THE GROUPS ARRIVE PASCALCASE. `get_groups` is serialised with the default
+// JsonConvert settings (GroupName, LeaderAccountName, FollowerAccounts), unlike
+// the snapshot's camelCase rows. Both spellings are read so a casing change on
+// either side cannot blank the cards.
+function renderGroups(data) {
+  var el = document.getElementById("groups");
+  if (!el) return;
+  var groups = (data && data.groups) || [];
+  var names = fleetAccountNames(data);
+  var html = '<section><h2>Copier groups</h2>';
+  if (!groups.length) {
+    html += '<div class="banner">No groups. A 1:1 pair is a group of one, and the '
+      + 'relationships above are keyed by their leader.</div></section>';
+    el.innerHTML = html;
+    return;
+  }
+  groups.forEach(function (g) {
+    var gname = g.groupName || g.GroupName || "";
+    var leader = g.leaderAccountName || g.LeaderAccountName || "";
+    var followers = (g.followerAccounts || g.FollowerAccounts || []).slice().sort();
+    html += '<div class="groupcard" data-group="' + escAttr(gname) + '">'
+      + '<b>' + esc(gname) + '</b>'
+      + ' <span class="note">leader ' + esc(leader) + '</span>'
+      + (g.isEnabled === false ? ' <span class="bad">disabled</span>' : '')
+      + '<ul>' + followers.map(function (f) {
+          return '<li>' + esc(f)
+            + ' <button class="act warn" data-group="' + escAttr(gname)
+            + '" data-follower="' + escAttr(f) + '" data-do="rmfollower">remove</button></li>';
+        }).join("") + '</ul>'
+      + '<div class="cfgbar">'
+      + '<select class="addfollower" data-group="' + escAttr(gname) + '">'
+      + names.map(function (n) { return '<option>' + esc(n) + '</option>'; }).join("")
+      + '</select>'
+      + '<button class="act" data-group="' + escAttr(gname) + '" data-do="addfollower">Add follower</button>'
+      + '<button class="act warn" data-group="' + escAttr(gname) + '" data-do="delgroup">Delete group</button>'
+      + '</div></div>';
+  });
+  html += '</section>';
+  el.innerHTML = html;
+  wireGroups();
+}
+
+function wireGroups() {
+  Array.prototype.forEach.call(document.querySelectorAll("#groups button"), function (b) {
+    var group = b.getAttribute("data-group");
+    var doWhat = b.getAttribute("data-do");
+    if (doWhat === "addfollower") {
+      b.addEventListener("click", function () {
+        var sel = document.querySelector('#groups select[data-group="' + group + '"]');
+        var follower = sel ? sel.value : "";
+        if (!follower) return;
+        dispatch({ action: "add_follower_to_group", groupName: group, followerAccount: follower },
+                 "Added " + follower + " to group \"" + group + "\".");
+      });
+    } else if (doWhat === "rmfollower") {
+      var follower = b.getAttribute("data-follower");
+      b.addEventListener("click", function () {
+        if (!window.confirm("Remove " + follower + " from group \"" + group + "\"?")) return;
+        dispatch({ action: "remove_follower_from_group", groupName: group, followerAccount: follower },
+                 "Removed " + follower + " from group \"" + group + "\".");
+      });
+    } else if (doWhat === "delgroup") {
+      b.addEventListener("click", function () {
+        if (!window.confirm("DELETE group \"" + group + "\"? Its followers are removed from "
+          + "the group; the accounts themselves are untouched.")) return;
+        dispatch({ action: "remove_group", groupName: group },
+                 "Deleted group \"" + group + "\".");
+      });
+    }
+  });
+}
+
+// The copier's global mode. A mode you cannot observe is a mode you cannot trust
+// (P1-69's class), so the select is rendered from the system cell the route sends
+// and the write is a POST-only action.
+//
+// ⚠️ IDEMPOTENT ON PURPOSE. The poll re-renders this every 5s, and a select
+// rebuilt under an open dropdown closes it -- so the renderer only rewrites the
+// DOM when the mode it would show has actually changed. Same rule as #config:
+// a control the operator is interacting with must not be rebuilt under them.
+function renderMode(data) {
+  var el = document.getElementById("copiermode");
+  if (!el) return;
+  var sys = data && data.system;
+  var cur = (sys && sys.mode) || "live";
+  var shown = el.getAttribute("data-mode");
+  if (shown === cur && el.querySelector("#copiermode-sel")) return;
+  el.setAttribute("data-mode", cur);
+  el.innerHTML = '<span class="meta">copier mode</span> '
+    + '<select id="copiermode-sel">'
+    + ["live", "shadow", "disabled"].map(function (m) {
+        return '<option' + (m === cur ? ' selected' : '') + '>' + m + '</option>';
+      }).join("")
+    + '</select> '
+    + '<button class="act" id="copiermode-set">Set</button>';
+  document.getElementById("copiermode-set").addEventListener("click", function () {
+    var next = document.getElementById("copiermode-sel").value;
+    if (next === cur) return;
+    if (!window.confirm("Set the copier's GLOBAL mode to \"" + next + "\"?\n\n"
+      + "This affects every relationship. Entering \"live\" runs preflight and is "
+      + "refused if it fails.")) return;
+    dispatch({ action: "set_mode", mode: next },
+             "Set the copier's global mode to \"" + next + "\".");
+  });
 }
 
 // ── writing ──────────────────────────────────────────────────────────────────
@@ -810,6 +1095,7 @@ function renderCopier(data) {
 //     whether the follower is holding something right now.
 
 var lastCopierRows = [];   // for deriving group membership from the detail
+var lastFleet = null;      // P2-126. the fleet tree as last sent, for the group pickers
 
 function apiPost(url, body) {
   var t = token();
@@ -903,6 +1189,14 @@ function dispatch(body, describe) {
         outcome("bad", "Refused. Nothing was changed.", res.reason);
       } else if (res && res.success) {
         outcome("ok", describe);
+      } else if (res && res.success === false) {
+        // The engine declined WITHOUT a `refused` flag. add_follower_to_group and
+        // remove_follower_from_group return success:false on a P1-76 overlap (the
+        // follower already has a direct relationship) and log the reason to the
+        // copier log, but the bridge does not echo it. Say what came back so the
+        // operator is not left guessing whether the change happened.
+        outcome("bad", "The bridge reported the change was NOT applied.",
+                JSON.stringify(res));
       } else {
         outcome("bad", "The bridge did not report success, and did not say it refused.",
                 JSON.stringify(res));
@@ -934,14 +1228,94 @@ function releaseRow(r) {
            "Released the quarantine on " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
 }
 
+// P2-126. Delete a relationship. The confirmation states the CONSEQUENCE, not the
+// action: a delete is permanent, and if the follower is holding a position the
+// leader's exits will no longer reach it.
+function deleteRow(r) {
+  var held = holdingNow(r);
+  var lines = ["DELETE the relationship " + r.leaderAccountName + " -> "
+               + r.followerAccountName + "?"];
+  if (r.groupName) {
+    lines.push("");
+    lines.push("This follower is managed by group \"" + r.groupName + "\". Deleting the "
+               + "relationship removes it from the group.");
+  }
+  lines.push("");
+  lines.push(held
+    ? held + ".\n\nDeleting stops copying permanently. The leader's EXIT will not reach "
+            + "it either, so that position becomes yours to close by hand."
+    : "The follower is flat, so nothing is stranded by this.");
+  if (!window.confirm(lines.join("\n"))) return;
+  dispatch({ action: "remove", leaderAccount: r.leaderAccountName,
+             followerAccount: r.followerAccountName },
+           "Deleted " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
+}
+
+// P2-126. Toggle the inline ratio/sizing editor on a row. Only one row's editor is
+// open at a time, so the Actions cell does not grow a control per row.
+function toggleRowEdit(i) {
+  var open = document.getElementById("rowedit-" + i);
+  if (!open) return;
+  var wasOpen = open.style.display !== "none";
+  Array.prototype.forEach.call(document.querySelectorAll(".rowedit"), function (e) {
+    e.style.display = "none";
+  });
+  if (!wasOpen) open.style.display = "";
+}
+
+// P2-126. Save the inline ratio/sizing edit. A DIFF, like every write on this page:
+// only the fields the operator changed are named, so PerTickerRatios,
+// CustomSymbolMappings and MaxSlippageTicks survive (P?-65's rule).
+//
+// ⚠️ FIXEDLOT IS SIZED OFF FixedLotSize, NOT QuantityRatio. The engine's
+// ComputeEffectiveRatio returns 0.0 for FixedLot and the copy quantity is
+// `rel.FixedLotSize` (TradeCopierEngine.cs:1727), so switching a row to FixedLot
+// without also writing FixedLotSize would copy 1 lot no matter what ratio the
+// operator typed. The ratio input doubles as the lot size when the mode is
+// FixedLot, exactly as the WPF window's create form does.
+function saveRowEdit(r) {
+  var idx = lastCopierRows.indexOf(r);
+  var ratioEl = document.querySelector('#rowedit-' + idx + ' input.ratio');
+  var sizingEl = document.querySelector('#rowedit-' + idx + ' select.sizing');
+  if (!ratioEl || !sizingEl) return;
+
+  var body = { action: "set", leaderAccount: r.leaderAccountName,
+               followerAccount: r.followerAccountName };
+  var ratio = parseFloat(ratioEl.value);
+  var mode = sizingEl.value;
+  if (mode === "FixedLot") {
+    if (!isNaN(ratio) && ratio > 0) body.fixedLotSize = Math.round(ratio);
+    // The engine sizes FixedLot copies off FixedLotSize, and the stored
+    // FixedLotMode flag is what the WPF window and the config file both read.
+    // Sending it keeps the two spellings of "this is a fixed-lot row" in step.
+    body.fixedLotMode = true;
+  } else {
+    if (!isNaN(ratio) && ratio > 0) body.quantityRatio = ratio;
+    if (r.sizingMode === "FixedLot") body.fixedLotMode = false;
+  }
+  if (mode && mode !== r.sizingMode) body.sizingMode = mode;
+  if (Object.keys(body).length <= 3) {
+    outcome("bad", "Nothing to change. Set a ratio or a sizing mode first.");
+    return;
+  }
+  dispatch(body, "Updated " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
+}
+
 function wireActions(rows) {
   Array.prototype.forEach.call(document.querySelectorAll("button.act"), function (b) {
     var r = rows[parseInt(b.getAttribute("data-row"), 10)];
     if (!r) return;
-    if (b.getAttribute("data-do") === "toggle") {
+    var doWhat = b.getAttribute("data-do");
+    if (doWhat === "toggle") {
       b.addEventListener("click", function () { toggleRow(r, !r.isEnabled); });
-    } else {
+    } else if (doWhat === "release") {
       b.addEventListener("click", function () { releaseRow(r); });
+    } else if (doWhat === "delete") {
+      b.addEventListener("click", function () { deleteRow(r); });
+    } else if (doWhat === "edit") {
+      b.addEventListener("click", function () { toggleRowEdit(parseInt(b.getAttribute("data-row"), 10)); });
+    } else if (doWhat === "saveedit") {
+      b.addEventListener("click", function () { saveRowEdit(r); });
     }
   });
 }
@@ -1329,13 +1703,19 @@ function renderTabs(data) {
   applyTabs();
 }
 
-// copier -> #copier, risk -> #content (the per-account rule rows), rare -> #config
-// (the set-rarely guard config, which section 4 puts in the inspector and nowhere else).
+// copier -> #copier + #newrel + #copiermode + #groups, risk -> #content (the
+// per-account rule rows), rare -> #config (the set-rarely guard config, which
+// section 4 puts in the inspector and nowhere else). The tab's LABEL is
+// "Settings" (BridgeInspectorTabs); the ID stays "rare" so the pane mapping
+// below and the route's tab ids never drift.
 function applyTabs() {
-  var paneOf = { copier: "copier", risk: "content", rare: "config" };
+  var paneOf = { copier: ["copier", "newrel", "copiermode", "groups"],
+                 risk: ["content"], rare: ["config"] };
   Object.keys(paneOf).forEach(function (id) {
-    var pane = document.getElementById(paneOf[id]);
-    if (pane) pane.style.display = (id === activeTab) ? "" : "none";
+    paneOf[id].forEach(function (paneId) {
+      var pane = document.getElementById(paneId);
+      if (pane) pane.style.display = (id === activeTab) ? "" : "none";
+    });
   });
 }
 
@@ -1435,7 +1815,39 @@ function load() {
   loadTabs();
 }
 
+// P2-126. The create-relationship form is rendered once on load and once on an
+// explicit Refresh, never on the 5s poll -- the same rule as #config. The flag is
+// set by the refresh handler and cleared by the first render.
+var renderNewRelPending = true;
+
+function loadCopier() {
+  api("/api/copier/snapshot")
+    .then(function (data) {
+      renderCopier(data);
+      if (renderNewRelPending) {
+        renderNewRel(data);
+        renderNewRelPending = false;
+      }
+    })
+    .catch(function (e) { renderCopier({ error: e.message }); });
+  // P2-126. The snapshot carries rows and the system cell but not the GROUPS
+  // (they are a config object, not a conformance row). Fetched separately and
+  // merged onto the same payload so the group cards and the rows cannot disagree
+  // about which group a follower belongs to.
+  api("/api/copier/config?action=get_groups")
+    .then(function (g) {
+      var el = document.getElementById("groups");
+      if (el) renderGroups({ groups: g.groups, fleet: lastFleet });
+    })
+    .catch(function (e) {
+      var el = document.getElementById("groups");
+      if (el) el.innerHTML = '<section><h2>Copier groups</h2><div class="banner bad">'
+        + esc(e.message) + '</div></section>';
+    });
+}
+
 document.getElementById("refresh").addEventListener("click", function () {
+  renderNewRelPending = true;
   load();
   loadConfig();   // an explicit Refresh is the operator asking; the 5s poll is not
 });

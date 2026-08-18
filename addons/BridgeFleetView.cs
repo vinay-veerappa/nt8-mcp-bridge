@@ -77,6 +77,16 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         public string Badge;
         public List<FleetNode> Children = new List<FleetNode>();
+
+        /// <summary>
+        /// P2-127 follow-up (2026-08-18). True for an account the broker did not deliver on
+        /// this login (`Connection == null`) and that has no open position, working order or
+        /// live guard finding. The page hides these by default behind a stated count and a
+        /// toggle; the flag is DATA, classified at the call site, so this class still names
+        /// no NinjaTrader type. Only UNLINKED children carry it -- an account in a copy
+        /// relationship is configured to copy, which is the thing the tree exists to show.
+        /// </summary>
+        public bool Dormant;
     }
 
     public static class BridgeFleetView
@@ -222,9 +232,31 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         public static List<FleetNode> Build(IList<FleetCopierRow> rows, IList<string> allAccounts)
         {
+            return Build(rows, allAccounts, null);
+        }
+
+        /// <summary>
+        /// P2-127 follow-up (2026-08-18). The dormant-account filter.
+        ///
+        /// <paramref name="dormantAccounts"/> is the set of account names the CALLER has
+        /// classified as dormant -- measured as `Connection == null` with no open position,
+        /// no working order and no live guard finding. The classification stays at the call
+        /// site because it reads `NinjaTrader.Cbi.Account.Connection`, and this class is
+        /// testable precisely because it names no NinjaTrader type. Passing the RESULT in as
+        /// data keeps that property.
+        ///
+        /// ⚠️ THE INVARIABLE: an account with an open position, a working order or a live
+        /// guard finding is NEVER dormant, whatever the caller's filter setting. The caller
+        /// is trusted to classify; this method only applies the flag to UNLINKED children,
+        /// so an account in a copy relationship is never hidden by this filter either.
+        /// </summary>
+        public static List<FleetNode> Build(IList<FleetCopierRow> rows, IList<string> allAccounts,
+                                           ISet<string> dormantAccounts)
+        {
             // Treat null inputs as empty so the tree is always well-formed.
             IList<FleetCopierRow> safeRows = rows ?? new List<FleetCopierRow>();
             IList<string> safeAccounts = allAccounts ?? new List<string>();
+            ISet<string> dormant = dormantAccounts ?? new HashSet<string>();
 
             Dictionary<string, List<FleetCopierRow>> groups = new Dictionary<string, List<FleetCopierRow>>();
             HashSet<string> linked = new HashSet<string>();
@@ -360,7 +392,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                         Kind = "account",
                         Name = account,
                         Rank = NotApplicableRank,
-                        Children = new List<FleetNode>()
+                        Children = new List<FleetNode>(),
+                        // P2-127 follow-up. The caller classified this account as dormant
+                        // (Connection == null, no position, no order, no guard finding). The
+                        // page hides dormant accounts by default behind a stated count.
+                        Dormant = dormant.Contains(account)
                     });
                     unlinkedRanks.Add(NotApplicableRank);
                 }

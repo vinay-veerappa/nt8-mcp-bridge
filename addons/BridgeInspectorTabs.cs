@@ -268,10 +268,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             string name = configConflicts > 0 ? "Conflict" : "No conflicts";
 
+            // ⚠️ THE LABEL IS "Settings", NOT "Rare". §4 decision 3 puts set-rarely config in the
+            // inspector, and this tab IS that: it holds the guard config editor. Commit a983455 moved
+            // `<div id="config">` inside `#tabpanes`, so the editor sat behind a tab labelled "Rare"
+            // whose badge read "No conflicts (0)" -- and the operator concluded the settings had
+            // been lost, because nothing on the tab said settings. No data was lost; the label was.
+            // The conflicts badge is a SEPARATE signal (the tab's worst state, per §4.2's rule that
+            // a bad state stays visible without being looked for) and it keeps its own wording.
             return new InspectorTab
             {
                 Id = RareTab,
-                Label = "Rare",
+                Label = "Settings",
                 Rank = worstRank,
                 Badge = FormatBadge(name, configConflicts),
                 Reason = configConflicts > 0
