@@ -1415,6 +1415,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP2127_TheCopierCellDefersToItsOwnProducer();
             TestP2127_TheRouteServesEventsAndSystemAndDecidesNeither();
             TestP2127_ThePageRendersEventsAndTheSystemRow();
+
+            // P1-149. The configured contract cap, enforced BEFORE the order exists. The refusals
+            // are the discriminators: a gate that allowed everything would still pass every
+            // "allowed" case below. [[detector-needs-a-negative-test]].
+            TestP1149_TheMeasuredDefectIsRefused();
+            TestP1149_NoCapConfiguredAllowsEverything();
+            TestP1149_ACapNeverRefusesTheOrderThatClosesThePosition();
+            TestP1149_AnUnderCapOrderThatLeavesAnOverCapPositionIsRefused();
+            TestP1149_TheBoundaryIsInclusive();
+            TestP1149_AReversalIsJudgedOnWhatItLeavesAndOffersTheExit();
+            TestP1149_ThePositionQuantityIsReadAsAMagnitude();
+            TestP1149_EveryOrderPathConsultsTheGate();
+            TestP1149_TheBridgeDoesNotCarryItsOwnCopyOfTheCap();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
@@ -1423,7 +1436,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 104;
+            const int declared = 113;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -4834,6 +4847,312 @@ namespace NinjaTrader.NinjaScript.AddOns
                 });
             }
             return new JObject { ["success"] = true, ["count"] = arr.Count, ["accounts"] = arr };
+        }
+
+
+        // ==================================================================================
+        // P1-149. The configured contract cap, applied before the order exists.
+        // ==================================================================================
+
+        /// <summary>
+        /// The defect exactly as measured: `Sizing.MaxContractsPerAccount: 10` live in the config,
+        /// `sell 1000 MES` on a flat account, FILLED, -$1,213 of slippage on the fill alone. The
+        /// only thing that ever refused an oversized order was the prop firm's own desk, at 60.
+        /// </summary>
+        private static void TestP1149_TheMeasuredDefectIsRefused()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: 1000 contracts against a cap of 10 is refused");
+
+            var d = BridgeSizingGate.Evaluate(10, 1000, "sell", "Flat", 0, "TAKEPROFITPRO524207503", "MES SEP26");
+
+            Assert(!d.Allowed,
+                "P1-149: refused. This exact call filled on 2026-08-18 -- 100x the configured cap, "
+                + "no guard event, no warning. MaxContractsPerAccount had four readers and the "
+                + "component that places the order was not one of them.");
+
+            Assert(d.Reason != null && d.Reason.Contains("10") && d.Reason.Contains("1000"),
+                "P1-149: and the refusal names BOTH the cap and what was asked. 'Order refused' "
+                + "alone makes an agent guess, and the caller here is an agent (got '"
+                + (d.Reason ?? "null") + "')");
+
+            Assert(d.ResultingQuantity == 1000,
+                "P1-149: the resulting position is reported as 1000, so a test can check the "
+                + "arithmetic separately from the verdict -- a gate that refuses for the wrong "
+                + "reason still refuses (got " + d.ResultingQuantity + ")");
+        }
+
+        /// <summary>
+        /// `GuardRules` reports `MaxContractsPerAccount &lt;= 0` as `Off("no per-account contract
+        /// cap")`. This must agree: a cap the inventory shows as OFF while the bridge enforces it
+        /// would be worse than either behaviour alone, because the operator would be reading a
+        /// screen that says the opposite of what happens.
+        /// </summary>
+        private static void TestP1149_NoCapConfiguredAllowsEverything()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: no cap configured allows everything, matching GuardRules' Off()");
+
+            Assert(BridgeSizingGate.Evaluate(0, 1000, "buy", "Flat", 0, "A", "MES").Allowed,
+                "P1-149: cap 0 allows 1000 -- GuardRules calls 0 'no per-account contract cap', and "
+                + "two readers of one setting must not disagree about whether it is on.");
+
+            Assert(BridgeSizingGate.Evaluate(-1, 1000, "buy", "Flat", 0, "A", "MES").Allowed,
+                "P1-149: and a negative cap is also off, not a cap of -1 that refuses everything.");
+        }
+
+        /// <summary>
+        /// ⚠️ THE LOAD-BEARING TEST. If you are long 50 against a cap of 10, a `Sell 50` is the FIX,
+        /// not the offence. `P1-106` is the same lesson one file over: a lockout refused the order
+        /// that would CLOSE a position and trapped the operator inside the exact risk the rule
+        /// existed to limit. A cap that refuses exits is a cap that manufactures the state it bans.
+        /// </summary>
+        private static void TestP1149_ACapNeverRefusesTheOrderThatClosesThePosition()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: a cap NEVER refuses the order that closes an over-cap position");
+
+            var flatten = BridgeSizingGate.Evaluate(10, 50, "sell", "Long", 50, "A", "MES");
+            Assert(flatten.Allowed && flatten.ResultingQuantity == 0,
+                "P1-149: long 50 against a cap of 10, Sell 50 is ALLOWED and leaves 0. Refusing it "
+                + "would trap the operator in the exposure the cap exists to prevent -- P1-106 "
+                + "verbatim, one file over (allowed=" + flatten.Allowed + ", leaves "
+                + flatten.ResultingQuantity + ")");
+
+            var partial = BridgeSizingGate.Evaluate(10, 30, "sell", "Long", 50, "A", "MES");
+            Assert(partial.Allowed && partial.ResultingQuantity == 20,
+                "P1-149: and a PARTIAL reduction is allowed too, even though it leaves 20 -- still "
+                + "over the cap of 10. Requiring a reduction to reach compliance in one order would "
+                + "refuse every scale-out (allowed=" + partial.Allowed + ", leaves "
+                + partial.ResultingQuantity + ")");
+
+            var shortSide = BridgeSizingGate.Evaluate(10, 50, "buy", "Short", 50, "A", "MES");
+            Assert(shortSide.Allowed,
+                "P1-149: and the same from the short side -- the rule is about direction against "
+                + "the position, not about buy or sell.");
+        }
+
+        /// <summary>
+        /// The reason the check is on the RESULTING position rather than the order quantity. The
+        /// guard's reactive rule asks `pos.Quantity > limit`; if this asked only about the order,
+        /// the two halves would measure different things and the reactive rule would flatten a
+        /// position the pre-trade gate had just approved.
+        /// </summary>
+        private static void TestP1149_AnUnderCapOrderThatLeavesAnOverCapPositionIsRefused()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: an under-cap ORDER that leaves an over-cap POSITION is refused");
+
+            var d = BridgeSizingGate.Evaluate(10, 5, "buy", "Long", 8, "A", "MES");
+
+            Assert(!d.Allowed && d.ResultingQuantity == 13,
+                "P1-149: long 8, cap 10, Buy 5 -- the order is 5, comfortably under the cap, and it "
+                + "leaves 13. Checking the order quantity alone passes this, and then MAX_SIZE_BREACH "
+                + "flattens all 13 within the audit interval, which reads to an operator as the "
+                + "guard flattening a legal order (allowed=" + d.Allowed + ", leaves "
+                + d.ResultingQuantity + ")");
+
+            Assert(d.Reason != null && d.Reason.Contains("long 8"),
+                "P1-149: and the refusal states the position it judged against, because '5 is too "
+                + "many' is false on its face and would read as a bug (got '" + (d.Reason ?? "null") + "')");
+        }
+
+        /// <summary>
+        /// An off-by-one here refuses an order that exactly meets the cap, which an operator reads
+        /// as the cap being one lower than it says.
+        /// </summary>
+        private static void TestP1149_TheBoundaryIsInclusive()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: a position exactly AT the cap is allowed, one over is not");
+
+            Assert(BridgeSizingGate.Evaluate(10, 10, "buy", "Flat", 0, "A", "MES").Allowed,
+                "P1-149: flat, cap 10, Buy 10 is allowed -- the cap is a maximum, not a limit you "
+                + "must stay under.");
+
+            Assert(!BridgeSizingGate.Evaluate(10, 11, "buy", "Flat", 0, "A", "MES").Allowed,
+                "P1-149: and 11 is refused. This pair is what pins the comparison operator; either "
+                + "test alone passes under both <= and <.");
+
+            Assert(BridgeSizingGate.Evaluate(10, 2, "buy", "Long", 8, "A", "MES").Allowed,
+                "P1-149: and reaching the cap exactly by ADDING is allowed too (8 + 2 = 10).");
+        }
+
+        /// <summary>
+        /// A `Sell 20` against a long 8 is an exit AND a new short 12 -- NT8 nets it into one order.
+        /// It is not strictly reducing, so it is judged on what it leaves. This is the case
+        /// `BridgeLockoutGate`'s quantity clamp exists for, and the refusal has to offer the exit or
+        /// it looks like the trap the previous test bans.
+        /// </summary>
+        private static void TestP1149_AReversalIsJudgedOnWhatItLeavesAndOffersTheExit()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: a reversal is judged on what it leaves, and the refusal offers the exit");
+
+            var d = BridgeSizingGate.Evaluate(10, 20, "sell", "Long", 8, "A", "MES");
+
+            Assert(!d.Allowed && d.ResultingQuantity == 12,
+                "P1-149: long 8, Sell 20 nets to short 12, over the cap of 10. Admitting it because "
+                + "'it reduces the long' opens 12 contracts of fresh risk -- the same arithmetic "
+                + "P1-106's clamp exists for (allowed=" + d.Allowed + ", leaves " + d.ResultingQuantity + ")");
+
+            Assert(d.Reason != null && d.Reason.Contains("18"),
+                "P1-149: and it names the largest sell that WOULD be accepted -- 8 to flatten plus "
+                + "10 of new short. Without it the operator cannot tell a size refusal from the "
+                + "exit-trap this gate promises never to be (got '" + (d.Reason ?? "null") + "')");
+
+            var exit = BridgeSizingGate.Evaluate(10, 8, "sell", "Long", 8, "A", "MES");
+            Assert(exit.Allowed,
+                "P1-149: positive control -- the plain exit it just suggested is in fact allowed. A "
+                + "remedy the gate would itself refuse is worse than no remedy.");
+        }
+
+        /// <summary>
+        /// `Position.Quantity` is ABSOLUTE on NT8; the side is `MarketPosition`. `P0-96` is the
+        /// copier reading the SIGN and DOUBLING a follower's short behind 1311 green tests. Nothing
+        /// here may depend on a sign, so a negative arriving from a caller that got it wrong must
+        /// still be read as a magnitude rather than flipping the arithmetic.
+        /// </summary>
+        private static void TestP1149_ThePositionQuantityIsReadAsAMagnitude()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: the position quantity is a magnitude, never a signed value");
+
+            var signed = BridgeSizingGate.Evaluate(10, 5, "buy", "Long", -8, "A", "MES");
+            Assert(!signed.Allowed && signed.ResultingQuantity == 13,
+                "P1-149: a -8 is read as 8 held, so Buy 5 still leaves 13 and is still refused. "
+                + "Arithmetic on the raw value gives -3, which is under the cap and would ADMIT the "
+                + "order -- P0-96's shape, where a sign read as data doubled a real position "
+                + "(allowed=" + signed.Allowed + ", leaves " + signed.ResultingQuantity + ")");
+        }
+
+        /// <summary>
+        /// ⚠️ THE POINT OF THE WHOLE TICKET. `PlaceAtmOrder` was the path the defect was measured on,
+        /// and fixing only it would leave `/api/order` and `/api/order/oco` exactly as open --
+        /// [[a-second-reader-of-the-same-state]], this repo's most repeated shape, where a predicate
+        /// learns a clause and the other readers never do.
+        ///
+        /// A SOURCE gate, because `McpBridgeAddOn.cs` is in no test build. Comments are stripped:
+        /// three times in one session a text gate here matched a comment about its own subject.
+        /// </summary>
+        private static void TestP1149_EveryOrderPathConsultsTheGate()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: EVERY order path consults the sizing gate (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            int calls = 0;
+            int at = code.IndexOf("BridgeSizingGate.Evaluate", StringComparison.Ordinal);
+            while (at >= 0)
+            {
+                calls++;
+                at = code.IndexOf("BridgeSizingGate.Evaluate", at + 1, StringComparison.Ordinal);
+            }
+
+            Assert(calls == 3,
+                "P1-149: all THREE order-placing paths consult the gate -- PlaceOrder, PlaceOcoOrder "
+                + "and PlaceAtmOrder. The count is asserted rather than 'at least one' precisely "
+                + "because the defect was found on one path and fixing that path alone is the "
+                + "failure this repo keeps repeating (found " + calls + ")");
+
+            // ⚠️ MATCH THE DEFINITION, NOT ANY OCCURRENCE. The first draft searched for
+            // " PlaceOrder(" and found the ROUTE TABLE -- `b => PlaceOrder(b)` -- so it inspected a
+            // few characters of a switch statement and reported three real call sites as missing.
+            // A region gate that does not say what it read is the shape this repo has shipped four
+            // times. [[state-the-region-a-gate-inspects]].
+            foreach (string method in new[] { "PlaceOrder", "PlaceOcoOrder", "PlaceAtmOrder" })
+            {
+                string signature = "private object " + method + "(string body)";
+                int start = code.IndexOf(signature, StringComparison.Ordinal);
+                Assert(start >= 0, "P1-149: " + method + "'s DEFINITION is found by its signature");
+                if (start < 0) continue;
+
+                // ⚠️ BRACE-MATCHED, and the first version of this was WRONG in the
+                // direction that passes. It ran from one definition to the NEXT OF THE THREE, which
+                // for PlaceOcoOrder is ~3000 lines and 119,756 characters of other methods -- so a
+                // call anywhere in that span satisfied it, which is exactly the "one wired path
+                // vouches for an unwired one" this test exists to prevent. The sliver guard caught
+                // a region too SMALL and said nothing about one 25x too LARGE.
+                int open = code.IndexOf('{', start);
+                Assert(open > start, "P1-149: " + method + "'s body has an opening brace");
+                if (open <= start) continue;
+
+                int depth = 0, end = -1;
+                for (int i = open; i < code.Length; i++)
+                {
+                    if (code[i] == '{') depth++;
+                    else if (code[i] == '}')
+                    {
+                        depth--;
+                        if (depth == 0) { end = i; break; }
+                    }
+                }
+                Assert(end > open, "P1-149: " + method + "'s body has a matching closing brace");
+                if (end <= open) continue;
+
+                string body = code.Substring(open, end - open);
+
+                Assert(body.Length > 400 && body.Length < 20000,
+                    "P1-149: the region for " + method + " is one method body -- " + body.Length
+                    + " chars, inside a stated range. Too small makes the assertion below vacuous; "
+                    + "too large lets a neighbouring method's call answer for this one. Both "
+                    + "directions are bounded because only one of them was, and it was the wrong one.");
+
+                Assert(body.Contains("BridgeSizingGate.Evaluate"),
+                    "P1-149: " + method + "'s OWN " + body.Length + "-char body consults the gate.");
+
+                // ⚠️ AND THE VERDICT IS CONSUMED. Asserting the CALL alone left a live mutant: wrap
+                // the verdict test in `if (false)` and the call is still there for any scan to
+                // find, while the order is placed regardless. That is an alarm wired to an output
+                // nobody reads -- [[an-alarm-wired-to-a-dead-output]] -- and it survived the first
+                // run of this battery. Assert DELIVERY, not presence.
+                string verdict = method == "PlaceOrder" ? "sizing"
+                    : method == "PlaceOcoOrder" ? "ocoSizing" : "atmSizing";
+                Assert(body.Contains("if (!" + verdict + ".Allowed)"),
+                    "P1-149: " + method + " TESTS the verdict it just computed (looking for `if (!"
+                    + verdict + ".Allowed)`). A call whose result is never read refuses nothing.");
+                Assert(body.Contains("return new { error = " + verdict + ".Reason };"),
+                    "P1-149: and " + method + " RETURNS the refusal rather than logging it and "
+                    + "carrying on. Reporting a refusal while placing the order anyway is the worst "
+                    + "of the three possible behaviours, because the log says it was stopped.");
+            }
+        }
+
+        /// <summary>
+        /// The cap must come from the guard, not from a number typed into the bridge. Four readers
+        /// of `MaxContractsPerAccount` already exist; a fifth that could drift from the config the
+        /// operator edits is the defect, not the fix.
+        /// </summary>
+        private static void TestP1149_TheBridgeDoesNotCarryItsOwnCopyOfTheCap()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P1-149: the cap is asked of the guard, not hardcoded in the bridge (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            Assert(code.Contains("RiskGuardAddOn.Instance.EffectiveMaxContracts"),
+                "P1-149: the bridge asks the GUARD for the cap, so the operator's config is the one "
+                + "source. A literal here would be a fifth reader of a number four things already "
+                + "read, and the drift would be silent.");
+
+            string gate = File.ReadAllText(Path.Combine(
+                Path.GetDirectoryName(BridgeSourcePath()), "BridgeSizingGate.cs"));
+            // ⚠️ THE FAILURE DIRECTION IS A JUDGEMENT, so it is asserted rather than assumed. With
+            // the guard unloaded the bridge must keep working, so an absent guard means NO CAP, not
+            // a cap of 1. A mutant returning 1 here survived the first run of the battery: nothing
+            // covered the fallback, and "the bridge refuses every order when the guard is absent"
+            // is a plausible-looking behaviour nobody would have questioned.
+            Assert(code.Contains("if (RiskGuardAddOn.Instance == null) return 0;"),
+                "P1-149: an absent guard yields a cap of 0, which BridgeSizingGate reads as NO CAP. "
+                + "Fail-OPEN is deliberate here: the bridge predates the guard and must run without "
+                + "it, and a locally-invented cap would be a second source of truth for a number the "
+                + "operator configures in exactly one place.");
+
+            Assert(!gate.Contains("MaxContractsPerAccount ="),
+                "P1-149: and the decision class assigns no default of its own -- it takes the cap as "
+                + "a parameter. A fallback constant in here is the same second-reader defect wearing "
+                + "a different hat.");
         }
 
         public static int Main(string[] args)

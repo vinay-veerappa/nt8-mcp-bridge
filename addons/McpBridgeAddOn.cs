@@ -2617,6 +2617,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = lockoutDecision.Reason };
             if (lockoutDecision.AllowedAsReducing)
                 Log("P1-106 " + account.Name + " " + symbol + ": " + lockoutDecision.Reason, LogLevel.Warning);
+
+            // P1-149. The configured contract cap, applied BEFORE the order exists. Same `currentPos`
+            // the lockout gate just read, and the cap comes from the guard so there is one reader.
+            var sizing = BridgeSizingGate.Evaluate(
+                EffectiveMaxContracts(account, symbol),
+                quantity,
+                actionStr,
+                currentPos != null ? currentPos.MarketPosition.ToString() : null,
+                currentPos != null ? currentPos.Quantity : 0,
+                account.Name,
+                symbol);
+            if (!sizing.Allowed)
+                return new { error = sizing.Reason };
+
             var orderType = (OrderType)Enum.Parse(typeof(OrderType), orderTypeStr, true);
 
             var tifStr = req.GetValueOrDefault("timeInForce")?.ToString() ?? "Day";
@@ -2690,6 +2704,21 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = "instrument not found: " + symbol };
+
+            // P1-149. An OCO's ENTRY is what adds exposure, so the cap applies to it. The position
+            // is read for the same reason the ATM path reads it: long 8 against a cap of 10 makes a
+            // Buy 5 an over-cap order even though 5 is under the cap.
+            var ocoPos = account.Positions.FirstOrDefault(p => p.Instrument.FullName == instrument.FullName);
+            var ocoSizing = BridgeSizingGate.Evaluate(
+                EffectiveMaxContracts(account, symbol),
+                quantity,
+                actionStr,
+                ocoPos != null ? ocoPos.MarketPosition.ToString() : null,
+                ocoPos != null ? ocoPos.Quantity : 0,
+                account.Name,
+                symbol);
+            if (!ocoSizing.Allowed)
+                return new { error = ocoSizing.Reason };
 
             // Generate a proper OCO GUID (NT8 uses GUID strings for OCO groups)
             string ocoId = Guid.NewGuid().ToString();
@@ -3990,6 +4019,26 @@ namespace NinjaTrader.NinjaScript.AddOns
             new System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
         // Check both RiskGuard and the local EmergencyFlatten lockout.
+        /// <summary>
+        /// P1-149. The contract cap for this account and instrument, asked of the GUARD rather than
+        /// re-derived here. Returns 0 when the guard is absent, which `BridgeSizingGate` reads as
+        /// "no cap" -- deliberately fail-OPEN, because the bridge must keep working with the guard
+        /// unloaded and a cap invented locally would be a second source of truth for a number the
+        /// operator configures in one place.
+        ///
+        /// ⚠️ NOT mode-aware, and that is the decision to revisit if this is ever wrong: a `shadow`
+        /// guard still returns its cap, so the bridge still refuses. `shadow` governs whether the
+        /// GUARD acts on breaches it observes; it cannot govern whether the bridge accepts an order,
+        /// because placing the order IS the irreversible act and there is no observe-only version of
+        /// it. The precedent is `confirmLive`, which refuses regardless of guard mode.
+        /// </summary>
+        private int EffectiveMaxContracts(Account account, string instrumentName)
+        {
+            if (RiskGuardAddOn.Instance == null) return 0;
+            try { return RiskGuardAddOn.Instance.EffectiveMaxContracts(account, instrumentName); }
+            catch { return 0; }
+        }
+
         private bool IsAccountLocked(string accountName)
         {
             if (RiskGuardAddOn.Instance != null && RiskGuardAddOn.Instance.IsAccountLocked(accountName))
@@ -5614,6 +5663,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return new { error = atmLockout.Reason };
 
             int quantity = req["quantity"]?.Value<int>() ?? 1;
+
+            // P1-149, and this is the path the defect was MEASURED on: sell 1000 MES against a
+            // configured cap of 10, filled, -$1,213 of slippage on the fill alone. The prop firm
+            // refused 501 at its own desk (Limit: 60); nothing of ours refused anything.
+            var atmPos = account.Positions.FirstOrDefault(p => p.Instrument.FullName == instrument.FullName);
+            var atmSizing = BridgeSizingGate.Evaluate(
+                EffectiveMaxContracts(account, symbol),
+                quantity,
+                action,
+                atmPos != null ? atmPos.MarketPosition.ToString() : null,
+                atmPos != null ? atmPos.Quantity : 0,
+                account.Name,
+                symbol);
+            if (!atmSizing.Allowed)
+                return new { error = atmSizing.Reason };
+
             double tickSize = instrument.MasterInstrument.TickSize;
             double pointValue = instrument.MasterInstrument.PointValue;
 

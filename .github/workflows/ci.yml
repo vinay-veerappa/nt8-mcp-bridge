@@ -245,6 +245,16 @@ jobs:
       - name: Mutation P2-127 slice 4 (the events pane and the system row)
         run: python mutation/mutate_p2127panes.py
 
+      # P1-149. The contract cap, applied before the order exists. Measured: `sell 1000 MES` against
+      # a configured cap of 10 FILLED, and the only thing that ever refused an oversized order was
+      # the prop firm's own desk at 60.
+      # ⚠️ Group 1's mutants guard the rule that must never regress -- a cap must NEVER refuse the
+      # order that CLOSES an over-cap position, or it manufactures the state it bans (P1-106, one
+      # file over). Group 5's mutants disable ONE order path at a time, because the defect was found
+      # on the ATM path and fixing only that path is the failure this repo keeps repeating.
+      - name: Mutation P1-149 (the pre-trade contract cap)
+        run: python mutation/mutate_p1149sizing.py
+
       # P1-131: "would severing this connection strand the order?" -- the FOURTH question over
       # OrderState, after the core's OccupiesSlot / ProvidesCoverage / AcceptsModification.
       # ⚠️ Group 1's first mutant is the one to know: it restores the instinct to borrow the
