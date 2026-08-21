@@ -265,6 +265,22 @@ jobs:
       - name: Mutation P1-131 (would a disconnect strand this order?)
         run: python mutation/mutate_p1131.py
 
+      # P2-178: nt_extract_trades stamped an Eastern wall-clock with a literal Z, four hours off.
+      # ⚠️ The mutant to know is group 1's: a fixed +4h subtraction instead of a real conversion.
+      # It is RIGHT in August and an hour wrong in January, so the measured-defect test passes
+      # under it and only the DST test's WINTER case kills it -- the plan entry warns against
+      # exactly that "fix". Groups 6 are source gates: McpBridgeAddOn.cs is in no test build, so
+      # both call sites reverting to the false Z are caught only by reading the text.
+      - name: Mutation P2-178 (the exec-time stamp that lied about its zone)
+        run: python mutation/mutate_p2178.py
+
+      # P2-181: the bridge twin of core P2-150. PlaceOcoOrder derived "partial_submit" from a
+      # synchronous OrderState read that Submit's async lifecycle makes unreachable. Source gate
+      # only -- McpBridgeAddOn.cs is in no test build -- so the battery proves the gate FAILS on
+      # the regression (the word reappearing, the read reappearing) rather than passing vacuously.
+      - name: Mutation P2-181 (the OCO path's dead synchronous verdict)
+        run: python mutation/mutate_p2181.py
+
       # Proves deploy.py refuses to half-deploy rather than trusting the comment
       # that says it does. Exit 2 is the refusal; anything else is a regression.
       - name: Deploy tool refuses to deploy without the core

@@ -1391,6 +1391,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1131_TheThreeTerminalStatesAndOnlyThose();
             TestP1131_AnUnknownStateNameFailsSAFE();
             TestP1131_NoBridgePathKeepsItsOwnStateList();
+            // P2-178. The exec-time stamp that lied about its zone. The two DST cases are the
+            // discriminators -- a constant 4h subtraction passes one and fails the other.
+            TestP2178_TheMeasuredDefectConvertsToTrueUtc();
+            TestP2178_TheOffsetFollowsTheDateNotAConstant();
+            TestP2178_TheTrailingZIsNowTrueUtc();
+            TestP2178_TheSpringForwardGapDoesNotThrow();
+            TestP2178_AKindTaggedInputIsTreatedAsAWallClock();
+            TestP2178_BothBridgeCallSitesConvertRatherThanStampingZ();
+            // P2-181. The bridge twin of P2-150 -- PlaceOcoOrder's dead synchronous verdict.
+            TestP2181_TheOcoPathReportsPendingLegsNotADeadVerdict();
             // P2-127 slice 3: the inspector's three tabs, the only tabs in the app.
             TestP2127_AllThreeTabsAlwaysExistInSectionFoursOrder();
             TestP2127_TheRiskTabFoldsInertNotJustUnevaluated();
@@ -1441,7 +1451,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 116;
+            const int declared = 123;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -3619,6 +3629,156 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "working order is never hidden");
             Assert(Regex.Matches(code, @"BridgeOrderLiveness\.IsTerminal\b").Count == 1,
                 "P1-131: the orders filter consults it too");
+        }
+
+        // ================================================================================
+        // P2-178. `nt_extract_trades` (and nt_capture_chart's fillTime) stamped an EASTERN
+        // wall-clock with a literal `Z`, so every consumer read it four hours off. BridgeTradeTime
+        // names no NT8 type, so the conversion is EXECUTED here, not asserted about. The two DST
+        // cases are the discriminators: a fixed 4h subtraction -- the wrong fix the plan warns
+        // against -- passes the August case and fails January. [[detector-needs-a-negative-test]].
+        // ================================================================================
+
+        private static void TestP2178_TheMeasuredDefectConvertsToTrueUtc()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: the measured Eastern stamp becomes the UTC the ledger had");
+
+            // MEASURED 2026-08-20: the tool reported 09:57:51.985 (Eastern) and stamped it `Z`;
+            // interventions.jsonl had the same order at 13:57:52Z. August is EDT (-4).
+            var etAug = new DateTime(2026, 8, 20, 9, 57, 51, 985, DateTimeKind.Unspecified);
+            string utc = BridgeTradeTime.ToUtcIso(etAug);
+            Assert(utc == "2026-08-20T13:57:51.985Z", string.Format(
+                "09:57:51.985 ET on 2026-08-20 is 13:57:51.985Z, not the false 09:57:51.985Z the "
+                + "tool reported. Got: {0}", utc));
+        }
+
+        private static void TestP2178_TheOffsetFollowsTheDateNotAConstant()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: the offset is DST-dependent, not a fixed 4h subtraction");
+
+            // Same wall-clock, two dates on opposite sides of the DST boundary. EDT is -4, EST is
+            // -5. A "fix" that subtracts a constant four hours gets exactly one of these right --
+            // which is why subtracting four hours was the wrong fix.
+            var summer = new DateTime(2026, 8, 20, 9, 0, 0, DateTimeKind.Unspecified);   // EDT -4
+            var winter = new DateTime(2026, 1, 15, 9, 0, 0, DateTimeKind.Unspecified);   // EST -5
+            string summerUtc = BridgeTradeTime.ToUtcIso(summer);
+            string winterUtc = BridgeTradeTime.ToUtcIso(winter);
+            Assert(summerUtc == "2026-08-20T13:00:00.000Z", "summer 09:00 ET -> 13:00Z (EDT -4). Got: " + summerUtc);
+            Assert(winterUtc == "2026-01-15T14:00:00.000Z", "winter 09:00 ET -> 14:00Z (EST -5). Got: " + winterUtc);
+            Assert(summerUtc.Substring(11, 2) != winterUtc.Substring(11, 2),
+                "the two offsets DIFFER, so a constant subtraction cannot be correct for both");
+        }
+
+        private static void TestP2178_TheTrailingZIsNowTrueUtc()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: the trailing Z now names real UTC");
+
+            // Convert to UTC by an independent path (TimeZoneInfo on the same zone) and confirm the
+            // string agrees. The Z is a claim; this checks the claim rather than trusting it.
+            var et = new DateTime(2026, 8, 20, 9, 57, 51, 985, DateTimeKind.Unspecified);
+            DateTime expected = TimeZoneInfo.ConvertTimeToUtc(et, BridgeTradeTime.EasternZone);
+            string s = BridgeTradeTime.ToUtcIso(et);
+            Assert(s.EndsWith("Z"), "still ends with Z: " + s);
+            Assert(s == expected.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                "the stamped instant equals the real UTC instant. Got: " + s);
+        }
+
+        private static void TestP2178_TheSpringForwardGapDoesNotThrow()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: an impossible wall-clock does not take out the whole response");
+
+            // 2:30am ET on the 2026 spring-forward Sunday (2026-03-08) never happened. ConvertTimeToUtc
+            // throws ArgumentException on it, and a throw here would drop the ENTIRE trade list for one
+            // impossible stamp. It must return a real instant instead.
+            var gap = new DateTime(2026, 3, 8, 2, 30, 0, DateTimeKind.Unspecified);
+            bool threw = false;
+            string s = null;
+            try { s = BridgeTradeTime.ToUtcIso(gap); } catch { threw = true; }
+            Assert(!threw, "the spring-forward gap is handled, not thrown");
+            Assert(s != null && s.EndsWith("Z"), "and still produces a UTC stamp. Got: " + (s ?? "<threw>"));
+        }
+
+        private static void TestP2178_AKindTaggedInputIsTreatedAsAWallClock()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: a Kind-tagged value is read as an Eastern wall-clock, not thrown on");
+
+            // exec.Time arrives Kind Unspecified, but ConvertTimeToUtc THROWS if a value's Kind
+            // says Utc/Local and contradicts the zone -- so the SpecifyKind normalisation is
+            // load-bearing. Feed a Utc-tagged value carrying the SAME wall-clock reading: it must
+            // be interpreted as the ET wall time (13:57Z), not thrown on and not taken literally.
+            var tagged = new DateTime(2026, 8, 20, 9, 57, 51, 985, DateTimeKind.Utc);
+            bool threw = false;
+            string s = null;
+            try { s = BridgeTradeTime.ToUtcIso(tagged); } catch { threw = true; }
+            Assert(!threw, "a Kind-tagged input does not throw (SpecifyKind normalises it)");
+            Assert(s == "2026-08-20T13:57:51.985Z",
+                "and the wall-clock reading is interpreted in the source zone. Got: " + (s ?? "<threw>"));
+        }
+
+        private static void TestP2178_BothBridgeCallSitesConvertRatherThanStampingZ()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-178: both exec-time call sites convert, and neither stamps a false Z");
+
+            // SOURCE GATE (McpBridgeAddOn.cs is in no test build -- P2-27). It proves the wiring:
+            // the executed test above proves the conversion is right, this proves the addon actually
+            // uses it. Comments are stripped so the header's mention of the old pattern is not
+            // mistaken for a live one.
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            Assert(!code.Contains("exec.Time.ToString(\"yyyy-MM-ddTHH:mm:ss.fffZ\")"),
+                "P2-178: ExtractTrades no longer stamps a literal Z on an Eastern exec.Time");
+            Assert(!code.Contains("targetExec.Time.ToString(\"yyyy-MM-ddTHH:mm:ss.fffZ\")"),
+                "P2-178: fillTime no longer stamps a literal Z on an Eastern targetExec.Time");
+
+            // NARROW: the ban is on the false Z over an EXEC time only. DateTime.UtcNow.ToString(
+            // "...fffZ") is CORRECT and must survive -- the value already IS UTC. So assert the two
+            // conversions are present rather than banning the format string globally.
+            Assert(Regex.Matches(code, @"BridgeTradeTime\.ToUtcIso\b").Count == 2,
+                "P2-178: both call sites (ExtractTrades, fillTime) route through the converter");
+            Assert(Regex.IsMatch(code, @"time\s*=\s*BridgeTradeTime\.ToUtcIso\(exec\.Time\)"),
+                "P2-178: ExtractTrades' `time` field is the converted value");
+            Assert(Regex.IsMatch(code, @"fillTime""\]\s*=\s*BridgeTradeTime\.ToUtcIso\(targetExec\.Time\)"),
+                "P2-178: fillTime is the converted value");
+        }
+
+        // ================================================================================
+        // P2-181. The bridge twin of P2-150: PlaceOcoOrder read the exit legs' OrderState in the
+        // same breath as Submit() and derived "partial_submit" from it -- a status no live input
+        // could set, because Submit is async and the legs are Initialized/Submitted at that
+        // instant. SOURCE GATE only (McpBridgeAddOn.cs is in no test build, P2-27); the honest
+        // behaviour on the core side is executed by nt8-riskguard's P2-150 test.
+        // ================================================================================
+
+        private static void TestP2181_TheOcoPathReportsPendingLegsNotADeadVerdict()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] P2-181: PlaceOcoOrder reports pending_legs, not a synchronous partial_submit");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // Locate the OCO method by index (a multiline regex silently stops matching when a
+            // signature changes -- the exact failure this class of gate exists to avoid). The
+            // region ends at the next member.
+            int start = code.IndexOf("private object PlaceOcoOrder(");
+            int end = start < 0 ? -1 : code.IndexOf("\n        private ", start + 10);
+            string oco = (start >= 0 && end > start) ? code.Substring(start, end - start) : "";
+            Assert(oco.Length > 200, string.Format(
+                "the OCO method is locatable for inspection ({0} chars read)", oco.Length));
+
+            Assert(oco.Length > 200 && !oco.Contains("partial_submit"),
+                "P2-181: the dead 'partial_submit' verdict is gone from PlaceOcoOrder -- a status "
+                + "no live input could set is not a status");
+            Assert(oco.Length > 200 && !oco.Contains("rejectedOrders"),
+                "P2-181: the synchronous rejected-orders read that fed it is gone too -- the bug "
+                + "was the TIMING, so the read is removed, not widened");
+            Assert(Regex.IsMatch(oco, "status\\s*=\\s*\"pending_legs\""),
+                "P2-181: the OCO path reports pending_legs, the honest status");
         }
 
         // ================================================================================

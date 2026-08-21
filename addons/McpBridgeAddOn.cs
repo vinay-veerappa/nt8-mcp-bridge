@@ -2737,7 +2737,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             var targetOrder = account.CreateOrder(instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Target1", null);
 
             // Submit all valid orders safely
-            List<string> rejectedOrders = new List<string>();
             try
             {
                 var validOrders = new[] { entryOrder, stopOrder, targetOrder }
@@ -2747,14 +2746,18 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     account.Submit(validOrders);
                 }
-                // Check for rejected exit orders (NT8 may reject OCO children if no
-                // position exists yet). Report the rejection so callers know the
-                // bracket may not be live.
-                foreach (var o in new[] { stopOrder, targetOrder })
-                {
-                    if (o != null && (o.OrderState == OrderState.Rejected || o.OrderState == OrderState.Cancelled))
-                        rejectedOrders.Add(o.Name + " state=" + o.OrderState);
-                }
+                // P2-181. The sibling of P2-150 (DynamicAtmManager). This used to read the exit
+                // legs' OrderState in the same breath as Submit() and set "partial_submit" on
+                // Rejected/Cancelled -- but Submit is ASYNCHRONOUS: at this instant the legs are
+                // Initialized/Submitted, and their Rejected verdict arrives 20-200ms later on
+                // OnOrderUpdate. So the read could never catch a rejection, and "partial_submit"
+                // was a status no live input could set -- [[a-green-that-can-never-be-red]]. Do NOT
+                // restore it with a wider state set: the bug is the TIMING. The honest report is
+                // "pending_legs" with the leg ids below for the caller to read the real state
+                // (nt_orders / nt_atm_bracket_status). A genuinely rejected stop is still caught by
+                // the guard's own net -- NAKED_POSITION + the grace timer + MISSING_STOP_ATTACH.
+                // The per-leg `state` fields below are an honest snapshot of the state AT
+                // submission (whatever it is), not a verdict derived from reading it too early.
             }
             catch (Exception ex)
             {
@@ -2763,13 +2766,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             return new
             {
-                status = rejectedOrders.Count > 0 ? "partial_submit" : "submitted",
+                status = "pending_legs",
                 ocoId = ocoId,
                 entry = new { id = entryOrder.Id.ToString(), name = entryOrder.Name },
                 stop = new { id = stopOrder.Id.ToString(), name = stopOrder.Name, stopPrice = stopPrice, state = stopOrder.OrderState.ToString() },
                 target = new { id = targetOrder.Id.ToString(), name = targetOrder.Name, targetPrice = targetPrice, state = targetOrder.OrderState.ToString() },
-                rejectedExitOrders = rejectedOrders.Count > 0 ? rejectedOrders : null,
-                note = rejectedOrders.Count > 0 ? "Some exit orders were rejected (NT8 may reject OCO children without an open position). Verify position before relying on the bracket." : null
+                note = "Exit-leg acceptance is not known at submission; read the stop/target order ids (or nt_orders) for the live state."
             };
         }
 
@@ -4331,7 +4333,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 resDict["price"] = targetExec.Price;
                 resDict["quantity"] = targetExec.Quantity;
                 resDict["marketPosition"] = targetExec.MarketPosition.ToString();
-                resDict["fillTime"] = targetExec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+                // P2-178. Same false-Z as ExtractTrades; convert the Eastern wall-clock to UTC.
+                resDict["fillTime"] = BridgeTradeTime.ToUtcIso(targetExec.Time);
             }
 
             return resDict;
@@ -5530,7 +5533,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                         price = exec.Price,
                         quantity = exec.Quantity,
                         marketPosition = exec.MarketPosition.ToString(),
-                        time = exec.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                        // P2-178. exec.Time is an Eastern wall-clock; emit TRUE UTC so the Z is
+                        // not a lie. BridgeTradeTime handles the DST-dependent offset.
+                        time = BridgeTradeTime.ToUtcIso(exec.Time),
                         macroTag,
                         latencyMs,
                         commission = exec.Commission,
