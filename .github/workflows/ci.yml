@@ -71,6 +71,14 @@ jobs:
       - name: Code no test build compiles still parses
         run: python tools/check_bridge_parses.py
 
+      # P2-158. Ported from nt8-riskguard the same session it was written there
+      # ([[a-gate-is-per-repo]]): no broker call directly inside a `lock (_stateLock)` block. This
+      # repo holds no _stateLock, so the gate finds zero blocks and says so -- but its self-test
+      # supplies a synthetic violation, so it is ARMED for the day the bridge grows a serializing
+      # lock, rather than passing vacuously over an empty set.
+      - name: No broker call while holding _stateLock
+        run: python tools/check_lock_discipline.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
