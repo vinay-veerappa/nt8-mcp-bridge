@@ -79,6 +79,13 @@ jobs:
       - name: No broker call while holding _stateLock
         run: python tools/check_lock_discipline.py
 
+      # The two sides of the nt_place_oco_order contract live in one repo but two languages
+      # (wrapper schema + addon handler) and cannot be pinned in one type. They drifted -- the
+      # wrapper required `limitPrice` while the addon read only `targetPrice`, so every documented
+      # call failed. This gate fails if a wrapper-required OCO price field is not read by the addon.
+      - name: OCO wrapper/addon param contract holds
+        run: python tools/check_oco_param_contract.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse

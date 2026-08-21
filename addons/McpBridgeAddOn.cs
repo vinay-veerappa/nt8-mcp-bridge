@@ -2696,11 +2696,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             var actionStr = req.GetValueOrDefault("action")?.ToString() ?? "Buy";
             var quantity = Convert.ToInt32(req.GetValueOrDefault("quantity", 1));
             var stopPrice = Convert.ToDouble(req.GetValueOrDefault("stopPrice", 0));
-            var targetPrice = Convert.ToDouble(req.GetValueOrDefault("targetPrice", 0));
+            // The wrapper's `nt_place_oco_order` schema advertises the profit target as `limitPrice`
+            // and marks it REQUIRED, but this handler read only `targetPrice` -- so every call made
+            // through the documented schema failed with "targetPrice required" (the standalone-OCO
+            // half of P2-181's validation was blocked on exactly this). Accept both names; the
+            // wrapper is the public contract. Contract drift is the recurring wrapper-defect class
+            // ([[nt8-mcp-wrapper-defects]]) -- check_oco_param_contract.py now fails if they diverge.
+            double targetPrice = 0;
+            if (req.ContainsKey("targetPrice")) targetPrice = Convert.ToDouble(req["targetPrice"]);
+            else if (req.ContainsKey("limitPrice")) targetPrice = Convert.ToDouble(req["limitPrice"]);
 
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
             if (stopPrice <= 0) return new { error = "stopPrice required" };
-            if (targetPrice <= 0) return new { error = "targetPrice required" };
+            if (targetPrice <= 0) return new { error = "targetPrice (a.k.a. limitPrice) required" };
 
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = "instrument not found: " + symbol };
