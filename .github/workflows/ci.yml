@@ -86,6 +86,12 @@ jobs:
       - name: OCO wrapper/addon param contract holds
         run: python tools/check_oco_param_contract.py
 
+      # P1-131. There must be exactly ONE order-liveness predicate (BridgeOrderLiveness). This fails
+      # if a hand-rolled OrderState disjunction reappears in McpBridgeAddOn.cs, or the route to
+      # BridgeOrderLiveness is severed. The count feeds WouldStrand, which refuses a disconnect.
+      - name: One order-liveness predicate, not four
+        run: python tools/check_single_order_liveness.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse

@@ -14,3 +14,8 @@ __pycache__/
 # per-machine, and a rejected patch committed here would read as a proposal that stands.
 # The DURABLE record of a run belongs in the handover, not in a log nobody re-reads.
 logs/
+
+# tools/ci_local.py scratch: parallel git worktrees and per-battery logs. Per-run and
+# per-machine; a committed worktree dir would be a nested checkout nobody wants.
+.ci-local/
+.ci-local-logs/
