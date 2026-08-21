@@ -42,11 +42,22 @@ BRIDGE_SRC = REPO_ROOT / "addons"
 # that folder, so an .html sitting in it is at best ignored and at worst confusing.
 UI_SRC = REPO_ROOT / "ui"
 VENDOR_SRC = REPO_ROOT / "vendor" / "nt8-riskguard" / "addons"
+# P1-149. The core also ships STRATEGIES (RiskManagerBase, RiskGatekeeper) -- .cs that name
+# NinjaTrader.* Strategy types, so no test build compiles them, but NT8 does. RiskGatekeeper.CanTradeSize
+# -> ContractCapGate (an addon) is the contract-cap enforcement, and RiskManagerBase's entry path calls
+# it, so the strategies and the addon MUST deploy together or the one Custom assembly fails to compile
+# and EVERY addon -- the guard included -- stops loading. Only the vendored core has strategies; the
+# bridge has none.
+STRATEGIES_SRC = REPO_ROOT / "vendor" / "nt8-riskguard" / "strategies"
 
 NT8_HOME = Path(os.environ.get("USERPROFILE", "")) / "Documents" / "NinjaTrader 8" / "bin" / "Custom"
 # Globals.UserDataDir as the addons see it -- the NinjaTrader 8 folder itself, not bin/Custom.
 UI_DST = Path(os.environ.get("USERPROFILE", "")) / "Documents" / "NinjaTrader 8" / "RiskGuard" / "ui"
 ADDONS_DST = NT8_HOME / "AddOns"
+# ⚠️ Preserve the source's SUBFOLDER (strategies/Vinay/*.cs -> Strategies/Vinay/*.cs). NT8 compiles
+# Strategies/ RECURSIVELY, so a copy under a DIFFERENT subfolder than the hand-deployed one would be a
+# SECOND class definition beside it, not a replacement -- the exact trap the indicators sync hit.
+STRATEGIES_DST = NT8_HOME / "Strategies"
 
 # Nothing is skipped. RiskManagerAddOn.cs is excluded from the core's *test* build
 # (RiskGuardTests.csproj) because compiling it alongside RiskGuardAddOn.cs duplicates
@@ -170,21 +181,21 @@ def check_vendor_not_stale(deploying: bool) -> None:
 
     count = _git(sibling, "rev-list", "--count", "{0}..{1}".format(pinned, sibling_main)) or "?"
 
-    # Behind, but behind in WHAT? This tool deploys addons/*.cs and nothing else, so
-    # a pin trailing only docs, tests, tooling or the agent profile carries no deploy
-    # risk at all -- the .cs it would write are byte-identical. Blocking on that would
-    # make every documentation commit in the core require a tag-and-bump before the
-    # bridge could be deployed, and a guard that fires when nothing is wrong is one
-    # people learn to override. Same reasoning as file_hash() normalising line endings:
-    # a check that cries wolf is worse than no check.
+    # Behind, but behind in WHAT? This tool deploys the core's addons/ AND strategies/ .cs and nothing
+    # else, so a pin trailing only docs, tests, tooling or the agent profile carries no deploy risk at
+    # all -- the .cs it would write are byte-identical. Blocking on that would make every documentation
+    # commit in the core require a tag-and-bump before the bridge could be deployed, and a guard that
+    # fires when nothing is wrong is one people learn to override. Same reasoning as file_hash()
+    # normalising line endings: a check that cries wolf is worse than no check.
     #
-    # So: narrow the question to the only files that can hurt.
+    # So: narrow the question to the only files that can hurt. strategies/ is included since P1-149 --
+    # a pin behind on RiskManagerBase/RiskGatekeeper would deploy a stale entry-path enforcement.
     addon_commits = _git(sibling, "rev-list", "--count",
-                         "{0}..{1}".format(pinned, sibling_main), "--", "addons/")
+                         "{0}..{1}".format(pinned, sibling_main), "--", "addons/", "strategies/")
     if addon_commits == "0":
         print("  vendored core: {0} -- {1} commit(s) behind {2} main, but NONE touch".format(
             described, count, sibling.name))
-        print("                 addons/, so the deployed .cs are identical. Proceeding.")
+        print("                 addons/ or strategies/, so the deployed .cs are identical. Proceeding.")
         return
 
     print()
@@ -193,7 +204,7 @@ def check_vendor_not_stale(deploying: bool) -> None:
     # same class of defect as P1-70's log line, in the tool that reports on it.
     print("[{0}] the vendored core is STALE: {1} is {2} commit(s) behind {3} main,".format(
         "FATAL" if deploying else "WARN", described, count, sibling.name))
-    print("        including {0} that touch addons/.".format(addon_commits or "?"))
+    print("        including {0} that touch addons/ or strategies/.".format(addon_commits or "?"))
     print()
     print("        This tool deploys the core as well as the bridge, so deploying now")
     print("        would overwrite whatever core is live in NT8 with an OLDER one and")
@@ -282,6 +293,43 @@ def main() -> int:
             else:
                 print("  [DRIFT]   {0:<28} ({1})".format(src.name, label))
 
+    # ── the vendored core's strategies ──────────────────────────────────────────────
+    # RiskManagerBase.cs + RiskGatekeeper.cs go to Custom/Strategies/<subfolder>/, preserving the
+    # source's subfolder (Vinay/). No orphan deletion here: Strategies/Vinay/ holds many other bots
+    # this tool does not own, so it touches ONLY the files the vendored core ships. These deploy in the
+    # SAME run as ContractCapGate.cs (an addon, above), because RiskGatekeeper depends on it and NT8
+    # compiles the whole Custom tree as one assembly.
+    strat_added, strat_drifted, strat_identical = 0, 0, 0
+    if STRATEGIES_SRC.exists():
+        print()
+        print("[strategies/] {0} -> {1}".format(STRATEGIES_SRC, STRATEGIES_DST))
+        for src in sorted(p for p in STRATEGIES_SRC.rglob("*.cs")):
+            rel = src.relative_to(STRATEGIES_SRC)
+            dst = STRATEGIES_DST / rel
+            if not dst.exists():
+                strat_added += 1
+                if not args.verify and not args.dry_run:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    print("  [COPIED]  {0}  (core, new)".format(rel))
+                elif args.verify:
+                    print("  [MISSING] {0}  (core, not deployed)".format(rel))
+                else:
+                    print("  [DRY-RUN] {0}  (core, would copy)".format(rel))
+            elif file_hash(src) == file_hash(dst):
+                strat_identical += 1
+                if args.verify:
+                    print("  [OK]      {0}  (core)".format(rel))
+            else:
+                strat_drifted += 1
+                if not args.verify and not args.dry_run:
+                    shutil.copy2(src, dst)
+                    print("  [SYNCED]  {0}  (core, differed)".format(rel))
+                elif args.verify:
+                    print("  [DRIFT]   {0}  (core)".format(rel))
+                else:
+                    print("  [DRY-RUN] {0}  (core, would sync)".format(rel))
+
     # ── the browser UI's static files ──────────────────────────────────────────────
     # These are NOT .cs and do not go into bin/Custom -- NT8 compiles that folder and
     # anything else there is noise at best. The bridge serves them from UserDataDir,
@@ -322,7 +370,7 @@ def main() -> int:
 
     print()
     print("=" * 70)
-    total_drift = len(drifted) + len(added)
+    total_drift = len(drifted) + len(added) + strat_drifted + strat_added
     if args.verify:
         if total_drift == 0:
             print("  ALL IN SYNC ({0} files identical, {1} orphan(s))".format(
@@ -336,6 +384,9 @@ def main() -> int:
     else:
         print("  DONE: {0} synced, {1} copied (new), {2} already identical".format(
             len(drifted), len(added), len(identical)))
+        if STRATEGIES_SRC.exists():
+            print("  STRAT: {0} synced, {1} copied (new), {2} already identical".format(
+                strat_drifted, strat_added, strat_identical))
         if UI_SRC.exists():
             print("  UI:   {0} synced, {1} copied (new), {2} already identical".format(
                 ui_drifted, ui_added, ui_identical))
