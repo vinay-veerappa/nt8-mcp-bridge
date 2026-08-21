@@ -14,6 +14,7 @@ import { createInterface } from 'node:readline';
 import { request as httpRequest } from 'node:http';
 
 import { buildCopierConfigRequest } from './lib/copier-config-request.js';
+import { validateBreakevenPair } from './lib/atm-breakeven.js';
 
 // ─── Config ─────────────────────────────────────────────────────────────
 const NT8_HOST = process.env.NT8_HOST || '127.0.0.1';
@@ -177,6 +178,11 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_place_atm_order': {
+      // P2-154. Refuse an explicit offset>=trigger pair here, before the round-trip, naming
+      // both values. The addon refuses the same pair (DynamicAtmManager.ValidateBreakevenPlacement,
+      // kept); this is the additive schema-boundary fast-fail.
+      const beRefusal = validateBreakevenPair(args);
+      if (beRefusal) return { error: beRefusal };
       const res = await ntFetch('/api/order/atm', 'POST', args);
       return res.data;
     }
