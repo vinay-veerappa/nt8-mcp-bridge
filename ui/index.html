@@ -1028,6 +1028,10 @@ function renderGroups(data) {
       + '</select>'
       + '<button class="act" data-group="' + escAttr(gname) + '" data-do="addfollower">Add follower</button>'
       + '<button class="act warn" data-group="' + escAttr(gname) + '" data-do="delgroup">Delete group</button>'
+      // F-10: Flatten Group / panic button. Calls /api/emergency-flatten for each
+      // follower in the group. The confirmation states the consequence: flattening
+      // closes every position the group's followers hold, immediately.
+      + '<button class="act warn" data-group="' + escAttr(gname) + '" data-do="flatten">FLATTEN</button>'
       + '</div></div>';
   });
   html += '</section>';
@@ -1060,6 +1064,47 @@ function wireGroups() {
           + "the group; the accounts themselves are untouched.")) return;
         dispatch({ action: "remove_group", groupName: group },
                  "Deleted group \"" + group + "\".");
+      });
+    } else if (doWhat === "flatten") {
+      b.addEventListener("click", function () {
+        // F-10: flatten every follower in the group. The emergency-flatten endpoint
+        // takes an account filter and an idempotency key. We call it once per follower,
+        // each with its own key, and collect the results.
+        var followers = lastCopierRows
+          .filter(function (r) { return r.groupName === group; })
+          .map(function (r) { return r.followerAccountName; })
+          .filter(function (n, i, a) { return n && a.indexOf(n) === i; });
+        if (!followers.length) {
+          outcome("bad", "Group \"" + group + "\" has no followers to flatten.");
+          return;
+        }
+        if (!window.confirm("FLATTEN all followers in group \"" + group + "\"?\n\n"
+          + "This immediately closes every position held by " + followers.length
+          + " follower" + (followers.length > 1 ? "s" : "") + ":\n  "
+          + followers.join(", ") + "\n\n"
+          + "Each account is then locked for 60 minutes. This cannot be undone.")) return;
+        var done = 0;
+        var errors = [];
+        followers.forEach(function (f) {
+          apiPost("/api/emergency-flatten", {
+            account: f, idempotencyKey: "grp_" + Date.now() + "_" + f
+          }).then(function (res) {
+            done++;
+            if (res && !res.success) errors.push(f + ": " + (res.error || "failed"));
+            if (done >= followers.length) {
+              if (errors.length) outcome("bad", "Flatten complete with errors.", errors.join("; "));
+              else outcome("ok", "Flattened " + followers.length + " follower(s) in group \"" + group + "\".");
+              load();
+            }
+          }).catch(function (e) {
+            done++;
+            errors.push(f + ": " + e.message);
+            if (done >= followers.length) {
+              outcome("bad", "Flatten complete with errors.", errors.join("; "));
+              load();
+            }
+          });
+        });
       });
     }
   });
