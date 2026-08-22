@@ -6360,7 +6360,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         var heartbeat = JsonConvert.SerializeObject(new { @event = "heartbeat", status = "connected", serverVersion = Version, timestamp = DateTime.UtcNow });
                         writer.WriteLine("data: " + heartbeat + "\n");
                         writer.Flush();
-                        System.Threading.Thread.Sleep(15000); // 15s heartbeat interval
+                        System.Threading.Thread.Sleep(5000); // 5s heartbeat drives the page refresh
                     }
                 }
             }

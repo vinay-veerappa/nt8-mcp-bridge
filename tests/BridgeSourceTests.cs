@@ -4557,13 +4557,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             Assert(html.Contains("data.dormantCount") && html.Contains("data.accountCount"),
                 "P2-127: the page reads the dormant and total counts the route now sends");
-            Assert(html.Contains("dormtog") && html.Contains("showDormant"),
-                "P2-127: and it renders a toggle that reveals the dormant accounts");
+            // Operator decision 2026-08-22: dormant accounts are blown evals, always hidden.
+            // The toggle (dormtog/showDormant) is removed; the count is still stated.
             Assert(html.Contains("n.dormant"),
                 "P2-127: and each node carries the dormant flag the route classified");
-            Assert(html.Contains("not delivered by the broker on this login"),
-                "P2-127: and the filter is labelled as what it measures -- dormant means "
-                + "the broker did not deliver the account on this login, not that it is blown");
+            Assert(html.Contains("blown evals"),
+                "P2-127: and the filter is labelled as what the operator ruled -- dormant means blown");
         }
 
         // ==============================================================================

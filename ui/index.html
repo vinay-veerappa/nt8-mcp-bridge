@@ -664,7 +664,9 @@ var selectedAccount = null;
 // P2-127 follow-up. A dormant account (Connection == null, no position, no order, no
 // guard finding) is hidden by default behind a stated count and a toggle. The flag is
 // DATA the route classified; this renderer only skips it.
-var showDormant = false;   // the dormant-account filter; the hidden count is always stated
+// Operator decision 2026-08-22: dormant accounts are blown evals that will never come
+// back unless reset. They are ALWAYS hidden -- the toggle to show them is removed.
+var showDormant = false;
 
 function fleetNodeHtml(n) {
   var sel = (n.kind === "account" && n.name === selectedAccount) ? " sel" : "";
@@ -686,7 +688,7 @@ function fleetNodeHtml(n) {
       var kid = kids[i];
       // P2-127 follow-up. Dormant accounts are hidden unless the toggle is on. The
       // count is stated above the tree, so a hidden set is never silent.
-      if (kid.dormant && !showDormant) continue;
+      if (kid.dormant) continue;
       html += fleetNodeHtml(kid);
     }
     html += "</ul>";
@@ -710,17 +712,16 @@ function renderFleetTree(data) {
     return;
   }
 
-  // P2-127 follow-up. The dormant count is stated ALWAYS, even when zero -- a hidden
-  // set with no visible count is how an erasure and a default come to look identical.
+  // Operator decision 2026-08-22: dormant accounts are blown evals that will never come
+  // back unless reset. They are ALWAYS hidden -- the toggle to show them is removed.
   var dormant = Number(data.dormantCount) || 0;
   var total = Number(data.accountCount) || 0;
-  var shown = total - (showDormant ? 0 : dormant);
+  var shown = total - dormant;
   var filter = '<div class="filter note">'
-    + (showDormant
-        ? 'Showing all ' + total + ' accounts. <a id="dormtog">Hide the ' + dormant
-          + ' dormant</a>'
-        : 'Showing ' + shown + ' of ' + total + ' accounts — ' + dormant
-          + ' dormant (not delivered by the broker on this login). <a id="dormtog">Show all</a>')
+    + (dormant > 0
+        ? 'Showing ' + shown + ' of ' + total + ' accounts — ' + dormant
+          + ' dormant (blown evals, hidden).'
+        : 'Showing ' + shown + ' accounts.')
     + '</div>';
 
   var html = filter + "<ul>";
@@ -732,9 +733,6 @@ function renderFleetTree(data) {
           + esc(selectedAccount) + "</b> — <a id=\"fclear\">show the whole fleet</a></div>";
   }
   el.innerHTML = html;
-
-  var tog = document.getElementById("dormtog");
-  if (tog) tog.addEventListener("click", function () { showDormant = !showDormant; load(); });
 
   var clear = document.getElementById("fclear");
   if (clear) clear.addEventListener("click", function () {
@@ -2006,15 +2004,33 @@ document.getElementById("refresh").addEventListener("click", function () {
   load();
   loadConfig();   // an explicit Refresh is the operator asking; the 5s poll is not
 });
+// SSE: replace the 5s poll with a server-sent event stream. The bridge's
+// /api/events/stream sends a heartbeat every 5s; each heartbeat triggers a
+// refetch of the three data sources (fleet, copier, inspector tabs), which
+// is the same thing the old setInterval did but driven by the server.
+// Config is deliberately NOT refetched (same rule as before: a form rebuilt
+// under the cursor loses what was being typed).
+var sseSource = null;
+function startSSE() {
+  var t = token();
+  if (!t) return;
+  try {
+    sseSource = new EventSource("/api/events/stream");
+    sseSource.onmessage = function () { load(); };
+    sseSource.onerror = function () {
+      // Reconnect after 3s. EventSource auto-reconnects, but if the token
+      // expired the stream returns 401 and EventSource stops silently.
+      if (sseSource) sseSource.close();
+      setTimeout(startSSE, 3000);
+    };
+  } catch (e) {
+    // EventSource not supported (very old browser) -- fall back to poll.
+    setInterval(load, 5000);
+  }
+}
 load();
 loadConfig();
-// ⚠️ loadConfig is deliberately NOT in here. The poll re-renders #content and
-// #copier every five seconds, and a form rebuilt under the cursor loses what
-// was being typed -- and worse, silently reverts a field the operator had
-// already changed but not yet saved, so they save a diff that no longer says
-// what they meant. Config is read on load and on Refresh, and re-read after
-// every write.
-setInterval(load, 5000);
+startSSE();
 </script>
 </body>
 </html>
