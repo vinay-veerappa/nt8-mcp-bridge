@@ -4437,6 +4437,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(Regex.IsMatch(html, @"action:\s*""set_mode"""),
                 "P2-126: and it can set the copier's global mode");
 
+            // P2-126. Arm/disarm is section 4 decision 3's first frequent action, and the
+            // ONLY write that sends confirmLive:true -- arming is what turns a relationship
+            // from "copies to simulation" into "places real orders", so it must be a separate
+            // deliberate act with the engine's arming gate satisfied, never a silent no-op.
+            Assert(html.Contains("data-do=\"arm\""),
+                "P2-126: each row carries an arm/disarm button");
+            Assert(Regex.IsMatch(html, @"armedForLive:\s*nextArmed"),
+                "P2-126: the arm path sends armedForLive as a DIFF, not a whole row");
+            Assert(Regex.IsMatch(html, @"confirmLive:\s*true"),
+                "P2-126: and arming is the one write that sends confirmLive:true -- without it "
+                + "the engine's ApplyArmingGate refuses the arm and the button is a silent no-op");
+
             // The two rules, as negatives. The create path must not arm and must not
             // enable: a new relationship lands disabled and not armed, and arming is a
             // separate deliberate act.
@@ -4462,6 +4474,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             Assert(html.Contains("quantityRatio") && html.Contains("sizingMode"),
                 "P2-126: and the inline editor writes ratio and sizing mode as a DIFF, "
                 + "naming only the fields the operator changed");
+            Assert(html.Contains("maxPositionSize") && html.Contains("maxSlippageTicks")
+                   && html.Contains("autoSymbolConversion"),
+                "P2-126: and the inline editor writes the set-rarely scalars (max position, "
+                + "slippage threshold, auto symbol conversion) as DIFF fields, so "
+                + "PerTickerRatios and CustomSymbolMappings survive (P?-65's rule)");
+            Assert(html.Contains("perTickerRatios") && html.Contains("customSymbolMappings"),
+                "P2-126: and the inline editor writes the two dictionary fields (per-ticker "
+                + "ratios, symbol mappings) as parsed KEY=VALUE diffs, so a ticker rule can be "
+                + "added or removed without deleting the relationship");
         }
 
         /// <summary>

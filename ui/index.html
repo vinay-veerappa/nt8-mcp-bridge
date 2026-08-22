@@ -855,6 +855,12 @@ function renderCopier(data) {
       + '<td>'
       + '<button class="act" data-row="' + i + '" data-do="toggle">'
       + (r.isEnabled ? "Disable" : "Enable") + '</button>'
+      // P2-126. Arm/disarm is section 4 decision 3's first "frequent action", and it
+      // is the one that makes a relationship actually live. Arming is a separate
+      // deliberate act -- never a side effect of create or enable -- so it is its own
+      // button, and it is the ONLY write on this page that sends confirmLive:true.
+      + '<button class="act' + (r.armedForLive ? ' warn' : '') + '" data-row="' + i + '" data-do="arm">'
+      + (r.armedForLive ? "Disarm" : "Arm") + '</button>'
       + (r.isQuarantined
           ? '<button class="act warn" data-row="' + i + '" data-do="release">Release</button>'
           : '')
@@ -872,6 +878,25 @@ function renderCopier(data) {
       + esc(r.effectiveRatio || "") + '" title="ratio">'
       + '<select class="sizing" data-row="' + i + '" data-field="sizing">'
       + sizingOptions(r.sizingMode) + '</select>'
+      // P2-126. The set-rarely scalar config, inline on the row (section 4 decision 3
+      // puts set-rarely config in the inspector; these three are the scalars that fit
+      // a row without a dictionary editor). Each is a DIFF field, so PerTickerRatios
+      // and CustomSymbolMappings survive (P?-65's rule).
+      + '<input class="maxpos" data-row="' + i + '" data-field="maxpos" value="'
+      + esc(r.maxPositionSize === undefined ? "" : r.maxPositionSize) + '" title="max position size">'
+      + '<input class="slippage" data-row="' + i + '" data-field="slippage" value="'
+      + esc(r.maxSlippageTicks === undefined ? "" : r.maxSlippageTicks) + '" title="max slippage ticks (0 = off)">'
+      + '<label class="autosym"><input type="checkbox" class="autosym" data-row="' + i + '" data-field="autosym"'
+      + (r.autoSymbolConversion ? ' checked' : '') + '> auto symbol</label>'
+      // P2-126. The two dictionary fields, as "KEY=VALUE" textareas. A dynamic key-value
+      // form is the P2-41 shape (per-account repetition hides the one finding); a textarea
+      // shows the whole map at once and the page parses a diff back on save.
+      + '<div class="rowdict"><label>Per-ticker ratios (SYM=ratio)</label>'
+      + '<textarea class="perticker" data-row="' + i + '" rows="2" placeholder="NQ=2.0">'
+      + esc((r.perTickerRatioLines || []).join("\n")) + '</textarea></div>'
+      + '<div class="rowdict"><label>Symbol mappings (LEADER=FOLLOWER)</label>'
+      + '<textarea class="symmap" data-row="' + i + '" rows="2" placeholder="MNQ=NQ">'
+      + esc((r.symbolMappingLines || []).join("\n")) + '</textarea></div>'
       + '<button class="act" data-row="' + i + '" data-do="saveedit">Save</button>'
       + '</div>'
       + '<button class="act" data-row="' + i + '" data-do="edit">Edit</button>'
@@ -1228,6 +1253,51 @@ function releaseRow(r) {
            "Released the quarantine on " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
 }
 
+// P2-126. Arm/disarm a relationship. The ONLY write on this page that sends
+// confirmLive:true, because arming is the one action that turns a relationship
+// from "copies to simulation" into "places real orders on a live follower". The
+// engine's ApplyArmingGate refuses an arm without confirmLive, so omitting it
+// here would make the button a silent no-op -- the exact P1-88 shape.
+//
+// ⚠️ A grouped row arms the GROUP, not the follower: a follower managed by a group
+// has no ArmedForLive of its own, and pretending otherwise is the quiet lie this
+// page exists to stop. The confirmation says who else it moves.
+function armRow(r) {
+  var nextArmed = !r.armedForLive;
+  var what = r.groupName
+    ? 'group "' + r.groupName + '"'
+    : r.leaderAccountName + " -> " + r.followerAccountName;
+
+  var lines = [(nextArmed ? "ARM " : "DISARM ") + what + "?"];
+  if (r.groupName) {
+    var sibs = groupSiblings(r.groupName);
+    if (sibs.length > 1) {
+      lines.push("");
+      lines.push("This follower is managed by a GROUP, so this affects all "
+                 + sibs.length + " of its followers: " + sibs.join(", "));
+    }
+  }
+  if (nextArmed) {
+    lines.push("");
+    lines.push("Arming makes this relationship place REAL orders on a live follower. "
+      + "The engine runs preflight and refuses if it fails.");
+  } else {
+    lines.push("");
+    lines.push("Disarming stops it placing live orders; it copies to SIMULATION "
+      + "followers only until re-armed.");
+  }
+  if (!window.confirm(lines.join("\n"))) return;
+
+  // Same group/direct split as toggleRow: a grouped follower has no direct
+  // relationship, so arming it means arming the GROUP (set_group), not inventing
+  // a direct relationship under it.
+  var body = r.groupName
+    ? { action: "set_group", groupName: r.groupName, armedForLive: nextArmed, confirmLive: true }
+    : { action: "set", leaderAccount: r.leaderAccountName,
+        followerAccount: r.followerAccountName, armedForLive: nextArmed, confirmLive: true };
+  dispatch(body, (nextArmed ? "Armed " : "Disarmed ") + what + ".");
+}
+
 // P2-126. Delete a relationship. The confirmation states the CONSEQUENCE, not the
 // action: a delete is permanent, and if the follower is holding a position the
 // leader's exits will no longer reach it.
@@ -1277,6 +1347,9 @@ function saveRowEdit(r) {
   var idx = lastCopierRows.indexOf(r);
   var ratioEl = document.querySelector('#rowedit-' + idx + ' input.ratio');
   var sizingEl = document.querySelector('#rowedit-' + idx + ' select.sizing');
+  var maxposEl = document.querySelector('#rowedit-' + idx + ' input.maxpos');
+  var slippageEl = document.querySelector('#rowedit-' + idx + ' input.slippage');
+  var autosymEl = document.querySelector('#rowedit-' + idx + ' input.autosym');
   if (!ratioEl || !sizingEl) return;
 
   var body = { action: "set", leaderAccount: r.leaderAccountName,
@@ -1294,11 +1367,91 @@ function saveRowEdit(r) {
     if (r.sizingMode === "FixedLot") body.fixedLotMode = false;
   }
   if (mode && mode !== r.sizingMode) body.sizingMode = mode;
+
+  // P2-126. The set-rarely scalars, each a DIFF field. A blank input means "leave
+  // it alone", not "write zero" -- writing zero would reset a stored value the
+  // operator never touched, which is P?-65's rule in miniature.
+  if (maxposEl) {
+    var maxpos = parseInt(maxposEl.value, 10);
+    if (!isNaN(maxpos) && maxpos > 0) body.maxPositionSize = maxpos;
+  }
+  if (slippageEl) {
+    var slip = parseFloat(slippageEl.value);
+    if (!isNaN(slip) && slip >= 0) body.maxSlippageTicks = slip;
+  }
+  if (autosymEl) {
+    // Only send it when it DIFFERS from the stored value, so the "nothing to
+    // change" guard below still fires when the operator opened the editor and
+    // changed nothing. Sending it unconditionally would make every save a write.
+    if (autosymEl.checked !== !!r.autoSymbolConversion) {
+      body.autoSymbolConversion = autosymEl.checked;
+    }
+  }
+
+  // P2-126. The two dictionary fields, parsed from "KEY=VALUE" lines. A blank line
+  // is skipped; a malformed line is refused rather than silently dropped, because
+  // dropping a ticker rule the operator typed is the P1-23 "config must not lie"
+  // shape. An empty textarea means "clear the map" -- the engine's merge treats an
+  // explicit empty object as a wipe (ClearCollectionsNamedIn), which is the only
+  // way to remove a ticker rule without deleting the relationship.
+  var pertickerEl = document.querySelector('#rowedit-' + idx + ' textarea.perticker');
+  var symmapEl = document.querySelector('#rowedit-' + idx + ' textarea.symmap');
+  if (pertickerEl) {
+    // Only send when the text DIFFERS from the stored lines, so the "nothing to
+    // change" guard below still fires when the operator opened the editor and
+    // changed nothing. Sending an unchanged map would make every save a write.
+    var storedPerticker = (r.perTickerRatioLines || []).join("\n");
+    if (pertickerEl.value !== storedPerticker) {
+      var parsed = parseKeyValueLines(pertickerEl.value, true);
+      if (parsed === null) {
+        outcome("bad", "Per-ticker ratios: each line must be SYMBOL=number (e.g. NQ=2.0).");
+        return;
+      }
+      body.perTickerRatios = parsed;
+    }
+  }
+  if (symmapEl) {
+    var storedSymmap = (r.symbolMappingLines || []).join("\n");
+    if (symmapEl.value !== storedSymmap) {
+      var parsedMap = parseKeyValueLines(symmapEl.value, false);
+      if (parsedMap === null) {
+        outcome("bad", "Symbol mappings: each line must be LEADER=FOLLOWER (e.g. MNQ=NQ).");
+        return;
+      }
+      body.customSymbolMappings = parsedMap;
+    }
+  }
+
   if (Object.keys(body).length <= 3) {
-    outcome("bad", "Nothing to change. Set a ratio or a sizing mode first.");
+    outcome("bad", "Nothing to change. Set a ratio, a sizing mode, or a limit first.");
     return;
   }
   dispatch(body, "Updated " + r.leaderAccountName + " -> " + r.followerAccountName + ".");
+}
+
+// P2-126. Parse "KEY=VALUE" lines into an object. `numeric` controls whether the
+// value must be a number (per-ticker ratios) or is a string (symbol mappings).
+// Returns null on a malformed line so the caller can refuse the whole write.
+function parseKeyValueLines(text, numeric) {
+  var out = {};
+  var lines = String(text || "").split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    var eq = line.indexOf("=");
+    if (eq <= 0) return null;
+    var key = line.slice(0, eq).trim();
+    var val = line.slice(eq + 1).trim();
+    if (!key || !val) return null;
+    if (numeric) {
+      var n = parseFloat(val);
+      if (isNaN(n)) return null;
+      out[key] = n;
+    } else {
+      out[key] = val;
+    }
+  }
+  return out;
 }
 
 function wireActions(rows) {
@@ -1308,6 +1461,8 @@ function wireActions(rows) {
     var doWhat = b.getAttribute("data-do");
     if (doWhat === "toggle") {
       b.addEventListener("click", function () { toggleRow(r, !r.isEnabled); });
+    } else if (doWhat === "arm") {
+      b.addEventListener("click", function () { armRow(r); });
     } else if (doWhat === "release") {
       b.addEventListener("click", function () { releaseRow(r); });
     } else if (doWhat === "delete") {
