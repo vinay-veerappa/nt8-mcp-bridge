@@ -1651,7 +1651,17 @@ function renderConfig(data) {
   }
   loadedCfg = cfg;
 
-  var html = '<section><h2>Configuration</h2>'
+  // F-11: no-edits-while-live session lock. When the guard is in an acting mode,
+  // editing its config can change what rules enforce mid-position. The page does
+  // not prevent the edit (the operator may need to), but it warns.
+  var guardMode = data.guardMode || (data.system && data.system.mode) || "";
+  var liveWarn = guardMode === "live";
+  var warnHtml = liveWarn
+    ? '<div class="banner bad">The guard is in LIVE mode. Editing its config '
+      + 'changes what rules enforce while positions are open. Save with care.</div>'
+    : '';
+
+  var html = '<section><h2>Configuration</h2>' + warnHtml
     + '<table class="cfg"><thead><tr><th>Setting</th><th>Value</th><th>Stored</th>'
     + '<th>Path</th></tr></thead><tbody>';
 

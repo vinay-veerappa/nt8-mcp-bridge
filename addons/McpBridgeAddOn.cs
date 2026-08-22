@@ -6929,7 +6929,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (RiskGuardAddOn.Instance == null)
                     return new { error = "RiskGuardAddOn not loaded" };
-                return new { success = true, config = RiskGuardAddOn.Instance.Config };
+                // F-11: carry the guard's mode so the page can warn when editing live.
+                string guardMode = RiskGuardAddOn.Instance.GetMode();
+                return new { success = true, config = RiskGuardAddOn.Instance.Config, guardMode };
             }
 
             var req = JObject.Parse(body);
