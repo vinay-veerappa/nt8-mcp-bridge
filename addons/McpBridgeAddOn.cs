@@ -3381,6 +3381,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     barsPayload = new Dictionary<string, object> { ["bars"] = result };
                 }
 
+                var payload = (Dictionary<string, object>)barsPayload;
                 return new
                 {
                     symbol, period = periodName, periodValue, offset, status,
@@ -3393,14 +3394,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                     // HISTORY-LIMITED: fewer bars than requested means the series ran out.
                     hasMore = available >= requestSize,
                     format = columnar ? "columnar" : "rows",
-                    bars = barsPayload["bars"],
-                    columns = barsPayload["columns"],
-                    time = columnar ? ((Dictionary<string, object>)barsPayload)["time"] : null,
-                    open = columnar ? ((Dictionary<string, object>)barsPayload)["open"] : null,
-                    high = columnar ? ((Dictionary<string, object>)barsPayload)["high"] : null,
-                    low = columnar ? ((Dictionary<string, object>)barsPayload)["low"] : null,
-                    close = columnar ? ((Dictionary<string, object>)barsPayload)["close"] : null,
-                    volume = columnar ? ((Dictionary<string, object>)barsPayload)["volume"] : null,
+                    bars = payload["bars"],
+                    columns = payload["columns"],
+                    time = columnar ? payload["time"] : null,
+                    open = columnar ? payload["open"] : null,
+                    high = columnar ? payload["high"] : null,
+                    low = columnar ? payload["low"] : null,
+                    close = columnar ? payload["close"] : null,
+                    volume = columnar ? payload["volume"] : null,
                 };
             }
         }
@@ -6863,7 +6864,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             int count = req["count"] != null ? (int)req["count"] : 1440;
 
             double basePrice = 20000.0;
-            var barsRes = GetBars(symbol, "Minute", "1", "10", null);
+            var barsRes = GetBars(symbol, "Minute", "1", "10", null, null);
             var barsObj = JObject.FromObject(barsRes);
             var barsArr = barsObj["bars"] as JArray;
             if (barsArr != null && barsArr.Count > 0 && barsArr.Last["close"] != null)
@@ -6942,7 +6943,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (!entryRule.Equals("sma_crossover", StringComparison.OrdinalIgnoreCase))
                 return new { error = $"entryRule '{entryRule}' is not supported. Only 'sma_crossover' is implemented." };
 
-            var barsResult = GetBars(symbol, "Minute", "5", "500", null);
+            var barsResult = GetBars(symbol, "Minute", "5", "500", null, null);
             var barsJObj = JObject.FromObject(barsResult);
             var barsArr = barsJObj["bars"] as JArray;
             if (barsArr == null || barsArr.Count < 50) return new { error = "insufficient bar data for signal backtest (minimum 50 bars required)" };
