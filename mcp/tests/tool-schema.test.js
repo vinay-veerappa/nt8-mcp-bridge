@@ -200,7 +200,7 @@ test('account stays OPTIONAL where omitting it legitimately means all accounts',
   const OPTIONAL_BY_DESIGN = [
     'nt_orders',
     'nt_fill_events',
-    'nt_trade_chart',
+    'nt_chart',
     'nt_riskguard_state',
     'nt_extract_trades',
     'nt_stop_strategy',
@@ -224,7 +224,11 @@ test('the schemas are still structurally sound after any edit', () => {
   // fire in one session (the addon's ResolveOrRefuse site count, twice) and each time it made
   // the author state that the addition was deliberate. The `>= N` version of this assertion
   // let a mutant survive earlier today.
-  assert.equal(TOOLS.length, 56, 'tool count unchanged');   // 55 -> 56: F-17 nt_connection
+  //
+  // 56 -> 53: F-18 consolidated the three chart-capture tools (nt_capture_chart,
+  // nt_chart_snapshot, nt_trade_chart) into one nt_chart with a mode enum, and retired the
+  // permanent NOT_IMPLEMENTED stub nt_script_execute. Net -4 removed, +1 added.
+  assert.equal(TOOLS.length, 53, 'tool count unchanged');   // 56 -> 53: F-18 chart consolidation + nt_script_execute retirement
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);

@@ -7,7 +7,7 @@
  *
  * Zero npm dependencies. Uses only Node.js builtins.
  * Run: node nt-mcp-server.js
- * Version: 1.4.0
+ * Version: 1.5.0
  */
 
 import { createInterface } from 'node:readline';
@@ -15,6 +15,7 @@ import { request as httpRequest } from 'node:http';
 
 import { buildCopierConfigRequest } from './lib/copier-config-request.js';
 import { validateBreakevenPair } from './lib/atm-breakeven.js';
+import { filterAccounts, filterPositions } from './lib/account-filter.js';
 
 // ─── Config ─────────────────────────────────────────────────────────────
 const NT8_HOST = process.env.NT8_HOST || '127.0.0.1';
@@ -32,6 +33,12 @@ import { TOOLS } from './lib/tools.js';
 import { summarise, forAccount, accountNames } from './lib/inventory-view.js';
 
 // ─── HTTP Client to NT8 AddOn ──────────────────────────────────────────
+// The last HTTP status the bridge returned, so the dispatch site can flag a
+// non-2xx response as an MCP `isError` without every handler threading the
+// status through its return value. Safe as module state because MCP stdio is
+// strictly serialised: one line in, one awaited handler, one line out.
+let lastHttpStatus = 200;
+
 function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000, retries = 3) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, NT8_BASE);
@@ -66,6 +73,7 @@ function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000, retri
         let chunks = '';
         res.on('data', (chunk) => { chunks += chunk; });
         res.on('end', () => {
+          lastHttpStatus = res.statusCode;
           try {
             const parsed = JSON.parse(chunks);
             resolve({ status: res.statusCode, data: parsed });
@@ -111,6 +119,13 @@ function sendResult(id, result) {
 
 // ─── Tool Handlers ──────────────────────────────────────────────────────
 async function handleToolCall(name, args) {
+  // Reset per call so a stale status from a previous tool never leaks into this
+  // one's isError decision. The single-fetch tools (the vast majority) are then
+  // exactly correct. nt_health sets lastHttpStatus explicitly after its secondary
+  // riskguard fetch so that fetch can't contaminate it. nt_compile relies on its
+  // last poll's status, which is imperfect but acceptable — a failed compile result
+  // poll is itself an error condition.
+  lastHttpStatus = 200;
   switch (name) {
     case 'nt_health': {
       try {
@@ -130,6 +145,10 @@ async function handleToolCall(name, args) {
         } catch (guardErr) {
           riskguard = { loaded: false, error: guardErr.message };
         }
+        // The health fetch is the subject of this tool; the riskguard fetch above is
+        // secondary and allowed to fail on its own, so it must not overwrite the status
+        // that drives this call's isError.
+        lastHttpStatus = res.status;
         return {
           status: res.status === 200 ? 'connected' : 'error',
           server_version: SERVER_VERSION,
@@ -150,12 +169,18 @@ async function handleToolCall(name, args) {
 
     case 'nt_accounts': {
       const res = await ntFetch('/api/account');
-      return res.data;
+      const rows = Array.isArray(res.data) ? res.data : [];
+      const filtered = filterAccounts(rows, args.account);
+      if (filtered.error) return filtered;
+      return filtered;
     }
 
     case 'nt_positions': {
       const res = await ntFetch('/api/positions');
-      return Array.isArray(res.data) ? res.data : [];
+      const rows = Array.isArray(res.data) ? res.data : [];
+      // Positions, not accounts: an empty match means the account has no open positions,
+      // not that it does not exist. Return the (possibly empty) array — no refusal.
+      return filterPositions(rows, args.account);
     }
 
     case 'nt_orders': {
@@ -261,19 +286,34 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
-    case 'nt_capture_chart': {
-      const res = await ntFetch(`/api/chart/capture?symbol=${encodeURIComponent(args.symbol || '')}`);
-      return res.data;
-    }
-
-    case 'nt_chart_snapshot': {
-      const res = await ntFetch('/api/chart/snapshot', 'POST', args);
-      return res.data;
-    }
-
-    case 'nt_trade_chart': {
-      const res = await ntFetch('/api/chart/trade', 'POST', args);
-      return res.data;
+    // F-18. One tool, three chart-capture modes. The three former tools
+    // (nt_capture_chart / nt_chart_snapshot / nt_trade_chart) all wrapped the same
+    // CaptureChart() path server-side; a `mode` enum routes to the right endpoint
+    // without tripling the tool-list surface. `mode` is required — a chart capture
+    // is a read, but the three modes answer different questions, so the caller states
+    // which one.
+    case 'nt_chart': {
+      const mode = args.mode;
+      if (mode === 'capture') {
+        const res = await ntFetch(`/api/chart/capture?symbol=${encodeURIComponent(args.symbol || '')}`);
+        return res.data;
+      }
+      // Strip the wrapper-only `mode` field before posting to the addon — it is not an
+      // addon parameter, and leaking it into the body is sloppy even though the addon
+      // ignores unknown fields.
+      const { mode: _mode, ...body } = args;
+      if (mode === 'snapshot') {
+        const res = await ntFetch('/api/chart/snapshot', 'POST', body);
+        return res.data;
+      }
+      if (mode === 'trade') {
+        const res = await ntFetch('/api/chart/trade', 'POST', body);
+        return res.data;
+      }
+      // No fetch happened, so lastHttpStatus is still 200 from the per-call reset.
+      // An unknown mode is a client error — flag it explicitly so isError reflects it.
+      lastHttpStatus = 400;
+      return { error: `Unknown chart mode: '${mode}'. Use capture, snapshot, or trade.` };
     }
 
 
@@ -442,11 +482,6 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
-    case 'nt_script_execute': {
-      const res = await ntFetch('/api/script/execute', 'POST', args);
-      return res.data;
-    }
-
     case 'nt_subscribe': {
       return { status: 'subscribed', hubUrl: args.hubUrl || 'http://127.0.0.1:7891', sseEndpoint: 'http://127.0.0.1:7890/api/events/stream' };
     }
@@ -606,8 +641,13 @@ rl.on('line', async (line) => {
       case 'tools/call': {
         const { name, arguments: args } = params;
         const result = await handleToolCall(name, args || {});
+        // Compact JSON, not pretty-printed. Indentation whitespace on nested arrays
+        // (nt_bars up to 5,000 rows, nt_orders) adds 30-50% token overhead with zero
+        // parsing benefit to the model. `isError` lets a client distinguish a failed
+        // bridge round-trip from a success without content-sniffing the body.
         sendResult(id, {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+          isError: lastHttpStatus >= 400,
         });
         break;
       }

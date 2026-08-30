@@ -23,13 +23,23 @@ export const TOOLS = [
   },
   {
     name: 'nt_accounts',
-    description: 'List accounts, cash balances, buying power, and total equity',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'List accounts, cash balances, buying power, and total equity. Optionally restrict to one account; a name that matches nothing is REFUSED naming the available accounts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Restrict to one account name. Omit for all accounts. A name that matches nothing is refused, not answered about every account.' },
+      },
+    },
   },
   {
     name: 'nt_positions',
-    description: 'List open market positions with live P&L per account',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'List open market positions with live P&L per account. Optionally restrict to one account; a name that matches nothing is REFUSED naming the available accounts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Restrict to one account name. Omit for all accounts. A name that matches nothing is refused, not answered about every account.' },
+      },
+    },
   },
   {
     name: 'nt_orders',
@@ -255,43 +265,27 @@ export const TOOLS = [
       required: ['name'],
     },
   },
+  // F-18. The three former chart-capture tools (nt_capture_chart / nt_chart_snapshot /
+  // nt_trade_chart) all wrapped the same CaptureChart() path server-side. One tool with a
+  // `mode` enum cuts the tool-list surface without losing capability. `mode` is required:
+  // the three modes answer different questions, so the caller states which one.
   {
-    name: 'nt_capture_chart',
-    description: 'Capture active NinjaTrader WPF chart window as a base64 PNG screenshot image',
+    name: 'nt_chart',
+    description: 'Capture a NinjaTrader chart as a base64 PNG. mode=capture grabs the active chart window; mode=snapshot adds high-res sizing, marker overlays, and indicator highlighting; mode=trade overlays an execution fill\'s trade markers. All three wrap the same CaptureChart() path.',
     inputSchema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Instrument symbol of chart to capture (e.g. NQ 09-26)' },
+        mode: { type: 'string', enum: ['capture', 'snapshot', 'trade'], description: 'capture = active chart window; snapshot = high-res with markers/indicators; trade = execution-fill marker overlay' },
+        symbol: { type: 'string', description: 'Instrument symbol (e.g. NQ 09-26)' },
+        width: { type: 'number', description: 'Width px (snapshot/trade)', default: 1280 },
+        height: { type: 'number', description: 'Height px (snapshot/trade)', default: 720 },
+        markers: { type: 'array', items: { type: 'object' }, description: 'Overlay markers [{ time, price, label, color, shape }] (snapshot)' },
+        indicators: { type: 'array', items: { type: 'string' }, description: 'Indicator names to highlight (snapshot)' },
+        timeRange: { type: 'string', description: 'Time range to display (snapshot, e.g. 09:30-16:00 ET or ISO range)' },
+        executionId: { type: 'string', description: 'Execution ID to overlay trade markers for (trade)' },
+        account: { type: 'string', description: 'Account name filter (trade)' },
       },
-    },
-  },
-  {
-    name: 'nt_chart_snapshot',
-    description: 'Generate high-res chart snapshot with visual execution markers (buy/sell), price lines, and indicator overlays',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        symbol:     { type: 'string', description: 'Instrument symbol' },
-        width:      { type: 'number', description: 'Width px', default: 1280 },
-        height:     { type: 'number', description: 'Height px', default: 720 },
-        markers:    { type: 'array', items: { type: 'object' }, description: 'Overlay markers [{ time, price, label, color, shape }]' },
-        indicators: { type: 'array', items: { type: 'string' }, description: 'Indicator names to highlight' },
-        timeRange:  { type: 'string', description: 'Time range to display (e.g. 09:30-16:00 ET or ISO range)' },
-      },
-    },
-  },
-  {
-    name: 'nt_trade_chart',
-    description: 'Capture chart screenshot automatically for an execution fill with trade marker overlay returning imageId & base64',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        executionId: { type: 'string', description: 'Execution ID to overlay trade markers for' },
-        symbol:      { type: 'string', description: 'Instrument symbol (e.g. NQ 09-26)' },
-        account:     { type: 'string', description: 'Account name filter' },
-        width:       { type: 'number', description: 'Width px', default: 1280 },
-        height:      { type: 'number', description: 'Height px', default: 720 },
-      },
+      required: ['mode'],
     },
   },
 
@@ -604,18 +598,6 @@ export const TOOLS = [
       required: ['symbol', 'indicatorName'],
     },
   },
-  {
-    name: 'nt_script_execute',
-    description: 'NOT IMPLEMENTED — always refuses with error=NOT_IMPLEMENTED. The former ad-hoc C# executor wrote a throwaway _ScriptEval_ strategy into the live Custom assembly and recompiled it from an HTTP thread, which was measured failing (ECONNRESET) and is destructive. Do not call; use nt_compile, nt_strategy_source or nt_inspect_strategy instead.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        codeSnippet: { type: 'string', description: 'C# code snippet to execute' },
-      },
-      required: ['codeSnippet'],
-    },
-  },
-
   // ─── Phase 5 SSE Stream & Phase 6-8 Expansion Tools ───────────────────
   {
     name: 'nt_subscribe',
