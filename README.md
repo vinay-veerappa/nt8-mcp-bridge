@@ -125,5 +125,4 @@ bridge.
 
 The HTTP listener is unauthenticated unless a token is configured, via the `NT8_MCP_TOKEN`
 environment variable or `<NT8 UserDataDir>/mcp_token.txt`. With no token set, any local
-process can flatten positions and place orders. `nt_script_execute` refuses to run at all
-without one.
+process can flatten positions and place orders.

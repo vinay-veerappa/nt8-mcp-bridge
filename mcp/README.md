@@ -146,9 +146,11 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | Tool | Endpoint | Description |
 |------|----------|-------------|
 | `nt_quote` | `GET /api/quote?symbol=` | Real-time quote: bid, ask, last, volume, high, low |
-| `nt_bars` | `GET /api/bars?symbol=&period=&periodValue=&count=` | Historical OHLCV bars (bar-close time in NT8 timezone) |
+| `nt_bars` | `GET /api/bars?symbol=&period=&periodValue=&count=&format=` | Historical OHLCV bars (bar-close time in NT8 timezone). `format=columnar` returns six parallel arrays (~40% fewer tokens); default `rows` unchanged |
 | `nt_export_bars` | `POST /api/bars/export` | Export date range of OHLCV to CSV on NT8 machine |
 | `nt_get_export` | `GET /api/export?name=` | Retrieve exported CSV content |
+| `nt_list_exports` | `GET /api/exports` | List `mcp_*.csv` export files (name, size, modified), newest first |
+| `nt_delete_export` | `POST /api/exports/delete` | Delete one `mcp_*.csv` export file (name-gated: mcp_ prefix, .csv only) |
 | `nt_search` | `GET /api/search?query=` | Search instruments by name or symbol |
 
 ### Strategy Authoring, Compile, Backtest
@@ -158,6 +160,9 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_list_strategies` | `GET /api/strategies` | List NinjaScript source files in `bin\Custom\Strategies` |
 | `nt_strategy_source` | `GET /api/strategy/source?name=` | Read source of one strategy |
 | `nt_create_strategy` | `POST /api/strategy/create` | Write full NinjaScript source to `bin\Custom\Strategies` |
+| `nt_list_indicators` | `GET /api/indicators` | List NinjaScript source files in `bin\Custom\Indicators` |
+| `nt_indicator_source` | `GET /api/indicator/source?name=` | Read source of one indicator |
+| `nt_create_indicator` | `POST /api/indicator/create` | Write full NinjaScript indicator source to `bin\Custom\Indicators` |
 | `nt_compile` | `POST /api/compile` then `GET /api/compile/result` | In-process Roslyn compile + hot-swap; returns errors/warnings |
 | `nt_backtest` | `POST /api/backtest` | Run Strategy Analyzer backtest |
 | `nt_portfolio_backtest` | `POST /api/backtest/portfolio` | Multi-symbol simultaneous backtests with correlation matrix |
@@ -173,13 +178,12 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | Tool | Endpoint | Description |
 |------|----------|-------------|
 | `nt_get_logs` | `GET /api/logs?tab=&lines=` | Tail Output tab, Strategy Analyzer, or `interventions.jsonl` |
-| `nt_fill_events` | `GET /api/events/fills?account=&count=` | Query account execution fill history |
-| `nt_subscribe` | `GET /api/events/stream` (SSE) | Subscribe to real-time fills/FSM/error SSE stream |
-| `nt_capture_chart` | `GET /api/chart/capture?symbol=` | Capture chart window as base64 PNG. Symbol-specific matching is best-effort; falls back to any visible chart |
-| `nt_chart_snapshot` | `POST /api/chart/snapshot` | Enhanced screenshot with visual markers |
+| `nt_fill_events` | `GET /api/events/fills?account=&count=&offset=` | Query account execution fill history, paged backwards from the most recent (count 1-1000, default 50) |
+| `nt_events_since` | `GET /api/events/since?since=&count=` | Poll bridge intervention events (guard actions, writes, orders) after a UTC instant, from the same audit tail the UI events pane reads. Stateless poll, not a stream; `truncated=true` flags an incomplete window |
+| `nt_chart` | `GET /api/chart/capture?symbol=` · `POST /api/chart/snapshot` · `POST /api/chart/trade` | One chart tool with a `mode` enum: capture = active window as base64 PNG (symbol matching best-effort, falls back to any visible chart); snapshot = high-res with markers/indicators; trade = screenshot centered on a fill. |
+| `nt_charts` | `GET /api/chart/list` | List every open chart window: instrument, visibility, size, dispatcher thread. Read-only precondition check for capture/draw. |
 | `nt_open_chart` | `POST /api/chart/open` | Validates instrument and focuses Control Center. NT8 has no public AddOn API to open a chart window — use Ctrl+Shift+N |
 | `nt_draw_level` | `POST /api/chart/draw` | Draw line/rectangle/text onto a chart (best-effort; requires visible chart for exact instrument) |
-| `nt_trade_chart` | `POST /api/chart/trade` | Chart screenshot centered on trade entry/exit |
 
 ### Research, Risk, Automation
 
@@ -190,7 +194,6 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_synthetic_data` | `POST /api/data/synthetic` | Generate stress-scenario OHLCV datasets |
 | `nt_trade_journal` | `POST /api/trades/journal` | CRUD + tag + export trade journal entries |
 | `nt_schedule` | `POST /api/schedule/task` | Register cron-based tasks inside NT8 |
-| `nt_script_execute` | `POST /api/script/execute` | NOT IMPLEMENTED — refuses with `error=NOT_IMPLEMENTED` (former ad-hoc executor compiled throwaway classes into the live assembly from an HTTP thread; measured failing, removed) |
 | `nt_alert` | `POST /api/alert/create` | Create persistent price/indicator alerts |
 | `nt_riskguard_state` | `GET /api/riskguard/fsm-state?account=&instrument=` | Read RiskGuard FSM state, drawdown, limits |
 | `nt_riskguard_config` | `POST /api/riskguard/config` | Configure trailing drawdown, vol caps, blackouts |

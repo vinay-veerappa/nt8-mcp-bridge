@@ -228,7 +228,18 @@ test('the schemas are still structurally sound after any edit', () => {
   // 56 -> 53: F-18 consolidated the three chart-capture tools (nt_capture_chart,
   // nt_chart_snapshot, nt_trade_chart) into one nt_chart with a mode enum, and retired the
   // permanent NOT_IMPLEMENTED stub nt_script_execute. Net -4 removed, +1 added.
-  assert.equal(TOOLS.length, 53, 'tool count unchanged');   // 56 -> 53: F-18 chart consolidation + nt_script_execute retirement
+  //
+  // 53 -> 53: review pass retired the nt_subscribe stub (it returned fabricated URLs and
+  // subscribed to nothing) and added nt_charts (GET /api/chart/list existed with no tool),
+  // re-exposing chart discovery. Net -1 removed, +1 added.
+  //
+  // 53 -> 59: F-19/20/21/22 pass — export lifecycle (nt_list_exports, nt_delete_export),
+  // indicator authoring parity (nt_list_indicators, nt_indicator_source, nt_create_indicator),
+  // and nt_events_since (the honest successor to the retired nt_subscribe stub: a stateless
+  // audit-tail poll, not a fabricated subscription). Six added, none removed.
+  //
+  // nt_bars gained a `format` enum field (rows|columnar), not a new tool.
+  assert.equal(TOOLS.length, 59, 'tool count unchanged');   // 56 -> 53 -> 53 -> 59
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);
@@ -457,4 +468,113 @@ test('F-16: every advertised tool is dispatched, and every dispatched tool is ad
   // sides still has to be stated deliberately in one place.
   assert.equal(dispatched.size, advertised.size,
     'the dispatcher and the tool list are the same size');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review pass: the schema is a contract, and four clauses of it were false.
+//
+//   * nt_subscribe was a STUB: it returned fabricated URLs ("status: subscribed")
+//     and subscribed to nothing — P1-72's exact shape, a tool that advertises and
+//     does not implement. Retired rather than implemented: the SSE endpoint is a
+//     long-lived connection an MCP tool call (one request, one response) cannot
+//     model.
+//
+//   * nt_orders and nt_fill_events advertise limit/offset/count bounds in prose
+//     ("max 5,000 rows" already burned this repo once — P3-111). The addon clamps;
+//     the schema now says so with minimum/maximum instead of hoping the caller
+//     reads the addon source.
+//
+//   * nt_charts: GET /api/chart/list shipped in the chart-discovery release with
+//     no tool in front of it, which is P1-102's shape — implemented and invisible.
+// ─────────────────────────────────────────────────────────────────────────────
+test('the nt_subscribe stub is gone, not silently still advertised', () => {
+  // A stub that answers "subscribed" without subscribing is worse than no tool:
+  // it is a green light for a capability that does not exist.
+  assert.ok(!byName.has('nt_subscribe'), 'nt_subscribe must not come back without a real SSE client');
+});
+
+test('nt_charts is advertised AND dispatched (GET /api/chart/list)', () => {
+  const tool = byName.get('nt_charts');
+  assert.ok(tool, 'nt_charts exists in the advertised list');
+  const serverSrc = fs.readFileSync(path.resolve(__dirname, '..', 'nt-mcp-server.js'), 'utf8');
+  assert.match(serverSrc, /case\s+'nt_charts'\s*:/, 'nt_charts has a dispatch case');
+  // And the endpoint it names is real: the route literal must exist in the addon.
+  const addonSrc = fs.readFileSync(ADDON_SOURCE, 'utf8');
+  assert.match(addonSrc, /case\s+"\/api\/chart\/list"/,
+    'GET /api/chart/list exists in the addon, so the tool cannot drift into a 404');
+});
+
+test('pagination bounds advertised by nt_orders match the addon clamp (1..500)', () => {
+  const p = props('nt_orders');
+  assert.equal(p.limit.minimum, 1, 'limit minimum matches the addon clamp floor');
+  assert.equal(p.limit.maximum, 500, 'limit maximum matches BridgeOrderQuery.MaxLimit');
+  assert.ok(p.offset.minimum === undefined || p.offset.minimum >= 0, 'offset is non-negative');
+});
+
+test('pagination bounds advertised by nt_fill_events match the addon clamp (1..1000)', () => {
+  const p = props('nt_fill_events');
+  assert.equal(p.count.minimum, 1);
+  assert.equal(p.count.maximum, 1000);
+  assert.ok(p.offset.minimum === undefined || p.offset.minimum >= 0, 'offset is non-negative');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-19 / F-20 / F-21 / F-22: the review's four deferred items.
+//
+// Each schema gate pins the SAME property the C# side implements, because the
+// wrapper-addon contract has burned this repo when its two halves lived apart
+// (P1-72 enum drift, P2-109 dropped params, the OCO limitPrice/targetPrice split).
+// ─────────────────────────────────────────────────────────────────────────────
+test('F-22: nt_events_since requires since, names no hub, and is honest about polling', () => {
+  const tool = byName.get('nt_events_since');
+  assert.ok(tool, 'nt_events_since exists');
+  assert.ok(required('nt_events_since').includes('since'),
+    'since is required — an omitted instant has no safe meaning for "events since"');
+  assert.match(tool.description, /poll/i,
+    'the description says POLL — the retired nt_subscribe stub is not coming back as a '
+    + 'tool that silently claims to stream');
+  assert.ok(!('default' in tool.inputSchema.properties),
+    'no fabricated defaults: nt_subscribe returned hubUrl defaults for a hub that does not exist');
+  // And the addon route it names is real.
+  const addonSrc = fs.readFileSync(ADDON_SOURCE, 'utf8');
+  assert.match(addonSrc, /case\s+"\/api\/events\/since"/, '/api/events/since exists in the addon');
+});
+
+test('F-19: export lifecycle tools exist and delete is gated to mcp_*.csv', () => {
+  assert.ok(byName.get('nt_list_exports'), 'nt_list_exports exists');
+  const del = byName.get('nt_delete_export');
+  assert.ok(del, 'nt_delete_export exists');
+  assert.ok(required('nt_delete_export').includes('name'), 'delete requires a name');
+  assert.match(del.description, /mcp_\*\.csv/i,
+    'the description states the same gate the addon enforces (mcp_ prefix, .csv)');
+  const addonSrc = fs.readFileSync(ADDON_SOURCE, 'utf8');
+  assert.match(addonSrc, /case\s+"\/api\/exports"/, 'GET /api/exports exists in the addon');
+  assert.match(addonSrc, /case\s+"\/api\/exports\/delete"/, 'POST /api/exports/delete exists in the addon');
+});
+
+test('F-20: indicator authoring parity with the strategy trio', () => {
+  for (const name of ['nt_list_indicators', 'nt_indicator_source', 'nt_create_indicator']) {
+    assert.ok(byName.get(name), `${name} exists`);
+  }
+  assert.ok(required('nt_indicator_source').includes('name'), 'source read requires a name');
+  assert.deepEqual(required('nt_create_indicator'), ['name', 'source'],
+    'create requires name+source, exactly like nt_create_strategy');
+  const addonSrc = fs.readFileSync(ADDON_SOURCE, 'utf8');
+  for (const route of ['/api/indicators', '/api/indicator/source', '/api/indicator/create']) {
+    assert.match(addonSrc, new RegExp(`case\\s+"${route.replace(/\//g, '\\/')}"`),
+      `${route} exists in the addon`);
+  }
+  // And the indicator path gate mirrors the strategy one — a weaker second gate would
+  // make the read a traversal hole SafeStrategyPath closed.
+  assert.match(addonSrc, /SafeIndicatorPath/,
+    'the addon routes indicator paths through a Safe path gate, not hand-rolled concat');
+});
+
+test('F-21: nt_bars format is opt-in and rows stays the default', () => {
+  const p = props('nt_bars');
+  assert.ok(p.format, 'format is declared');
+  assert.deepEqual(p.format.enum, ['rows', 'columnar'],
+    'format is a closed enum — an unexpected value would be a silent shape change');
+  assert.equal(p.format.default, 'rows',
+    'rows is the default: the response shape a caller gets without asking must not have changed');
 });

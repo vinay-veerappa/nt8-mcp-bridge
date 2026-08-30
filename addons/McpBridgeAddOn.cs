@@ -661,10 +661,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // which is P2-109 at a second endpoint.
                 case "/api/bars":
                     return GetBars(query["symbol"], query["period"], query["periodValue"],
-                        query["count"], query["offset"]);
+                        query["count"], query["offset"], query["format"]);
                 case "/api/search":             return SearchInstruments(query["query"]);
                 case "/api/bars/export":        return Post(method, () => ExportBars(body));
                 case "/api/export":             return ReadExportFile(query["name"]);
+                // F-19. Export lifecycle: the tool could GET one file and had no way to see what
+                // exists or to remove one, so every large pull leaked a file into UserDataDir.
+                case "/api/exports":            return ListExports();
+                case "/api/exports/delete":     return Post(method, () => DeleteExport(body));
                 case "/api/order":              return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOrder(b)));
                 case "/api/order/oco":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceOcoOrder(b)));
                 case "/api/order/atm":          return Post(method, () => ExecuteIdempotencyFromReq(body, b => PlaceAtmOrder(b)));
@@ -690,6 +694,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategies":         return ListStrategies();
                 case "/api/strategy/source":    return GetStrategySource(query["name"]);
                 case "/api/strategy/create":    return Post(method, () => CreateStrategy(body));
+                // F-20. Indicator authoring parity with strategies: list / read / write for
+                // bin\Custom\Indicators, same SafeName gate, same compile-by-nt_compile loop.
+                case "/api/indicators":         return ListIndicators();
+                case "/api/indicator/source":   return GetIndicatorSource(query["name"]);
+                case "/api/indicator/create":   return Post(method, () => CreateIndicator(body));
                 case "/api/compile":            return Post(method, () => Compile(body));
                 case "/api/compile/result":     return ReadCompileResult();
                 case "/api/backtest":           return Post(method, () => Backtest(body));
@@ -708,7 +717,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/chart/open":         return Post(method, () => OpenChart(body));
                 case "/api/chart/draw":         return Post(method, () => DrawChartLevel(body));
 
-                case "/api/events/fills":       return GetFillEvents(query["count"] ?? "50");
+                case "/api/events/fills":       return GetFillEvents(query["account"], query["count"] ?? "50", query["offset"]);
+                // F-22. "What happened while I was away" -- a stateless poll of the audit tail
+                // after a timestamp, where the retired SSE tool advertised a subscription that
+                // did not exist.
+                case "/api/events/since":       return GetEventsSince(query["since"], query["count"]);
                 // P1-69 / §5.3: GET was missing, so the ONLY way to inspect the live copier config was
                 // to POST -- i.e. to write in order to read. That defeats the GET-mutate-POST-GET-diff
                 // discipline this project relies on, and it is why the live metrics could not simply
@@ -718,7 +731,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/trades/extract":     return ExtractTrades(query["account"], query["format"], query["from"], query["to"], query["limit"]);
                 case "/api/trades/monte-carlo": return Post(method, () => MonteCarlo(body));
                 case "/api/indicator/values":   return GetIndicatorValues(query["symbol"], query["indicatorName"], query["period"], query["barsBack"]);
-                case "/api/script/execute":     return Post(method, () => ScriptExecute(body));
                 case "/api/backtest/portfolio": return Post(method, () => PortfolioBacktest(body));
                 case "/api/data/synthetic":    return Post(method, () => SyntheticData(body));
                 case "/api/backtest/signal":   return Post(method, () => SignalBacktest(body));
@@ -836,6 +848,63 @@ namespace NinjaTrader.NinjaScript.AddOns
             File.WriteAllText(path, source, new UTF8Encoding(false));
             return new { status = existed ? "updated" : "created", name = Path.GetFileNameWithoutExtension(path), file = path, bytes = source.Length,
                          note = "call /api/compile to build + hot-load this strategy" };
+        }
+
+        // -
+        //  Indicator authoring -- the strategy trio's twin for bin\Custom\Indicators,
+        //  reusing the SAME name gate. A weaker second gate here would make the read-only
+        //  `nt_indicator_source` the traversal hole `SafeStrategyPath` closed (P1-72's
+        //  advertised-vs-implemented shape at a security boundary).
+        // -
+
+        private static string IndicatorsDir =>
+            Path.Combine(Globals.UserDataDir, "bin", "Custom", "Indicators");
+
+        private static string SafeIndicatorPath(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new Exception("name required");
+            name = name.Trim();
+            if (name.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 3);
+            if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || name.Contains("..") || name.Contains("/") || name.Contains("\\"))
+                throw new Exception($"invalid indicator name: {name}");
+            return Path.Combine(IndicatorsDir, name + ".cs");
+        }
+
+        private object ListIndicators()
+        {
+            var dir = IndicatorsDir;
+            if (!Directory.Exists(dir)) return new { dir, indicators = new List<object>() };
+            var list = Directory.GetFiles(dir, "*.cs")
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(fi => fi.LastWriteTimeUtc)
+                .Select(fi => new { name = Path.GetFileNameWithoutExtension(fi.Name), file = fi.Name, bytes = fi.Length, modified = fi.LastWriteTimeUtc })
+                .ToList();
+            return new { dir, count = list.Count, indicators = list };
+        }
+
+        private object GetIndicatorSource(string name)
+        {
+            var path = SafeIndicatorPath(name);
+            if (!File.Exists(path)) return new { error = $"indicator not found: {name}" };
+            return new { name = Path.GetFileNameWithoutExtension(path), file = Path.GetFileName(path), source = File.ReadAllText(path) };
+        }
+
+        private object CreateIndicator(string body)
+        {
+            var req = JObject.Parse(body ?? "{}");
+            var name = req.Str("name");
+            var source = req.Str("source");
+            var overwrite = req.Bool("overwrite", true);
+            if (string.IsNullOrWhiteSpace(source)) return new { error = "source required" };
+
+            var path = SafeIndicatorPath(name);
+            var existed = File.Exists(path);
+            if (existed && !overwrite) return new { error = $"indicator exists (pass overwrite=true): {name}" };
+
+            Directory.CreateDirectory(IndicatorsDir);
+            File.WriteAllText(path, source, new UTF8Encoding(false));
+            return new { status = existed ? "updated" : "created", name = Path.GetFileNameWithoutExtension(path), file = path, bytes = source.Length,
+                         note = "call /api/compile to build + hot-load this indicator" };
         }
 
         // -
@@ -3221,7 +3290,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // The parsing, clamping and refusal decisions live in BridgeBarsQuery (which names no NT8
         // type, so tests EXECUTE them); this method does the NT8 work and nothing else.
         private object GetBars(string symbol, string periodStr, string periodValueRaw,
-                               string countRaw, string offsetRaw)
+                               string countRaw, string offsetRaw, string formatRaw)
         {
             if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
             var instrument = Instrument.GetInstrument(symbol);
@@ -3271,17 +3340,51 @@ namespace NinjaTrader.NinjaScript.AddOns
                         count = 0, available, hasMore = false, bars = new List<object>(),
                     };
 
-                var result = new List<object>();
-                for (int i = start; i < start + take; i++)
-                    result.Add(new
+                // F-21. Columnar encoding, OPT-IN via format=columnar. Six parallel arrays replace
+                // {time,open,high,low,close,volume} repeated per row: 5,000 rows measured ~531KB
+                // row-wise, ~40% of it the six field names said 5,000 times. The row-wise shape
+                // stays the default -- every existing consumer reads it, and a wrapper silently
+                // changing a response shape is P2-109's family by another door.
+                //
+                // ⚠️ ONE response site, not two. A second `return new { ... hasMore = ... }`
+                // block for the columnar shape re-implements the pager's termination signal in a
+                // second place, which is exactly what the hasMore source gate exists to stop
+                // (its first failure found a THIRD assignment). The shape -- row objects or six
+                // parallel arrays -- is chosen below; hasMore is derived once.
+                bool columnar = string.Equals(formatRaw, "columnar", StringComparison.OrdinalIgnoreCase);
+                object barsPayload;
+                if (columnar)
+                {
+                    var times = new List<object>(); var opens = new List<object>(); var highs = new List<object>();
+                    var lows = new List<object>(); var closes = new List<object>(); var volumes = new List<object>();
+                    for (int i = start; i < start + take; i++)
                     {
-                        time = bars.GetTime(i), open = bars.GetOpen(i), high = bars.GetHigh(i),
-                        low = bars.GetLow(i), close = bars.GetClose(i), volume = bars.GetVolume(i),
-                    });
+                        times.Add(bars.GetTime(i)); opens.Add(bars.GetOpen(i)); highs.Add(bars.GetHigh(i));
+                        lows.Add(bars.GetLow(i)); closes.Add(bars.GetClose(i)); volumes.Add(bars.GetVolume(i));
+                    }
+                    barsPayload = new Dictionary<string, object>
+                    {
+                        ["columns"] = new[] { "time", "open", "high", "low", "close", "volume" },
+                        ["time"] = times, ["open"] = opens, ["high"] = highs,
+                        ["low"] = lows, ["close"] = closes, ["volume"] = volumes,
+                    };
+                }
+                else
+                {
+                    var result = new List<object>();
+                    for (int i = start; i < start + take; i++)
+                        result.Add(new
+                        {
+                            time = bars.GetTime(i), open = bars.GetOpen(i), high = bars.GetHigh(i),
+                            low = bars.GetLow(i), close = bars.GetClose(i), volume = bars.GetVolume(i),
+                        });
+                    barsPayload = new Dictionary<string, object> { ["bars"] = result };
+                }
+
                 return new
                 {
                     symbol, period = periodName, periodValue, offset, status,
-                    count = result.Count, available,
+                    count = take, available,
                     // Whether paging further back can yield anything. ⚠️ NOT `start > 0`: when NT8
                     // returns exactly what was asked for, `start` is 0 and older history still
                     // exists, so that test would tell an agent to stop one page early -- silent
@@ -3289,7 +3392,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                     // ticket fixes. What is actually knowable is whether the fetch was
                     // HISTORY-LIMITED: fewer bars than requested means the series ran out.
                     hasMore = available >= requestSize,
-                    bars = result,
+                    format = columnar ? "columnar" : "rows",
+                    bars = barsPayload["bars"],
+                    columns = barsPayload["columns"],
+                    time = columnar ? ((Dictionary<string, object>)barsPayload)["time"] : null,
+                    open = columnar ? ((Dictionary<string, object>)barsPayload)["open"] : null,
+                    high = columnar ? ((Dictionary<string, object>)barsPayload)["high"] : null,
+                    low = columnar ? ((Dictionary<string, object>)barsPayload)["low"] : null,
+                    close = columnar ? ((Dictionary<string, object>)barsPayload)["close"] : null,
+                    volume = columnar ? ((Dictionary<string, object>)barsPayload)["volume"] : null,
                 };
             }
         }
@@ -3391,6 +3502,35 @@ namespace NinjaTrader.NinjaScript.AddOns
             var path = Path.Combine(Globals.UserDataDir, name);
             if (!File.Exists(path)) return new { error = $"not found: {name}" };
             return new { name, bytes = new FileInfo(path).Length, content = File.ReadAllText(path) };
+        }
+
+        // F-19. The other half of export lifecycle: what can I fetch, and how do I stop
+        // accumulating mcp_*.csv files in UserDataDir forever. Both gate the name with the
+        // SAME checks ReadExportFile has always used (mcp_ prefix, .csv suffix, no invalid
+        // filename chars) -- a second, weaker gate here would make delete the traversal hole
+        // read never was.
+        private object ListExports()
+        {
+            var files = Directory.GetFiles(Globals.UserDataDir, "mcp_*.csv")
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(fi => fi.LastWriteTimeUtc)
+                .Select(fi => new { name = fi.Name, bytes = fi.Length, modified = fi.LastWriteTimeUtc })
+                .ToList();
+            return new { dir = Globals.UserDataDir, count = files.Count, exports = files };
+        }
+
+        private object DeleteExport(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var name = req.Str("name");
+            if (string.IsNullOrWhiteSpace(name))
+                return new { error = "name required" };
+            if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || !name.StartsWith("mcp_") || !name.EndsWith(".csv"))
+                return new { error = "only mcp_*.csv export files are deletable" };
+            var path = Path.Combine(Globals.UserDataDir, name);
+            if (!File.Exists(path)) return new { error = $"not found: {name}" };
+            File.Delete(path);
+            return new { deleted = name };
         }
 
         private object SearchInstruments(string query)
@@ -3995,14 +4135,31 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
 
-        private object GetFillEvents(string countStr)
+        private object GetFillEvents(string accountName, string countStr, string offsetStr)
         {
-            int c;
-            int count = int.TryParse(countStr, out c) ? c : 50;
+            // Same three rules as /api/orders (BridgeOrderQuery): unparseable falls back to the
+            // default, count clamped to [1,1000], a negative offset is 0. /api/events/fills took
+            // only `count` before, so the wrapper's `account` and `offset` were silently dropped
+            // -- an account filter answered about every account (P2-109 again, third endpoint)
+            // and every page was page one.
+            int count = BridgeQueryValue.ParseInt(countStr, 50, 1, 1000);
+            int offset = BridgeQueryValue.ParseInt(offsetStr, 0, 0, int.MaxValue);
+
+            // P1-90 on a read path: a SUPPLIED name that resolves to nothing is refused naming
+            // the accounts that exist, never answered about all of them.
+            if (!string.IsNullOrWhiteSpace(accountName))
+            {
+                var fillsResolution = BridgeAccountResolver.ResolveOrRefuse(
+                    accountName, Account.All.Select(a => a.Name), "list fill events");
+                if (fillsResolution.Refused) return new { error = fillsResolution.Error };
+                accountName = fillsResolution.Name;
+            }
+
             var fills = new List<object>();
 
             foreach (Account account in Account.All)
             {
+                if (!BridgeAccountScope.Matches(account.Name, accountName)) continue;
                 foreach (Execution exec in account.Executions)
                 {
                     fills.Add(new
@@ -4019,8 +4176,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
 
-            var result = fills.Skip(Math.Max(0, fills.Count - count)).ToList();
-            return new { success = true, count = result.Count, fills = result };
+            // Pages backwards from the most recent: skip `offset` of the newest, then take `count`.
+            // ⚠️ Named olderRemaining, not hasMore, deliberately: this list is NOT windowed by a
+            // fetch (unlike /api/bars, where `start > 0` is the hasMore anti-pattern -- start is 0
+            // whenever NT8 returned exactly what was asked for). account.Executions holds the
+            // whole matched set, so here start > 0 IS the true "older fills remain" signal, and
+            // sharing the bars pager's name would put a file-wide source gate's pattern on a
+            // different question.
+            int end = Math.Max(0, fills.Count - offset);
+            int start = Math.Max(0, end - count);
+            var result = fills.GetRange(start, end - start);
+
+            bool olderRemaining = start > 0;
+            Log($"[FILLS] Account={accountName ?? "ALL"} Matched={fills.Count} Count={count} "
+                + $"Offset={offset} Returned={result.Count} OlderRemaining={olderRemaining}");
+            return new { success = true, count = result.Count, matched = fills.Count, olderRemaining, fills = result };
         }
 
         // - v1.4.0 Expansion Endpoints -
@@ -6325,23 +6495,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             atr[0] = double.NaN;
             return TakeLast(atr, barsBack);
         }
- 
-
-        private object ScriptExecute(string body)
-        {
-            return new
-            {
-                success = false,
-                error = "NOT_IMPLEMENTED",
-                message = "nt_script_execute is intentionally not implemented. The former "
-                        + "implementation wrote a throwaway _ScriptEval_ strategy into the live "
-                        + "Custom assembly and recompiled it from a background HTTP thread, which "
-                        + "was measured failing (ECONNRESET) on 2026-08-15; recompiling the live "
-                        + "assembly from an HTTP thread is destructive. Refusing explicitly beats "
-                        + "advertising an executor that cannot run -- use the specific tools "
-                        + "(nt_compile, nt_strategy_source, nt_inspect_strategy) instead."
-            };
-        }
 
         private void HandleSseStream(HttpListenerContext ctx)
         {
@@ -6432,6 +6585,73 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return lines;
             }
             return lines;
+        }
+
+        // F-22. The events story, finished: /api/events/stream was heartbeat-only, and the
+        // SSE tool was retired for advertising a subscription that did not exist. But the
+        // NEED behind it was real -- "what happened while I was away" -- and the answer lives
+        // in the same audit record the events pane reads: every POST the bridge serves is
+        // logged to interventions.jsonl with a UTC timestamp.
+        //
+        // This is a STATELESS POLL, not a cursor server: since= returns the bounded tail's
+        // events AFTER that instant. A truly stateful cursor would invent a second event store
+        // beside the audit record, and two event stores is how the events pane and the
+        // investigation disagree (F-9's shape).
+        //
+        // ⚠️ BOUNDS ARE THE MEASURED ONES FROM P2-127: the file grew 43MB in one day, so the
+        // tail is capped the way the pane's is and a `since` older than the tail CANNOT be
+        // answered honestly -- the response SAYS so (truncated=true) rather than returning a
+        // subset that reads as complete history.
+        private const int EventsSinceMaxBytes = 256 * 1024;
+        private const int EventsSinceMaxLines = 500;
+
+        private object GetEventsSince(string sinceRaw, string countRaw)
+        {
+            if (string.IsNullOrWhiteSpace(sinceRaw))
+                return new { error = "since required (ISO-8601 UTC, e.g. 2026-08-29T14:00:00Z)" };
+            DateTime since;
+            if (!DateTime.TryParse(sinceRaw, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out since))
+                return new { error = $"since is not a parseable timestamp: {sinceRaw}" };
+
+            int maxLines = BridgeQueryValue.ParseInt(countRaw, EventsSinceMaxLines, 1, EventsSinceMaxLines);
+
+            var tail = ReadInterventionTail(EventsSinceMaxBytes);
+            if (tail.Count == 0)
+                return new { since = sinceRaw, events = new List<object>(), truncated = false,
+                             note = "no events read (log absent or unreadable)" };
+
+            var events = new List<object>();
+            bool sawOlder = false;   // a tail line PREDATES `since` -> the tail is not deep enough
+            foreach (var line in tail)
+            {
+                JObject obj;
+                try { obj = JObject.Parse(line); } catch { continue; }
+                var ts = obj["timestamp"]?.ToString();
+                DateTime when;
+                if (!DateTime.TryParse(ts, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out when))
+                    continue;
+                if (when <= since) { sawOlder = true; continue; }
+                events.Add(obj);
+            }
+
+            // Newest first, capped: a poll that returns 10,000 SUBSCRIBE lines is P2-127's
+            // telemetry hazard again. Older-than-since lines only appear when the bounded tail
+            // does not reach back past `since`, which is exactly when the answer would
+            // silently lie about being complete.
+            var paged = events
+                .OrderByDescending(e => ((JObject)e)["timestamp"]?.ToString())
+                .Take(maxLines)
+                .ToList<object>();
+            return new
+            {
+                since = sinceRaw,
+                matched = events.Count,
+                returned = paged.Count,
+                truncated = events.Count > maxLines || sawOlder,
+                events = paged,
+            };
         }
 
         private static string ScheduledTasksFile => Path.Combine(Globals.UserDataDir, "RiskGuard", "scheduled_tasks.json");

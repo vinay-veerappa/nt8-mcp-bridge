@@ -89,7 +89,7 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 
 ---
 
-## 4. Complete 52-Tool Reference (Phases 1–8 Shipped)
+## 4. Complete Tool Reference (Phases 1–8 Shipped)
 
 ### Phase 1 — Account Management, Live Trading & Quotes
 | Tool Name | Endpoint | Description |
@@ -106,7 +106,7 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | `nt_close_position` | `POST /api/position/close` | Flatten a position and cancel working orders for a symbol. |
 | `nt_emergency_flatten`| `POST /api/emergency-flatten`| **Atomic Kill-Switch**: Cancel all orders, flatten positions, and engage RiskGuard lockout. |
 | `nt_quote` | `GET /api/quote?symbol=` | Real-time quote stream (bid, ask, last, volume, daily high/low) with auto-subscription. |
-| `nt_bars` | `GET /api/bars?...` | Fetch historical OHLCV bars with pagination (`limit`, `offset`) capped at 5,000 rows. |
+| `nt_bars` | `GET /api/bars?...` | Fetch historical OHLCV bars with pagination (`limit`, `offset`) capped at 5,000 rows. `format=columnar` returns six parallel arrays (~40% fewer tokens); default `rows` unchanged. |
 | `nt_search` | `GET /api/search?query=` | Search available instrument master records by symbol or description. |
 
 ### Phase 2 — Strategy Development & Backtesting
@@ -115,6 +115,9 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | `nt_list_strategies` | `GET /api/strategies` | List NinjaScript strategy source `.cs` files in `bin\Custom\Strategies`. |
 | `nt_strategy_source` | `GET /api/strategy/source?name=` | Read raw NinjaScript C# source code. |
 | `nt_create_strategy` | `POST /api/strategy/create` | Write NinjaScript C# source file into `bin\Custom\Strategies`. |
+| `nt_list_indicators` | `GET /api/indicators` | List NinjaScript indicator source `.cs` files in `bin\Custom\Indicators`. |
+| `nt_indicator_source` | `GET /api/indicator/source?name=` | Read raw NinjaScript indicator C# source code. |
+| `nt_create_indicator` | `POST /api/indicator/create` | Write NinjaScript indicator C# source file into `bin\Custom\Indicators`. |
 | `nt_compile` | `POST /api/compile` | Hot-swap compile NinjaScript in-process via Roslyn (**no NT8 restart required**). |
 | `nt_backtest` | `POST /api/backtest` | Run Strategy Analyzer backtests over symbol, UTC date range, timeframe, and parameters. |
 
@@ -123,6 +126,8 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | :--- | :--- | :--- |
 | `nt_export_bars` | `POST /api/bars/export` | Download & export raw historical OHLCV bars to CSV (continuous or single contract). |
 | `nt_get_export` | `GET /api/export?name=` | Fetch generated export CSV file content over network. |
+| `nt_list_exports` | `GET /api/exports` | List `mcp_*.csv` export files on the NT8 machine (name, size, modified). |
+| `nt_delete_export` | `POST /api/exports/delete` | Delete one `mcp_*.csv` export file (name-gated). |
 
 ### Phase 4 — Strategy Deployment & Real-Time Monitoring
 | Tool Name | Endpoint | Description |
@@ -135,13 +140,12 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 ### Phase 5 — Real-Time Streaming & Observability
 | Tool Name | Endpoint | Description |
 | :--- | :--- | :--- |
-| `nt_subscribe` | `GET /api/events/stream` | Subscribe to NinjaTrader Hub (`ninjatrader_hub.py`) or McpBridge SSE stream. |
-| `nt_capture_chart` | `GET /api/chart/capture` | Capture active WPF chart window as a base64 PNG screenshot. |
-| `nt_chart_snapshot` | `POST /api/chart/snapshot` | High-res PNG chart screenshot with overlay markers, price lines, indicators, and time range. |
-| `nt_trade_chart` | `POST /api/chart/trade` | Visual Feedback Loop: Auto-capture execution fill chart with trade marker overlays, returning image ID & base64. |
+| `nt_chart` | `GET /api/chart/capture` · `POST /api/chart/snapshot` · `POST /api/chart/trade` | One chart tool with a `mode` enum (`capture`/`snapshot`/`trade`): base64 PNG of the active window, high-res with markers/indicators, or a fill-centered trade screenshot. |
+| `nt_charts` | `GET /api/chart/list` | List every open chart window (instrument, visibility, size, dispatcher thread). |
 | `nt_open_chart` | `POST /api/chart/open` | Programmatically open a chart window/tab for a symbol and period. |
 | `nt_get_logs` | `GET /api/logs` | Tail Output tab logs, Strategy Analyzer output, or `interventions.jsonl`. |
-| `nt_fill_events` | `GET /api/events/fills` | Query execution fill history with pagination (`limit`, `offset`). |
+| `nt_fill_events` | `GET /api/events/fills` | Query execution fill history, paged backwards from the most recent (`account`, `count` 1-1000, `offset`). |
+| `nt_events_since` | `GET /api/events/since` | Poll intervention events (guard actions, config writes, orders) logged after a UTC instant, from the audit record the UI events pane reads. Stateless poll — no live SSE subscription; `truncated=true` flags an incomplete window. |
 | `nt_inspect_strategy` | `GET /api/strategy/inspect` | Reflect over compiled strategy assemblies to extract input parameters and types. |
 | `nt_indicator_values`| `GET /api/indicator/values`| Retrieve calculated historical or live indicator values (SMA, EMA, VWAP, ATR). |
 
@@ -158,7 +162,6 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | `nt_extract_trades` | `GET /api/trades/extract` | Extract execution records enriched with MAE/MFE, macro window tags (`macro_1050`), and latency. |
 | `nt_monte_carlo` | `POST /api/trades/monte-carlo` | Run Block Bootstrap Monte Carlo simulations returning Risk of Ruin %, CVaR @ 95%/99%, and MaxDD bands. |
 | `nt_draw_level` | `POST /api/chart/draw` | Plot S/R levels, Midnight Open, HOD/LOD, or FVG boxes onto charts via `Draw.*` methods. |
-| `nt_script_execute` | `POST /api/script/execute` | Execute sandboxed C# utility snippets or pre-approved helper functions. |
 
 ### Phase 7 — Advanced Research & Automation Pipeline
 | Tool Name | Endpoint | Description |

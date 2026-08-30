@@ -7,7 +7,7 @@
  *
  * Zero npm dependencies. Uses only Node.js builtins.
  * Run: node nt-mcp-server.js
- * Version: 1.5.0
+ * Version: 1.7.0
  */
 
 import { createInterface } from 'node:readline';
@@ -24,7 +24,7 @@ const NT8_BASE = `http://${NT8_HOST}:${NT8_PORT}`;
 const NT8_MCP_TOKEN = process.env.NT8_MCP_TOKEN || '';
 
 const SERVER_NAME = 'nt-mcp-server';
-const SERVER_VERSION = '1.5.0';
+const SERVER_VERSION = '1.7.0';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 
 
@@ -261,6 +261,8 @@ async function handleToolCall(name, args) {
         count: String(args.count ?? 100),
         offset: String(args.offset ?? 0),
       });
+      // F-21: columnar is opt-in and passes through; the default 'rows' shape is unchanged.
+      if (args.format) params.append('format', String(args.format));
       const res = await ntFetch(`/api/bars?${params}`);
       return res.data;
     }
@@ -283,6 +285,17 @@ async function handleToolCall(name, args) {
 
     case 'nt_get_export': {
       const res = await ntFetch(`/api/export?name=${encodeURIComponent(args.name)}`, 'GET', null, 60000);
+      return res.data;
+    }
+
+    // F-19. Export lifecycle.
+    case 'nt_list_exports': {
+      const res = await ntFetch('/api/exports');
+      return res.data;
+    }
+
+    case 'nt_delete_export': {
+      const res = await ntFetch('/api/exports/delete', 'POST', { name: args.name });
       return res.data;
     }
 
@@ -322,6 +335,15 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    // GET /api/chart/list existed with no tool reaching it, so "does NT8 actually have a
+    // chart open for this symbol?" — the precondition every capture/draw tool depends on —
+    // was only answerable by raw HTTP. Read-only; reports one row per chart window with its
+    // instrument and dispatcher thread, and a diagnostics row when zero charts are found.
+    case 'nt_charts': {
+      const res = await ntFetch('/api/chart/list');
+      return res.data;
+    }
+
     case 'nt_get_logs': {
       const params = new URLSearchParams({
         tab: args.tab || 'Output',
@@ -332,11 +354,30 @@ async function handleToolCall(name, args) {
     }
 
     case 'nt_fill_events': {
-      const params = new URLSearchParams();
+      // Fills pages BACKWARDS from the most recent (the addon keeps the tail), so offset
+      // must reach the addon — the addon dropped both it and `account` until now, which
+      // made every page page one and an account filter answer about everyone (P2-109's
+      // shape). count is clamped here because the addon's int.TryParse had no upper bound.
+      const count = Math.min(1000, Math.max(1, Number(args.count) || 50));
+      const params = new URLSearchParams({ count: String(count) });
       if (args.account) params.append('account', args.account);
-      if (args.count) params.append('count', String(args.count));
       if (args.offset) params.append('offset', String(args.offset));
       const res = await ntFetch(`/api/events/fills?${params}`);
+      return res.data;
+    }
+
+    // F-22. "What happened while I was away" — the honest successor to the retired
+    // nt_subscribe stub. Stateles poll of the guard's audit record after a UTC instant;
+    // the addon reports truncated=true when its bounded tail cannot reach back to `since`.
+    case 'nt_events_since': {
+      if (!args.since || !String(args.since).trim()) {
+        // No fetch happened; flag it as a client error rather than a silent default.
+        lastHttpStatus = 400;
+        return { error: 'since is required (ISO-8601 UTC, e.g. 2026-08-29T14:00:00Z)' };
+      }
+      const params = new URLSearchParams({ since: String(args.since) });
+      if (args.count) params.append('count', String(args.count));
+      const res = await ntFetch(`/api/events/since?${params}`);
       return res.data;
     }
 
@@ -482,10 +523,6 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
-    case 'nt_subscribe': {
-      return { status: 'subscribed', hubUrl: args.hubUrl || 'http://127.0.0.1:7891', sseEndpoint: 'http://127.0.0.1:7890/api/events/stream' };
-    }
-
     case 'nt_portfolio_backtest': {
       const res = await ntFetch('/api/backtest/portfolio', 'POST', args, 300000);
       return res.data;
@@ -573,6 +610,27 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    // F-20. Indicator authoring mirrors the strategy trio; nt_create_strategy's
+    // `overwrite !== false` default is preserved.
+    case 'nt_list_indicators': {
+      const res = await ntFetch('/api/indicators');
+      return res.data;
+    }
+
+    case 'nt_indicator_source': {
+      const res = await ntFetch(`/api/indicator/source?name=${encodeURIComponent(args.name)}`);
+      return res.data;
+    }
+
+    case 'nt_create_indicator': {
+      const res = await ntFetch('/api/indicator/create', 'POST', {
+        name: args.name,
+        source: args.source,
+        overwrite: args.overwrite !== false,
+      });
+      return res.data;
+    }
+
     case 'nt_compile': {
       try {
         await ntFetch('/api/compile', 'POST', { debug: !!args.debug, ignoreWarnings: !!args.ignoreWarnings }, 30000);
@@ -594,6 +652,12 @@ async function handleToolCall(name, args) {
           }
         } catch { /* bridge reloading */ }
       }
+      // Every poll failed or came back non-object (bridge gone for >=~25s of the
+      // 15x1.5s window). That is a failed tool call, not a success carrying a
+      // description: flag it so isError is true. Without this the per-call reset
+      // keeps lastHttpStatus at 200 and a compile that died during hot-swap
+      // reports success to the client.
+      lastHttpStatus = 502;
       return { error: 'compile result unavailable' };
     }
 

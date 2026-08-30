@@ -48,8 +48,8 @@ export const TOOLS = [
       type: 'object',
       properties: {
         account: { type: 'string', description: 'Filter by account name' },
-        limit:   { type: 'number', description: 'Max orders to return (default 50)', default: 50 },
-        offset:  { type: 'number', description: 'Offset for pagination', default: 0 },
+        limit:   { type: 'number', minimum: 1, maximum: 500, description: 'Max orders to return, 1-500 (clamped by the addon)', default: 50 },
+        offset:  { type: 'number', minimum: 0, description: 'Offset for pagination', default: 0 },
       },
     },
   },
@@ -224,6 +224,7 @@ export const TOOLS = [
         periodValue: { type: 'number', description: 'Period value (e.g. 5 for 5m)', default: 1 },
         count:       { type: 'number', minimum: 1, maximum: 5000, description: 'Bars per call, 1-5000 (clamped, never rejected)', default: 100 },
         offset:      { type: 'number', minimum: 0, description: 'Bars to skip, counting back from the most recent. offset=100 with count=100 is the 100 bars BEFORE the latest 100', default: 0 },
+        format:      { type: 'string', enum: ['rows', 'columnar'], description: 'rows (default) = one object per bar as before. columnar = six parallel arrays (time/open/high/low/close/volume), ~40% fewer tokens on large pulls — read response.columns before indexing', default: 'rows' },
       },
       required: ['symbol'],
     },
@@ -265,6 +266,22 @@ export const TOOLS = [
       required: ['name'],
     },
   },
+  {
+    // F-19. The other two-thirds of export lifecycle: you could fetch one file but never
+    // see what existed or clean up, so every large pull leaked mcp_*.csv into UserDataDir.
+    name: 'nt_list_exports',
+    description: 'List mcp_*.csv export files on the NT8 machine (name, size, last modified), newest first. Pair with nt_get_export to read one and nt_delete_export to clean up.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'nt_delete_export',
+    description: 'Delete one mcp_*.csv export file by name. Only files matching mcp_*.csv are deletable — refuse paths, other extensions, or anything else.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Export filename to delete (mcp_*.csv only)' } },
+      required: ['name'],
+    },
+  },
   // F-18. The three former chart-capture tools (nt_capture_chart / nt_chart_snapshot /
   // nt_trade_chart) all wrapped the same CaptureChart() path server-side. One tool with a
   // `mode` enum cuts the tool-list surface without losing capability. `mode` is required:
@@ -303,6 +320,14 @@ export const TOOLS = [
     },
   },
   {
+    name: 'nt_charts',
+    description: 'List every open NinjaTrader chart window: instrument, visibility, size and dispatcher thread, plus a diagnostics row when zero charts are open. Read-only precondition check for the chart capture/draw tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
     name: 'nt_get_logs',
     description: 'Tail NinjaTrader Output tab logs, Strategy Analyzer output, or interventions.jsonl audit file',
     inputSchema: {
@@ -315,14 +340,30 @@ export const TOOLS = [
   },
   {
     name: 'nt_fill_events',
-    description: 'Query account execution fill history with pagination',
+    description: 'Query account execution fill history, paged backwards from the most recent fill. count=1..1000 (default 50); offset skips further back.',
     inputSchema: {
       type: 'object',
       properties: {
         account: { type: 'string', description: 'Filter by account' },
-        count:   { type: 'number', description: 'Number of recent fills to return', default: 50 },
-        offset:  { type: 'number', description: 'Offset for pagination', default: 0 },
+        count:   { type: 'number', minimum: 1, maximum: 1000, description: 'Number of recent fills to return, 1-1000', default: 50 },
+        offset:  { type: 'number', minimum: 0, description: 'Fills to skip before the most recent', default: 0 },
       },
+    },
+  },
+  {
+    // F-22. The honest successor to the retired nt_subscribe stub: an MCP call is one
+    // request/response, so a live SSE subscription cannot be modeled. What CAN be answered
+    // is "what happened since my last poll" — a stateless read of the guard's audit record
+    // (interventions.jsonl), the same source the UI events pane reads.
+    name: 'nt_events_since',
+    description: 'Poll bridge intervention events (guard actions, config writes, orders, flattens) logged since a UTC timestamp. Read of the same audit record the UI events pane shows; truncated=true means the bounded tail could not reach back to since. Poll after long idle; do not use for live streaming.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since:  { type: 'string', description: 'ISO-8601 UTC timestamp (e.g. 2026-08-29T14:00:00Z). Events strictly after this instant are returned.', pattern: '^\\d{4}-\\d{2}-\\d{2}T' },
+        count:  { type: 'number', minimum: 1, maximum: 500, description: 'Max events to return, 1-500 (default 500)', default: 500 },
+      },
+      required: ['since'],
     },
   },
   {
@@ -598,17 +639,7 @@ export const TOOLS = [
       required: ['symbol', 'indicatorName'],
     },
   },
-  // ─── Phase 5 SSE Stream & Phase 6-8 Expansion Tools ───────────────────
-  {
-    name: 'nt_subscribe',
-    description: 'Subscribe to NinjaTrader Hub (ninjatrader_hub.py) or McpBridge real-time SSE event stream for fills, RiskGuard FSM state transitions, and strategy errors',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        hubUrl: { type: 'string', description: 'NinjaTrader Hub URL or local broadcast bus', default: 'http://127.0.0.1:7891' },
-      },
-    },
-  },
+  // ─── Phase 6-8 Expansion Tools ────────────────────────────────────────
   {
     name: 'nt_portfolio_backtest',
     description: 'Run simultaneous multi-symbol portfolio backtests with correlation matrix calculation and capital allocation metrics',
@@ -741,6 +772,37 @@ export const TOOLS = [
       properties: {
         name:      { type: 'string', description: 'Strategy class/file name (no .cs). Must match the class name in source.' },
         source:    { type: 'string', description: 'Full NinjaScript C# source (namespace NinjaTrader.NinjaScript.Strategies, class : Strategy)' },
+        overwrite: { type: 'boolean', description: 'Overwrite if it already exists', default: true },
+      },
+      required: ['name', 'source'],
+    },
+  },
+  // F-20. Indicator authoring parity: the strategy trio has had its seam since Phase 2
+  // (write source -> compile -> inspect/deploy). Indicators could only be read (nt_inspect_
+  // strategy reflects compiled ones); authoring an indicator meant hand-editing files on
+  // the NT8 box.
+  {
+    name: 'nt_list_indicators',
+    description: 'List NinjaScript indicator source files in bin\\Custom\\Indicators (name, size, last modified).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'nt_indicator_source',
+    description: 'Read the NinjaScript source of one indicator by class/file name. Note: nt_indicator_values reads CALCULATED values from a compiled indicator; this reads its SOURCE.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Indicator class/file name (no .cs)' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'nt_create_indicator',
+    description: 'Write a NinjaScript indicator (.cs) into bin\\Custom\\Indicators. Pass full NinjaScript C# source. Call nt_compile afterward to build + hot-load it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:      { type: 'string', description: 'Indicator class/file name (no .cs). Must match the class name in source.' },
+        source:    { type: 'string', description: 'Full NinjaScript C# source (namespace NinjaTrader.NinjaScript.Indicators, class : Indicator)' },
         overwrite: { type: 'boolean', description: 'Overwrite if it already exists', default: true },
       },
       required: ['name', 'source'],

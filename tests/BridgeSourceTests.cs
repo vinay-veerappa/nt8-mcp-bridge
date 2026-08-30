@@ -436,9 +436,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             // fired on the very next change after the >= 6 leak was closed, and made this
             // author state that the new site is a deliberate addition rather than let it
             // quietly restore the slack that let a mutant survive.
+            // ⚠️ 8 -> 9 for /api/events/fills (GetFillEvents), which had been dropping the
+            // wrapper's `account` filter entirely -- P2-109's shape at a third endpoint.
             int routed = Regex.Matches(code, @"ResolveOrRefuse\(").Count;
-            Assert(routed == 8, string.Format(
-                "and all EIGHT account-resolution sites route through the tested resolver "
+            Assert(routed == 9, string.Format(
+                "and all NINE account-resolution sites route through the tested resolver "
                 + "(found {0}). If you added a site, raise this number; if you removed one, "
                 + "say which and why", routed));
 
