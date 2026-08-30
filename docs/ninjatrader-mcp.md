@@ -1,7 +1,7 @@
 # NinjaTrader 8 Model Context Protocol (MCP) — Architecture & Feature Specification
 
-> **Version**: 1.5.0  
-> **Status**: Production Shipped Architecture & 52-Tool Specification  
+> **Version**: 1.7.0 (wrapper) / 1.5.2-chart-discovery (AddOn)
+> **Status**: Production Shipped Architecture & 59-Tool Specification
 > **Target Audience**: Engineering Team, Quant Researchers, & External Reviewers
 
 ---
@@ -14,7 +14,7 @@ The **NinjaTrader MCP Bridge** provides a standardized [Model Context Protocol (
 +---------------------------------------------------------------------------------------------------+
 |  NinjaTrader 8 Native AddOn (McpBridgeAddOn.cs)                                                   |
 |  HTTP REST Server: http://127.0.0.1:7890 (Bearer Auth)                                            |
-|  Server-Sent Events (SSE) Producer: GET http://127.0.0.1:7890/api/events/stream                  |
+|  Server-Sent Events (SSE) heartbeat: GET http://127.0.0.1:7890/api/events/stream (heartbeat only; poll /api/events/since for real events)  |
 +---------------------------------------------------------------------------------------------------+
        ^                                                            |
        | REST Tool Calls                                            | Real-Time Event Stream
@@ -44,7 +44,7 @@ The **NinjaTrader MCP Bridge** provides a standardized [Model Context Protocol (
 ### A. Authentication, Network Isolation & Versioning
 * **Localhost Binding**: The HTTP listener (`McpBridgeAddOn.cs`) binds strictly to `127.0.0.1:7890` by default to prevent DNS rebinding attacks and cross-process network sniffing.
 * **Bearer Token Authorization**: Requests include an `Authorization: Bearer <NT8_MCP_TOKEN>` header.
-* **Semantic Versioning Header**: All HTTP responses include `X-NT8-MCP-Version: 1.5.0` allowing clients to detect capability levels.
+* **Semantic Versioning Header**: All HTTP responses include `X-NT8-MCP-Version: 1.7.0` allowing clients to detect capability levels.
 
 ### B. Concurrency, Retries & Mandatory Idempotency
 * All mutating endpoints (`nt_place_order`, `nt_place_oco_order`, `nt_place_atm_order`, `nt_emergency_flatten`) REQUIRE a client-supplied `idempotencyKey` UUID.

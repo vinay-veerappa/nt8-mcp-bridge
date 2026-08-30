@@ -8,10 +8,10 @@ Through a single stdio interface, this MCP server lets an AI agent:
 
 - **Account & Risk** — list accounts/positions/orders, read RiskGuard FSM state, pull compliance reports
 - **Live Trading** — place Market / Limit / StopMarket / StopLimit / OCO / ATM orders, cancel/change orders, close positions, emergency flatten
-- **Quotes & Data** — stream real-time quotes, historical bars, export date ranges to CSV, search instruments
-- **Strategy Development** — author NinjaScript source, compile in-process (Roslyn hot-swap, **no NT8 restart**), backtest, inspect, deploy, stop, and tune parameters
-- **Research & Automation** — signal backtests, portfolio backtests, synthetic stress data, Monte Carlo, scheduled tasks, C# snippet execution, chart drawing/capture
-- **Observability** — tail NT8 logs, capture chart screenshots, stream fills/FSM events via SSE, export trade journals
+- **Quotes & Data** — real-time quotes, historical bars (row-wise or opt-in columnar encoding), export date ranges to CSV with full export lifecycle (list/delete), search instruments
+- **Strategy & Indicator Development** — author NinjaScript source for strategies *and* indicators, compile in-process (Roslyn hot-swap, **no NT8 restart**), backtest, inspect, deploy, stop, and tune parameters
+- **Research & Automation** — signal backtests, portfolio backtests, synthetic stress data, Monte Carlo, scheduled tasks, chart drawing/capture, chart discovery
+- **Observability** — tail NT8 logs, query fill history, poll intervention events since a timestamp (`nt_events_since`, a stateless poll of the audit record — there is no live SSE subscription), export trade journals
 
 ## Architecture
 
@@ -48,10 +48,17 @@ Two rules those defects establish, both enforced by tests here:
 
 ## Version
 
-**AddOn + MCP server version: 1.5.0** (`X-NT8-MCP-Version: 1.5.0`)
+**MCP server version: 1.7.0** (`X-NT8-MCP-Version: 1.7.0`); **AddOn version: 1.5.2-chart-discovery**
+(59 tools: F-18 chart consolidation (`nt_chart` mode enum, `nt_charts` discovery), F-19 export
+lifecycle (`nt_list_exports`/`nt_delete_export`), F-20 indicator authoring (`nt_list_indicators`/
+`nt_indicator_source`/`nt_create_indicator`), F-21 opt-in columnar bars, F-22 `nt_events_since`
+audit poll. Retired: `nt_subscribe` (stub that subscribed to nothing), `nt_script_execute`
+(unsafe executor), the three separate chart tools.
 
 ⚠️ **The server must be restarted to pick up a change to this file or `lib/`.** A client
-that spawned `nt-mcp-server.js` earlier is still running the old tool schema.
+that spawned `nt-mcp-server.js` earlier is still running the old tool schema. After such a
+change also run `node tools/sync_client_caches.mjs` — the VS Code allowlist and Antigravity
+schema caches are generated from `lib/tools.js` and `ci_local.py` fails on drift.
 
 ## Quick Start
 
@@ -73,7 +80,7 @@ and compile via NinjaScript Editor (F5).
 Verify the AddOn is running:
 ```powershell
 curl http://localhost:7890/api/health
-# {"status":"ok","timestamp":"...","version":"1.5.0","dev":true|false,"accounts":N,"feedConnected":true|false}
+# {"status":"ok","timestamp":"...","version":"1.5.2-chart-discovery","dev":true|false,"accounts":N,"feedConnected":true|false}
 ```
 
 ### 2. Start the MCP Server
@@ -84,7 +91,7 @@ node nt-mcp-server.js
 
 Expected output:
 ```
-[nt-mcp] Server v1.5.0 started — NT8 at http://127.0.0.1:7890
+[nt-mcp] Server v1.7.0 started — NT8 at http://127.0.0.1:7890
 [nt-mcp] Waiting for MCP messages on stdin...
 ```
 
