@@ -192,7 +192,17 @@ def phase_suite():
         summary = 'tests %d / fail %s' % (ntests, nfail if nfail is not None else '?')
     say('  [%s] Node wrapper (node --test) %s' % ('ok  ' if node_ok else 'FAIL', summary))
 
-    return (csharp_ok and node_ok), out + '\n=== node --test ===\n' + out2
+    # The client caches (VS Code allowlist, Antigravity schema files) must agree with
+    # lib/tools.js. --check writes nothing and exits 1 on drift; the generator itself is
+    # NOT run here, because a CI pass that silently rewrites files outside the repo is a
+    # pass that hides the drift it exists to report. Run the generator by hand when this
+    # gate is red: `node tools/sync_client_caches.mjs`.
+    rc3, out3 = run(['node', os.path.join('tools', 'sync_client_caches.mjs'), '--check'])
+    caches_ok = rc3 == 0
+    say('  [%s] Client caches (tools/sync_client_caches.mjs --check) %s'
+        % ('ok  ' if caches_ok else 'FAIL', 'in sync' if caches_ok else 'DRIFT -- run: node tools/sync_client_caches.mjs'))
+
+    return (csharp_ok and node_ok and caches_ok), out + '\n=== node --test ===\n' + out2 + '\n=== client caches ===\n' + out3
 
 
 def worker(wt, work, results, log_dir):
