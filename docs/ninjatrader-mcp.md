@@ -106,7 +106,7 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | `nt_close_position` | `POST /api/position/close` | Flatten a position and cancel working orders for a symbol. |
 | `nt_emergency_flatten`| `POST /api/emergency-flatten`| **Atomic Kill-Switch**: Cancel all orders, flatten positions, and engage RiskGuard lockout. |
 | `nt_quote` | `GET /api/quote?symbol=` | Real-time quote stream (bid, ask, last, volume, daily high/low) with auto-subscription. |
-| `nt_bars` | `GET /api/bars?...` | Fetch historical OHLCV bars with pagination (`limit`, `offset`) capped at 5,000 rows. `format=columnar` returns six parallel arrays (~40% fewer tokens); default `rows` unchanged. |
+| `nt_bars` | `GET /api/bars?...` | Fetch historical OHLCV bars with pagination (`limit`, `offset`) capped at 5,000 rows. Auto-columnar above 200 bars (six parallel arrays, ~40% fewer tokens); `format=rows` forces the legacy shape. |
 | `nt_search` | `GET /api/search?query=` | Search available instrument master records by symbol or description. |
 
 ### Phase 2 — Strategy Development & Backtesting
@@ -178,7 +178,7 @@ The **NinjaTrader Unified Hub** ([scripts/streaming/ninjatrader_hub.py](file:///
 | :--- | :--- | :--- |
 | `nt_riskguard_config` | `POST /api/riskguard/config` | Dynamic configuration of trailing drawdown limits and volatility position caps. |
 | `nt_compliance_report`| `GET /api/compliance/report` | One-click generation of prop firm / broker compliance reports. |
-| `nt_multi_account_orchestrator`| `POST /api/orchestrator/multi-account`| Coordinated order routing and hedging across multiple accounts. |
+| `nt_multi_account_orchestrator`| `POST /api/orchestrator/multi-account`| Route the same order list to many accounts. Every account passes the full gate chain (resolver, sim/live confirmLive, lockout, contract cap) per account. |
 
 ---
 

@@ -8,7 +8,7 @@ Through a single stdio interface, this MCP server lets an AI agent:
 
 - **Account & Risk** — list accounts/positions/orders, read RiskGuard FSM state, pull compliance reports
 - **Live Trading** — place Market / Limit / StopMarket / StopLimit / OCO / ATM orders, cancel/change orders, close positions, emergency flatten
-- **Quotes & Data** — real-time quotes, historical bars (row-wise or opt-in columnar encoding), export date ranges to CSV with full export lifecycle (list/delete), search instruments
+- **Quotes & Data** — real-time quotes, historical bars (auto-columnar above 200 bars, ~40% fewer tokens; `format=rows` opts out), export date ranges to CSV with full export lifecycle (list/delete), search instruments
 - **Strategy & Indicator Development** — author NinjaScript source for strategies *and* indicators, compile in-process (Roslyn hot-swap, **no NT8 restart**), backtest, inspect, deploy, stop, and tune parameters
 - **Research & Automation** — signal backtests, portfolio backtests, synthetic stress data, Monte Carlo, scheduled tasks, chart drawing/capture, chart discovery
 - **Observability** — tail NT8 logs, query fill history, poll intervention events since a timestamp (`nt_events_since`, a stateless poll of the audit record — there is no live SSE subscription), export trade journals
@@ -51,9 +51,9 @@ Two rules those defects establish, both enforced by tests here:
 **MCP server version: 1.7.0** (`X-NT8-MCP-Version: 1.7.0`); **AddOn version: 1.5.2-chart-discovery**
 (59 tools: F-18 chart consolidation (`nt_chart` mode enum, `nt_charts` discovery), F-19 export
 lifecycle (`nt_list_exports`/`nt_delete_export`), F-20 indicator authoring (`nt_list_indicators`/
-`nt_indicator_source`/`nt_create_indicator`), F-21 opt-in columnar bars, F-22 `nt_events_since`
-audit poll. Retired: `nt_subscribe` (stub that subscribed to nothing), `nt_script_execute`
-(unsafe executor), the three separate chart tools.
+`nt_indicator_source`/`nt_create_indicator`), F-21 columnar bars (now the automatic shape
+above 200 bars), F-22 `nt_events_since` audit poll. Retired: `nt_subscribe` (stub that
+subscribed to nothing), `nt_script_execute` (unsafe executor), the three separate chart tools.
 
 ⚠️ **The server must be restarted to pick up a change to this file or `lib/`.** A client
 that spawned `nt-mcp-server.js` earlier is still running the old tool schema. After such a
@@ -153,7 +153,7 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | Tool | Endpoint | Description |
 |------|----------|-------------|
 | `nt_quote` | `GET /api/quote?symbol=` | Real-time quote: bid, ask, last, volume, high, low |
-| `nt_bars` | `GET /api/bars?symbol=&period=&periodValue=&count=&format=` | Historical OHLCV bars (bar-close time in NT8 timezone). `format=columnar` returns six parallel arrays (~40% fewer tokens); default `rows` unchanged |
+| `nt_bars` | `GET /api/bars?symbol=&period=&periodValue=&count=&format=` | Historical OHLCV bars (bar-close time in NT8 timezone). Auto-columnar above 200 bars (six parallel arrays, ~40% fewer tokens); `format=rows` forces the legacy shape |
 | `nt_export_bars` | `POST /api/bars/export` | Export date range of OHLCV to CSV on NT8 machine |
 | `nt_get_export` | `GET /api/export?name=` | Retrieve exported CSV content |
 | `nt_list_exports` | `GET /api/exports` | List `mcp_*.csv` export files (name, size, modified), newest first |
@@ -207,7 +207,7 @@ The server exposes the following MCP tools, mapped to the HTTP endpoints listed 
 | `nt_compliance_report` | `GET /api/compliance/report?account=` | Generate prop/broker compliance report |
 | `nt_copier_config` | `POST /api/copier/config` | Get/Set TradeCopierEngine leader/follower config |
 | `nt_prop_limits` | `POST /api/prop/limits` | Get/Set PropFirmProtectionSuite rules |
-| `nt_multi_account_orchestrator` | `POST /api/orchestrator/multi-account` | Coordinated multi-account order routing/hedging |
+| `nt_multi_account_orchestrator` | `POST /api/orchestrator/multi-account` | Route the same order list to many accounts. Every account passes the FULL gate chain — resolver (refuses a bad name), sim/live confirmLive, lockout, contract cap — per account, with per-account errors instead of aborting the batch |
 | `nt_indicator_values` | `GET /api/indicator/values?symbol=&indicatorName=` | Retrieve indicator values. Scans loaded assemblies to resolve the NinjaScript indicator host, fixing the original `NinjaTrader.Custom` AssemblyLoadContext mismatch |
 
 ## Instrument Symbols
