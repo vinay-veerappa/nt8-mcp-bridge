@@ -3351,7 +3351,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // second place, which is exactly what the hasMore source gate exists to stop
                 // (its first failure found a THIRD assignment). The shape -- row objects or six
                 // parallel arrays -- is chosen below; hasMore is derived once.
-                bool columnar = string.Equals(formatRaw, "columnar", StringComparison.OrdinalIgnoreCase);
+                //
+                // F-21b. Columnar is now the DEFAULT above 200 bars (opt out with format=rows).
+                // Measured: at count=1000 row-wise is ~53KB / ~13k tokens where columnar is
+                // ~35% less, and the callers paying that cost are agents paging history who
+                // never remember to pass the enum. The threshold keeps the small-read shape
+                // (charts, quick quotes-context) byte-identical for existing consumers; a
+                // large pull's shape was never something anything parsed positionally -- it
+                // walks .bars or .columns either way.
+                bool columnar = string.Equals(formatRaw, "columnar", StringComparison.OrdinalIgnoreCase)
+                             || (string.IsNullOrWhiteSpace(formatRaw) && take > 200);
                 object barsPayload;
                 if (columnar)
                 {
@@ -7279,18 +7288,47 @@ namespace NinjaTrader.NinjaScript.AddOns
         private object MultiAccountOrchestrator(string body)
         {
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
-            var action = req.Str("action") ?? "sync_hedge";
-            var accList = req["accounts"] as JArray;
-            var targetAccounts = accList != null ? accList.Select(a => a.ToString()).ToList() : Account.All.Select(a => a.Name).ToList();
+
+            // P1-150-shaped audit finding (2026-08-30): this was the FOURTH order path and the
+            // only one that routed around every safety gate. PlaceOrder / PlaceOcoOrder /
+            // PlaceAtmOrder each consult the account resolver, the sim/live confirmLive gate,
+            // the lockout gate and the sizing gate; this loop submitted to every account with
+            // none of them -- an omitted or typo'd account traded, a live account traded without
+            // confirmLive, an over-cap order was placed, a locked account traded. The copier's
+            // per-account gates exist precisely because one loop over N accounts multiplies every
+            // one of those hazards by N.
+            bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
             var orders = req["orders"] as JArray;
             if (orders == null || orders.Count == 0)
                 return new { error = "orders array required, e.g. [{symbol,action,quantity,orderType}, ...]" };
 
+            // The account LIST still carries the caller's intent (empty = every account, the
+            // tool's purpose), but each NAME is resolved through the tested resolver before
+            // anything is submitted to it -- a typo inside the list is now a refusal for that
+            // account, not a silent skip or, worse, a guess.
+            var accList = req["accounts"] as JArray;
+            var requestedNames = accList != null
+                ? accList.Select(a => a.ToString()).ToList()
+                : Account.All.Select(a => a.Name).ToList();
+
             var results = new List<object>();
-            foreach (string accName in targetAccounts)
+            foreach (string accName in requestedNames)
             {
-                Account account = Account.All.FirstOrDefault(a => a.Name.Equals(accName, StringComparison.OrdinalIgnoreCase));
-                if (account == null) { results.Add(new { account = accName, status = "error", error = "account not found" }); continue; }
+                // P1-90 at the ninth site: resolve or refuse per account.
+                var resolution = BridgeAccountResolver.ResolveOrRefuse(
+                    accName, Account.All.Select(a => a.Name), "route an orchestrated order");
+                if (resolution.Refused) { results.Add(new { account = accName, status = "error", error = resolution.Error }); continue; }
+                Account account = Account.All.FirstOrDefault(a => a.Name == resolution.Name);
+                if (account == null) { results.Add(new { account = accName, status = "error", error = "no account available" }); continue; }
+
+                // P2-38 at the fourth site: provider-only sim classification, confirmLive on live.
+                bool isSim = TradeCopierEngine.IsSimulationAccount(account);
+                if (!isSim && !confirmLive)
+                {
+                    results.Add(new { account = account.Name, status = "error",
+                        error = "Refusing to place order on LIVE account '" + account.Name + "' without confirmLive=true" });
+                    continue;
+                }
 
                 foreach (var ord in orders)
                 {
@@ -7298,10 +7336,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                     var actionStr = ord["action"]?.ToString() ?? "buy";
                     var quantity = ord["quantity"] != null ? (int)ord["quantity"] : 1;
                     var orderTypeStr = ord["orderType"]?.ToString() ?? "Market";
-                    if (string.IsNullOrEmpty(symbol)) { results.Add(new { account = accName, status = "error", error = "symbol required" }); continue; }
+                    if (string.IsNullOrEmpty(symbol)) { results.Add(new { account = account.Name, status = "error", error = "symbol required" }); continue; }
 
                     var instrument = Instrument.GetInstrument(symbol);
-                    if (instrument == null) { results.Add(new { account = accName, status = "error", error = "instrument not found: " + symbol }); continue; }
+                    if (instrument == null) { results.Add(new { account = account.Name, status = "error", error = "instrument not found: " + symbol }); continue; }
+
+                    // P1-106 at the fourth site: a locked account may reduce, never open.
+                    var orchPos = account.Positions.FirstOrDefault(p => p != null && p.Instrument != null && p.Instrument.FullName == instrument.FullName);
+                    var lockoutDecision = BridgeLockoutGate.Evaluate(
+                        IsAccountLocked(account.Name),
+                        actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase),
+                        orchPos != null ? orchPos.MarketPosition.ToString() : null,
+                        orchPos != null ? orchPos.Quantity : 0,
+                        quantity,
+                        false,
+                        account.Name);
+                    if (!lockoutDecision.Allowed)
+                    { results.Add(new { account = account.Name, symbol, status = "error", error = lockoutDecision.Reason }); continue; }
+
+                    // P1-149 at the fourth site: the cap is asked of the guard, judged on the
+                    // resulting position -- same arithmetic the three single-account paths use.
+                    var sizing = BridgeSizingGate.Evaluate(
+                        EffectiveMaxContracts(account, symbol),
+                        quantity,
+                        actionStr,
+                        orchPos != null ? orchPos.MarketPosition.ToString() : null,
+                        orchPos != null ? orchPos.Quantity : 0,
+                        account.Name,
+                        symbol);
+                    if (!sizing.Allowed)
+                    { results.Add(new { account = account.Name, symbol, status = "error", error = sizing.Reason }); continue; }
 
                     var orderAction = actionStr.Equals("sell", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.Buy;
                     var orderType = orderTypeStr.Equals("Limit", StringComparison.OrdinalIgnoreCase) ? OrderType.Limit : OrderType.Market;
@@ -7312,12 +7376,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     {
                         var order = account.CreateOrder(instrument, orderAction, orderType, TimeInForce.Day, quantity, limitPrice, stopPrice, string.Empty, "McpOrchestrator", null);
                         account.Submit(new[] { order });
-                        results.Add(new { account = accName, symbol, action = actionStr, quantity, orderId = order.Id.ToString(), status = "submitted" });
+                        results.Add(new { account = account.Name, symbol, action = actionStr, quantity, orderId = order.Id.ToString(), status = "submitted" });
                     }
-                    catch (Exception ex) { results.Add(new { account = accName, symbol, status = "error", error = ex.Message }); }
+                    catch (Exception ex) { results.Add(new { account = account.Name, symbol, status = "error", error = ex.Message }); }
                 }
             }
-            return new { success = true, action, targetAccounts, status = "executed", results };
+            return new { success = true, confirmLive, targetAccounts = requestedNames, status = "executed", results };
         }
 
         // - Helpers -

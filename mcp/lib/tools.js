@@ -96,7 +96,7 @@ export const TOOLS = [
   },
   {
     name: 'nt_place_atm_order',
-    description: 'Place a bracket order with server-side ATM strategy (stop loss, profit target, auto-breakeven, trailing, partials). Supports 8 strategies: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal. Auto-selects strategy per instrument if omitted.',
+    description: 'Place a bracket with a server-side ATM strategy (stop, target, auto-breakeven, trailing, partials). 8 strategies: FixedTicks, AtrAdaptive, SwingPoint, DrawdownShield, ScaledRunner, VolatilityScaled, SessionAdaptive, KellyOptimal; auto-selects per instrument if omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -224,7 +224,7 @@ export const TOOLS = [
         periodValue: { type: 'number', description: 'Period value (e.g. 5 for 5m)', default: 1 },
         count:       { type: 'number', minimum: 1, maximum: 5000, description: 'Bars per call, 1-5000 (clamped, never rejected)', default: 100 },
         offset:      { type: 'number', minimum: 0, description: 'Bars to skip, counting back from the most recent. offset=100 with count=100 is the 100 bars BEFORE the latest 100', default: 0 },
-        format:      { type: 'string', enum: ['rows', 'columnar'], description: 'rows (default) = one object per bar as before. columnar = six parallel arrays (time/open/high/low/close/volume), ~40% fewer tokens on large pulls — read response.columns before indexing', default: 'rows' },
+        format:      { type: 'string', enum: ['rows', 'columnar'], description: 'rows = one object per bar; columnar = six parallel arrays (~40% fewer tokens). Server picks automatically: columnar above 200 bars, rows below. Pass format=rows to force the legacy row shape on large counts', default: 'rows' },
       },
       required: ['symbol'],
     },
@@ -288,7 +288,7 @@ export const TOOLS = [
   // the three modes answer different questions, so the caller states which one.
   {
     name: 'nt_chart',
-    description: 'Capture a NinjaTrader chart as a base64 PNG. mode=capture grabs the active chart window; mode=snapshot adds high-res sizing, marker overlays, and indicator highlighting; mode=trade overlays an execution fill\'s trade markers. All three wrap the same CaptureChart() path.',
+    description: 'Capture a NinjaTrader chart as base64 PNG: capture = active window; snapshot = high-res with markers/indicators; trade = fill-marker overlay.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -321,7 +321,7 @@ export const TOOLS = [
   },
   {
     name: 'nt_charts',
-    description: 'List every open NinjaTrader chart window: instrument, visibility, size and dispatcher thread, plus a diagnostics row when zero charts are open. Read-only precondition check for the chart capture/draw tools.',
+    description: 'List every open chart window (instrument, visibility, size, dispatcher thread) -- precondition check for the chart capture/draw tools. Diagnostics row when zero are open.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -356,7 +356,7 @@ export const TOOLS = [
     // is "what happened since my last poll" — a stateless read of the guard's audit record
     // (interventions.jsonl), the same source the UI events pane reads.
     name: 'nt_events_since',
-    description: 'Poll bridge intervention events (guard actions, config writes, orders, flattens) logged since a UTC timestamp. Read of the same audit record the UI events pane shows; truncated=true means the bounded tail could not reach back to since. Poll after long idle; do not use for live streaming.',
+    description: 'Poll bridge intervention events (guard actions, config writes, orders, flattens) after a UTC timestamp -- the same audit record the UI events pane reads. Stateless poll, not a live stream; truncated=true means the bounded tail could not reach back to since.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -424,7 +424,7 @@ export const TOOLS = [
   // working order, and confirmDisruptive is how you override that deliberately.
   {
     name: 'nt_connection',
-    description: 'List NinjaTrader connections with their live status, or connect/disconnect one. Status now also lists the CONFIGURED-but-not-instantiated connections from Config.xml (each carries configured/present flags) so the operator can see every broker on the box, not just the ones carrying accounts. This is the detail behind nt_health\'s feedConnected -- each row carries countsTowardMarketData from the same predicate. ⚠️ disconnect severs the path by which open positions are managed, and is REFUSED while anything on the connection is live unless confirmDisruptive is set. Connect/Disconnect are marshalled to the NT8 UI thread (the P2-112 family); a configured connection with no live Connection object yet is REFUSED with NOT_INSTANTIATED -- open the Connections window once to materialize it.',
+    description: 'List NinjaTrader connections (live AND configured-but-not-instantiated, with countsTowardMarketData) or connect/disconnect one. The detail behind nt_health\'s feedConnected. ⚠️ disconnect is REFUSED while anything on the connection is live unless confirmDisruptive=true; ambiguous or instantiated-but-absent names are refused naming the real ones.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -470,12 +470,10 @@ export const TOOLS = [
   {
     name: 'nt_riskguard_inventory',
     description:
-      'Read the per-rule RiskGuard inventory: for every rule, whether it is Enforcing, ' +
-      'EvaluatedNotEnforcing, ConfiguredNotEvaluated, Inert or Disabled, and the limit it ' +
-      'holds you to. This is the surface that answers "is the guard actually protecting me". ' +
-      'Defaults to a SUMMARY: the raw payload is ~635KB across 96 accounts and 2304 rule rows. ' +
-      'ConfiguredNotEvaluated is the state to read first -- it means the config file describes ' +
-      'a protection that nothing computes.',
+      'Per-rule RiskGuard inventory: for every rule, Enforcing / EvaluatedNotEnforcing / ' +
+      'ConfiguredNotEvaluated / Inert / Disabled, and its limit. Answers "is the guard actually ' +
+      'protecting me". Defaults to a summary (~635KB raw across 96 accounts); read ' +
+      'ConfiguredNotEvaluated first -- config that nothing computes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -497,10 +495,9 @@ export const TOOLS = [
   {
     name: 'nt_copier_snapshot',
     description:
-      'Read per-relationship trade-copier conformance: leader vs expected vs ACTUAL position ' +
-      'per follower, whether the expected size was clamped, quarantine state and reason, and ' +
-      'measured latency/slippage. This is conformance, not configuration -- nt_copier_config ' +
-      'returns what is configured, this returns what is actually happening.',
+      'Trade-copier CONFORMANCE per relationship: leader vs expected vs ACTUAL position per ' +
+      'follower, size clamps, quarantine state/reason, latency/slippage. Config lives in ' +
+      'nt_copier_config; this is what is actually happening.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -514,10 +511,9 @@ export const TOOLS = [
   {
     name: 'nt_copier_config',
     description:
-      'Read or modify TradeCopierEngine relationships and groups: leader/follower ratios, ' +
-      'the per-ticker ratio matrix, symbol mappings, slippage quarantine, and group membership. ' +
-      'action=get is a pure read (HTTP GET). Writes send ONLY the fields you name -- the engine ' +
-      'merges, so an omitted field keeps its stored value and is never reset to a default.',
+      'Read or modify TradeCopierEngine relationships/groups: ratios, per-ticker matrix, symbol ' +
+      'mappings, quarantine, group membership. action=get is a pure GET. Writes send ONLY the ' +
+      'fields you name -- the engine merges, an omitted field keeps its stored value.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -681,7 +677,7 @@ export const TOOLS = [
   },
   {
     name: 'nt_schedule',
-    description: 'Register time-based or event-based scheduled tasks inside NinjaTrader (e.g., re-optimize weekly, flatten at market close)',
+    description: 'Register a recurring task in the bridge\'s in-process scheduler (30s tick): at each due time it POSTs `command` (an endpoint path) with `args`, loopback, as the bridge. Persisted to disk; restarts clear it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -703,7 +699,7 @@ export const TOOLS = [
   },
   {
     name: 'nt_alert',
-    description: 'Create persistent price, indicator, or strategy alerts with local email/SMS/webhook notifications',
+    description: 'Create a price-level alert: records it, AND (when price>0) registers a live monitor that fires NT8\'s AlertCallback into the Alerts Log on cross_above/cross_below. Without a price it is a log entry only. Alerts do NOT notify you -- read the Alerts Log or poll.',
     inputSchema: {
       type: 'object',
       properties: {

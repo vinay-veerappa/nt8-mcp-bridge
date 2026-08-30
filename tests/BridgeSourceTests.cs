@@ -439,8 +439,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             // ⚠️ 8 -> 9 for /api/events/fills (GetFillEvents), which had been dropping the
             // wrapper's `account` filter entirely -- P2-109's shape at a third endpoint.
             int routed = Regex.Matches(code, @"ResolveOrRefuse\(").Count;
-            Assert(routed == 9, string.Format(
-                "and all NINE account-resolution sites route through the tested resolver "
+            Assert(routed == 10, string.Format(
+                "and all TEN account-resolution sites route through the tested resolver "
                 + "(found {0}). If you added a site, raise this number; if you removed one, "
                 + "say which and why", routed));
 
@@ -5403,11 +5403,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 at = code.IndexOf("BridgeSizingGate.Evaluate", at + 1, StringComparison.Ordinal);
             }
 
-            Assert(calls == 3,
-                "P1-149: all THREE order-placing paths consult the gate -- PlaceOrder, PlaceOcoOrder "
-                + "and PlaceAtmOrder. The count is asserted rather than 'at least one' precisely "
-                + "because the defect was found on one path and fixing that path alone is the "
-                + "failure this repo keeps repeating (found " + calls + ")");
+            Assert(calls == 4,
+                "P1-149: all FOUR order-placing paths consult the gate -- PlaceOrder, PlaceOcoOrder, "
+                + "PlaceAtmOrder and MultiAccountOrchestrator. The orchestrator was found in the "
+                + "2026-08-30 audit submitting to every account with NONE of the gates; the count "
+                + "is asserted rather than 'at least one' precisely because the defect was found "
+                + "on one path and fixing that path alone is the failure this repo keeps "
+                + "repeating (found " + calls + ")");
 
             // ⚠️ MATCH THE DEFINITION, NOT ANY OCCURRENCE. The first draft searched for
             // " PlaceOrder(" and found the ROUTE TABLE -- `b => PlaceOrder(b)` -- so it inspected a
