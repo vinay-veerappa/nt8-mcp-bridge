@@ -3367,6 +3367,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                         ["columns"] = new[] { "time", "open", "high", "low", "close", "volume" },
                         ["time"] = times, ["open"] = opens, ["high"] = highs,
                         ["low"] = lows, ["close"] = closes, ["volume"] = volumes,
+                        // The return site reads every key on BOTH branches; a missing
+                        // key here is a KeyNotFoundException on a read path (measured).
+                        ["bars"] = null,
                     };
                 }
                 else
@@ -3378,7 +3381,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                             time = bars.GetTime(i), open = bars.GetOpen(i), high = bars.GetHigh(i),
                             low = bars.GetLow(i), close = bars.GetClose(i), volume = bars.GetVolume(i),
                         });
-                    barsPayload = new Dictionary<string, object> { ["bars"] = result };
+                    barsPayload = new Dictionary<string, object>
+                    {
+                        ["bars"] = result, ["columns"] = null,
+                        ["time"] = null, ["open"] = null, ["high"] = null,
+                        ["low"] = null, ["close"] = null, ["volume"] = null,
+                    };
                 }
 
                 var payload = (Dictionary<string, object>)barsPayload;
@@ -3396,12 +3404,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     format = columnar ? "columnar" : "rows",
                     bars = payload["bars"],
                     columns = payload["columns"],
-                    time = columnar ? payload["time"] : null,
-                    open = columnar ? payload["open"] : null,
-                    high = columnar ? payload["high"] : null,
-                    low = columnar ? payload["low"] : null,
-                    close = columnar ? payload["close"] : null,
-                    volume = columnar ? payload["volume"] : null,
+                    time = payload["time"],
+                    open = payload["open"],
+                    high = payload["high"],
+                    low = payload["low"],
+                    close = payload["close"],
+                    volume = payload["volume"],
                 };
             }
         }
