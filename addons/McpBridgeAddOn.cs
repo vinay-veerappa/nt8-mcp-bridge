@@ -1947,21 +1947,123 @@ namespace NinjaTrader.NinjaScript.AddOns
             try { return a.Get(item, a.Denomination); } catch { return 0; }
         }
 
+        private void EnsureSubscribedNoSleep(Instrument instrument)
+        {
+            if (instrument == null) return;
+            lock (_subLock)
+            {
+                if (!_subscribedSymbols.Contains(instrument.FullName))
+                {
+                    try { instrument.MarketData.Update += (sender, args) => {}; } catch { }
+                    _subscribedSymbols.Add(instrument.FullName);
+                }
+            }
+        }
+
+        private static double ComputePositionUnrealized(Position pos)
+        {
+            if (pos == null || pos.Instrument == null || pos.MarketPosition == MarketPosition.Flat) return 0.0;
+            double upnl = 0.0;
+            try { upnl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency); } catch { }
+            if (upnl == 0.0 && pos.AveragePrice > 0)
+            {
+                try
+                {
+                    var md = pos.Instrument.MarketData;
+                    double curPrice = (md != null && md.Last != null && md.Last.Price > 0) ? md.Last.Price : 0.0;
+                    if (curPrice <= 0.0 && md != null && md.Ask != null && md.Bid != null && md.Ask.Price > 0)
+                    {
+                        curPrice = (md.Ask.Price + md.Bid.Price) / 2.0;
+                    }
+                    if (curPrice > 0.0)
+                    {
+                        try
+                        {
+                            upnl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, curPrice);
+                        }
+                        catch
+                        {
+                            double pointVal = pos.Instrument.MasterInstrument.PointValue;
+                            double diff = pos.MarketPosition == MarketPosition.Long
+                                ? (curPrice - pos.AveragePrice)
+                                : (pos.AveragePrice - curPrice);
+                            upnl = diff * pointVal * pos.Quantity;
+                        }
+                    }
+                }
+                catch { }
+            }
+            return upnl;
+        }
+
         private object GetAccountInfo()
         {
             var accounts = new List<object>();
             foreach (Account account in Account.All)
+            {
+                double rPnl = AcctGet(account, AccountItem.RealizedProfitLoss);
+                double uPnl = AcctGet(account, AccountItem.UnrealizedProfitLoss);
+                if (uPnl == 0.0 && account.Positions != null)
+                {
+                    foreach (Position pos in account.Positions)
+                    {
+                        if (pos.Instrument != null && pos.MarketPosition != MarketPosition.Flat)
+                        {
+                            EnsureSubscribedNoSleep(pos.Instrument);
+                            uPnl += ComputePositionUnrealized(pos);
+                        }
+                    }
+                }
+
+                if (account.Executions != null && account.Executions.Count > 0)
+                {
+                    try
+                    {
+                        int count = account.Executions.Count;
+                        Tuple<int, double> cached;
+                        lock (_execPnlCache)
+                        {
+                            _execPnlCache.TryGetValue(account.Name, out cached);
+                        }
+
+                        if (cached != null && cached.Item1 == count)
+                        {
+                            if (cached.Item2 != 0.0 || rPnl == 0.0) rPnl = cached.Item2;
+                        }
+                        else
+                        {
+                            var execList = account.Executions.ToList();
+                            double cum = SystemPerformance.Calculate(execList).AllTrades.TradesPerformance.Currency.CumProfit;
+                            lock (_execPnlCache)
+                            {
+                                _execPnlCache[account.Name] = Tuple.Create(count, cum);
+                            }
+                            if (cum != 0.0 || rPnl == 0.0) rPnl = cum;
+                        }
+                    }
+                    catch { }
+                }
+
+                double cash = AcctGet(account, AccountItem.CashValue);
+                double netLiq = AcctGet(account, AccountItem.NetLiquidation);
+                if (netLiq == 0.0) netLiq = cash;
+                if (uPnl != 0.0 && AcctGet(account, AccountItem.UnrealizedProfitLoss) == 0.0)
+                {
+                    netLiq += uPnl;
+                }
+
                 accounts.Add(new
                 {
                     name = account.Name,
                     provider = account.Provider.ToString(),
                     denomination = account.Denomination.ToString(),
-                    cashValue = AcctGet(account, AccountItem.CashValue),
-                    netLiquidation = AcctGet(account, AccountItem.NetLiquidation),
-                    realizedPnL = AcctGet(account, AccountItem.RealizedProfitLoss),
-                    unrealizedPnL = AcctGet(account, AccountItem.UnrealizedProfitLoss),
+                    cashValue = cash,
+                    netLiquidation = netLiq,
+                    realizedPnL = rPnl,
+                    unrealizedPnL = uPnl,
                     buyingPower = AcctGet(account, AccountItem.BuyingPower),
                 });
+            }
             return accounts;
         }
 
@@ -1972,8 +2074,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 foreach (Position pos in account.Positions)
                 {
                     if (pos.Instrument == null || pos.MarketPosition == MarketPosition.Flat) continue;
-                    double upnl = 0;
-                    try { upnl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency); } catch { }
+                    EnsureSubscribedNoSleep(pos.Instrument);
+                    double upnl = ComputePositionUnrealized(pos);
                     positions.Add(new
                     {
                         account = account.Name,
@@ -3246,6 +3348,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static readonly HashSet<string> _subscribedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly object _subLock = new object();
+        private static readonly Dictionary<string, Tuple<int, double>> _execPnlCache = new Dictionary<string, Tuple<int, double>>(StringComparer.OrdinalIgnoreCase);
 
         private void EnsureSubscribed(Instrument instrument)
         {
@@ -6032,7 +6135,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 calculatedQuantity = result.CalculatedQuantity,
                 strategyName = result.StrategyName,
                 note = result.Note,
-                error = result.Error
+                error = string.IsNullOrEmpty(result.Error) ? null : result.Error
             };
         }
 

@@ -67,6 +67,59 @@ STRATEGIES_DST = NT8_HOME / "Strategies"
 # what is running.
 SKIP = set()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT STRATEGY DENYLIST (2026-09-04 ownership cleanup).
+# Trading bots live ONLY in tvDownloadOHLC/scripts/ninjatrader/strategies/ and
+# deploy via that repo's sync_nt8_strategies.py. The vendored core used to ship
+# 15 bot .cs files that were 5+ days stale copies; deploying them silently
+# reverted whatever bot build was live (measured: vendor pin 2026-08-29 vs the
+# deployed 2026-09-03 ICTFVGCISDBot). The core now ships framework only
+# (RiskManagerBase/RiskGatekeeper/IntradayStrategyBase) — this denylist makes
+# that an INVARIANT, not a convention: if a bot name ever reappears in the
+# vendor tree, deploy refuses rather than clobbering the live bot.
+# ─────────────────────────────────────────────────────────────────────────────
+BOT_DENYLIST = {
+    "bandits8020bot.cs",
+    "bbmrreversionbot.cs",
+    "emapullbackbot.cs",
+    "failedauctionbot.cs",
+    "ibbreakoutbot.cs",
+    "ibfadebot.cs",
+    "ibretestbot.cs",
+    "ibstrategybase.cs",
+    "ictfvgbos.cs",
+    "ictfvgcisdbot.cs",
+    "keltnerchannelbot.cs",
+    "strat212continuationbot.cs",
+    "strat22revstratbot.cs",
+    "sttrendbot.cs",
+    "vwapreclaimbot.cs",
+}
+
+
+def _assert_no_bots_in_vendor() -> None:
+    """Fail closed if the vendored core ships any bot strategy.
+
+    The framework files the core ships are an allowlist by construction (its
+    strategies/ tree is reviewed with the guard); a bot appearing there is a
+    mistake that would overwrite a NEWER live bot owned by tvDownloadOHLC.
+    """
+    if not STRATEGIES_SRC.exists():
+        return
+    offenders = sorted(
+        p.name for p in STRATEGIES_SRC.rglob("*.cs")
+        if p.name.lower() in BOT_DENYLIST
+    )
+    if offenders:
+        print("[FATAL] the vendored core ships bot strategies this tool must not deploy:")
+        for name in offenders:
+            print("        {0}".format(name))
+        print()
+        print("        Bots are owned by tvDownloadOHLC/scripts/ninjatrader/strategies/")
+        print("        and deploy via that repo's sync_nt8_strategies.py. Remove the bot")
+        print("        .cs from nt8-riskguard/strategies/ and re-vendor the core.")
+        raise SystemExit(2)
+
 
 def file_hash(path: Path) -> str:
     """MD5 of content, normalised to LF with any BOM stripped.
@@ -244,6 +297,12 @@ def main() -> int:
     check_vendor_not_stale(deploying=not (args.verify or args.dry_run))
     print()
 
+    # Ownership invariant: the vendored core ships framework only. A bot in the
+    # vendor tree would overwrite the live bot owned by tvDownloadOHLC with a
+    # stale copy. Checked on every mode, including --verify, so drift is visible
+    # before any deploy attempt.
+    _assert_no_bots_in_vendor()
+
     if not NT8_HOME.exists():
         print("[ERROR] NT8 Custom folder not found: {0}".format(NT8_HOME))
         print("        Is NinjaTrader 8 installed on this machine?")
@@ -294,16 +353,20 @@ def main() -> int:
                 print("  [DRIFT]   {0:<28} ({1})".format(src.name, label))
 
     # ── the vendored core's strategies ──────────────────────────────────────────────
-    # RiskManagerBase.cs + RiskGatekeeper.cs go to Custom/Strategies/<subfolder>/, preserving the
-    # source's subfolder (Vinay/). No orphan deletion here: Strategies/Vinay/ holds many other bots
-    # this tool does not own, so it touches ONLY the files the vendored core ships. These deploy in the
-    # SAME run as ContractCapGate.cs (an addon, above), because RiskGatekeeper depends on it and NT8
-    # compiles the whole Custom tree as one assembly.
+    # RiskManagerBase.cs + RiskGatekeeper.cs + IntradayStrategyBase.cs go to
+    # Custom/Strategies/<subfolder>/, preserving the source's subfolder (Vinay/).
+    # FRAMEWORK ONLY — bots are denylisted (_assert_no_bots_in_vendor above) and
+    # the generator loops skip them as a second layer. No orphan deletion here:
+    # Strategies/Vinay/ holds bots this tool does not own, so it touches ONLY
+    # the files the vendored core ships. These deploy in the SAME run as
+    # ContractCapGate.cs (an addon, above), because RiskGatekeeper depends on it
+    # and NT8 compiles the whole Custom tree as one assembly.
     strat_added, strat_drifted, strat_identical = 0, 0, 0
     if STRATEGIES_SRC.exists():
         print()
         print("[strategies/] {0} -> {1}".format(STRATEGIES_SRC, STRATEGIES_DST))
-        for src in sorted(p for p in STRATEGIES_SRC.rglob("*.cs")):
+        for src in sorted(p for p in STRATEGIES_SRC.rglob("*.cs")
+                          if p.name.lower() not in BOT_DENYLIST):
             rel = src.relative_to(STRATEGIES_SRC)
             dst = STRATEGIES_DST / rel
             if not dst.exists():
