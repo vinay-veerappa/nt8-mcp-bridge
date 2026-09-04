@@ -1297,6 +1297,25 @@ namespace NinjaTrader.NinjaScript.AddOns
             var paramErrors = new List<string>();                       // any param that did NOT take
             var appliedParams = new Dictionary<string, string>();       // param -> value READ BACK after the write
 
+            // Profile provenance and GLOBAL preconditions.
+            //
+            // `requireGlobals` names NinjaTrader.Core.Globals.MarketDataOptions properties the
+            // caller needs to be true for the result to mean anything - GlobalMergePolicy above
+            // all, because the Strategy Analyzer takes NO MergePolicy argument and inherits this
+            // one, so a back-adjusted global silently rescales every price the backtest sees.
+            //
+            // ASSERTED, NEVER SET. A global is not a per-run parameter: writing it changes every
+            // chart, strategy and export on the machine, and a backtest that quietly reconfigured
+            // the box would be worse than one that reported the wrong number. So a mismatch
+            // REFUSES and says what to change.
+            //
+            // `profileHash` is echoed, not interpreted. Its only job is to let a stored result
+            // name the profile that produced it; a result that cannot is unattributable.
+            string profileHash = req.Str("profileHash");
+            var reqGlobals = req["requireGlobals"] as JObject;
+            var globalMismatches = new List<string>();
+            var effectiveGlobals = new Dictionary<string, string>();
+
             disp.Invoke((Action)(() =>
             {
                 try
@@ -1369,11 +1388,86 @@ namespace NinjaTrader.NinjaScript.AddOns
                     // SelectedResult object across runs and just swap its Results (SystemPerformance).
                     // Detecting a new Results reference is more reliable than a new SelectedResult.
                     baselineResults = baseline != null ? GetP(baseline, "Results") : null;
+                    // Validate OrderFillResolutionTYPE against what NT8 says is legal for the
+                    // selected bars period.
+                    //
+                    // ⚠️ `ValidOrderFillResolutions` holds BarsPeriodType values (measured:
+                    // "Minute, Second, Tick"), NOT OrderFillResolution values. The first version
+                    // of this check compared `OrderFillResolution` - a High/Standard enum -
+                    // against that list, so it refused every legitimate `High` while reporting a
+                    // list that made the refusal look authoritative. Two incompatible domains,
+                    // and only running it found that out. Assert the property the list actually
+                    // constrains.
+                    if (prms != null && (prms["OrderFillResolutionType"] != null || prms["OrderFillResolution"] != null))
+                    {
+                        var tmplForOfr = GetP(props, "StrategyTemplate");
+                        var valid = GetP(tmplForOfr, "ValidOrderFillResolutions") as System.Collections.IEnumerable;
+                        if (valid != null)
+                        {
+                            var legal = new List<string>();
+                            foreach (var v in valid) legal.Add(SafeToString(v));
+                            var askedType = SafeToString(GetP(tmplForOfr, "OrderFillResolutionType"));
+                            if (legal.Count > 0 && !legal.Contains(askedType))
+                                paramErrors.Add("OrderFillResolutionType '" + askedType
+                                    + "' is not valid for this bars period; NT8 allows: "
+                                    + string.Join(", ", legal));
+
+                            // High resolution whose sub-period equals the PRIMARY series buys
+                            // nothing - it subdivides a bar into one bar. That is a silently
+                            // useless setting, not an error NT8 reports, so say so here.
+                            var ofr = SafeToString(GetP(tmplForOfr, "OrderFillResolution"));
+                            var primaryType = SafeToString(GetP(GetP(props, "BarsPeriod"), "BarsPeriodType"));
+                            var primaryValue = SafeToString(GetP(GetP(props, "BarsPeriod"), "Value"));
+                            var ofrVal = SafeToString(GetP(tmplForOfr, "OrderFillResolutionValue"));
+                            if (string.Equals(ofr, "High", StringComparison.OrdinalIgnoreCase)
+                                && string.Equals(askedType, primaryType, StringComparison.OrdinalIgnoreCase)
+                                && string.Equals(ofrVal, primaryValue, StringComparison.Ordinal))
+                                paramErrors.Add(string.Format(
+                                    "OrderFillResolution=High with sub-period {0} {1} equals the primary series "
+                                    + "({2} {3}), so it resolves nothing. Use a finer sub-period (NT8 allows: {4}).",
+                                    ofrVal, askedType, primaryValue, primaryType, string.Join(", ", legal)));
+                        }
+                    }
+
+                    // GLOBAL preconditions. Read the live values, compare as strings (the enum
+                    // member name is what a profile can sensibly pin), and record BOTH what was
+                    // required and what is actually set.
+                    var mdo = GetStaticP(ResolveNtType("NinjaTrader.Core.Globals"), "MarketDataOptions");
+                    if (reqGlobals != null)
+                    {
+                        if (mdo == null)
+                            globalMismatches.Add("cannot read Globals.MarketDataOptions, so no global precondition can be checked");
+                        else
+                            foreach (var g in reqGlobals.Properties())
+                            {
+                                var actual = GetP(mdo, g.Name);
+                                if (actual == null)
+                                {
+                                    globalMismatches.Add(g.Name + ": no such property on MarketDataOptions");
+                                    continue;
+                                }
+                                var actualStr = SafeToString(actual);
+                                var wantStr = g.Value == null ? null : g.Value.ToString();
+                                effectiveGlobals[g.Name] = actualStr;
+                                if (!string.Equals(actualStr, wantStr, StringComparison.OrdinalIgnoreCase))
+                                    globalMismatches.Add(string.Format(
+                                        "{0}: profile requires '{1}' but NT8 has '{2}' (Settings -> Market data; this is GLOBAL)",
+                                        g.Name, wantStr, actualStr));
+                            }
+                    }
+                    else if (mdo != null)
+                    {
+                        // Even with no precondition declared, report the two globals that decide
+                        // whether the numbers are comparable to anything.
+                        effectiveGlobals["GlobalMergePolicy"] = SafeToString(GetP(mdo, "GlobalMergePolicy"));
+                        effectiveGlobals["IsTickReplayEnabled"] = SafeToString(GetP(mdo, "IsTickReplayEnabled"));
+                    }
+
                     // FAIL CLOSED. A parameter that did not take means the run would execute
                     // some OTHER configuration and report it as the one requested - the exact
                     // silent substitution this whole path is being hardened against. Refusing
                     // is louder and cheaper than a plausible number nobody can attribute.
-                    if (paramErrors.Count > 0) return;
+                    if (paramErrors.Count > 0 || globalMismatches.Count > 0) return;
                     valid = Convert.ToBoolean(InvokeM(vm, "CheckSettingsValid"));
                     if (valid) InvokeM(vm, "OnRun", null, null);
                 }
@@ -1381,15 +1475,21 @@ namespace NinjaTrader.NinjaScript.AddOns
             }));
 
             if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
-            if (paramErrors.Count > 0)
+            if (paramErrors.Count > 0 || globalMismatches.Count > 0)
                 return new
                 {
-                    error = "refused: " + paramErrors.Count + " parameter(s) could not be applied, so the "
-                          + "backtest would have run a configuration you did not ask for",
+                    error = "refused: " + (paramErrors.Count + globalMismatches.Count)
+                          + " precondition(s) unmet, so the backtest would have run a configuration "
+                          + "you did not ask for",
                     paramErrors,
+                    globalMismatches,
                     appliedParams,
+                    effectiveGlobals,
+                    profileHash,
                     hint = "enums are set BY NAME (case-insensitive); POST /api/backtest/inspect lists "
-                         + "every property with its legal enum members",
+                         + "every property with its legal enum members, and POST /api/settings/inspect "
+                         + "{\"type\":\"NinjaTrader.Core.Globals\"} shows the globals. A global must be "
+                         + "changed in NT8 Settings -> Market data; this endpoint will not write it.",
                 };
             if (!valid) return new { error = "settings invalid - check strategy name, instrument, or that data exists for the range" };
 
@@ -1421,7 +1521,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             object report = null;
             // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
-            disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades, appliedParams); }));
+            disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades, appliedParams, effectiveGlobals, profileHash); }));
             return report;
             } // end lock(_saLock)
         }
@@ -1696,7 +1796,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         // WRITE time on the SA dispatcher, and by the time results are extracted the template
         // may have been reconfigured by another call. Echoing what THIS run applied is the
         // point; re-reading now would echo whatever is current.
-        private object ExtractBacktest(object entry, int maxTrades, Dictionary<string, string> appliedParams)
+        private object ExtractBacktest(object entry, int maxTrades, Dictionary<string, string> appliedParams,
+                                      Dictionary<string, string> effectiveGlobals, string profileHash)
         {
             var perf = GetP(entry, "Results");            // SystemPerformance
             var all = GetP(perf, "AllTrades");            // TradeCollection (IEnumerable<Trade>)
@@ -1773,6 +1874,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // distinguishes "applied" from "silently kept the previous value" - which is
                 // what a persisted StrategyTemplate does when a strategy's C# default changes.
                 appliedParams,
+                effectiveGlobals,
+                profileHash,
                 metrics = new
                 {
                     entries,
@@ -1816,6 +1919,27 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // - small reflection helpers (instance) -
+        // STATIC member reader. GetP() cannot do this: it calls o.GetType(), so handing it a
+        // Type looks the member up on RuntimeType and silently returns null - which reads as
+        // "the setting is absent" rather than "you asked the wrong object". NT8's global
+        // options hang off statics (Globals.MarketDataOptions), so this is the only way in.
+        private static object GetStaticP(Type t, string name)
+        {
+            if (t == null) return null;
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+            var p = t.GetProperty(name, F);
+            if (p != null && p.GetIndexParameters().Length == 0)
+            {
+                try { return p.GetValue(null); } catch { }
+            }
+            var f = t.GetField(name, F);
+            if (f != null)
+            {
+                try { return f.GetValue(null); } catch { }
+            }
+            return null;
+        }
+
         private static object GetP(object o, string name)
         {
             if (o == null) return null;
