@@ -1421,7 +1421,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             object report = null;
             // Leave the (minimized) window open for reuse - closing pops a blocking dialog.
-            disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades); }));
+            disp.Invoke((Action)(() => { report = ExtractBacktest(entry, maxTrades, appliedParams); }));
             return report;
             } // end lock(_saLock)
         }
@@ -1692,7 +1692,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // Pull metrics + (capped) trade list out of a StrategyAnalyzerGridEntry's SystemPerformance.
-        private object ExtractBacktest(object entry, int maxTrades)
+        // `appliedParams` is threaded in rather than read here: the values are captured at
+        // WRITE time on the SA dispatcher, and by the time results are extracted the template
+        // may have been reconfigured by another call. Echoing what THIS run applied is the
+        // point; re-reading now would echo whatever is current.
+        private object ExtractBacktest(object entry, int maxTrades, Dictionary<string, string> appliedParams)
         {
             var perf = GetP(entry, "Results");            // SystemPerformance
             var all = GetP(perf, "AllTrades");            // TradeCollection (IEnumerable<Trade>)
@@ -1763,6 +1767,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             return new
             {
                 summary = SafeToString(entry),
+                // ECHO. The values READ BACK off StrategyTemplate after the writes landed, not
+                // the values that were requested. A result that cannot name its own
+                // configuration is unattributable, and the read-back is the only thing that
+                // distinguishes "applied" from "silently kept the previous value" - which is
+                // what a persisted StrategyTemplate does when a strategy's C# default changes.
+                appliedParams,
                 metrics = new
                 {
                     entries,
@@ -1861,9 +1871,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (s != null)
                     {
-                        // Enum.Parse accepts an integer STRING too ("1"), which would silently
-                        // accept a value outside the enum. IsDefined closes that.
-                        var parsed = Enum.Parse(under, s, true);
+                        // Enum.Parse THROWS on an unknown name, and that exception message
+                        // ("Requested value 'Banana' was not found.") does not say what WOULD
+                        // have worked. A bad name is the common mistake, so it is caught here
+                        // rather than by the outer handler, and answered with the legal set -
+                        // an error a caller can act on without a second round trip.
+                        object parsed;
+                        try { parsed = Enum.Parse(under, s, true); }
+                        catch
+                        {
+                            error = string.Format("'{0}' is not a member of {1}; legal: {2}",
+                                s, under.Name, string.Join(", ", Enum.GetNames(under)));
+                            return false;
+                        }
+                        // Enum.Parse also accepts an integer STRING ("1"), which would silently
+                        // admit a value outside the enum. IsDefined closes that.
                         if (!Enum.IsDefined(under, parsed))
                         {
                             error = string.Format("'{0}' is not a member of {1}; legal: {2}",
