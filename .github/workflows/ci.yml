@@ -92,6 +92,18 @@ jobs:
       - name: One order-liveness predicate, not four
         run: python tools/check_single_order_liveness.py
 
+      # The Strategy Analyzer window is REUSED across calls and the strategy was applied
+      # with the lenient SetP, so an unresolvable name failed silently and the window kept
+      # whatever it already had. Measured 2026-09-04: a request for '@SampleMACrossOver'
+      # ran '_McpTestBot' and returned totalTrades: 0 -- indistinguishable from the
+      # requested strategy simply not having traded. The trigger is NT8's own convention:
+      # the FILE is '@SampleMACrossOver.cs' while the CLASS has no '@'.
+      #
+      # McpBridgeAddOn.cs is the one bridge source tests/BridgeTests.csproj cannot compile,
+      # so this gate is the ONLY automated reader of that contract.
+      - name: Backtest runs the strategy it was asked for
+        run: python tools/check_backtest_strategy_echo.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
@@ -150,6 +162,18 @@ jobs:
 
       - name: Mutation P1-106 (the lockout that trapped you in the position)
         run: python mutation/mutate_p1106.py
+
+      # 8/8 first run -- read that as the moment to add a mutant expected to survive,
+      # not as a strong result. One already was: a mutant written as an ORDERING case
+      # turned out to be killed by the existing `return` check instead, so the ordering
+      # condition is asserted by the gate's own self_test rather than from here (the
+      # resolve sits outside the dispatcher lambda and the write inside it, ~60 lines
+      # apart, so moving one past the other is not a single anchored replacement).
+      #
+      # Killer is a SOURCE GATE, not the C# suite: McpBridgeAddOn.cs cannot be built by
+      # tests/BridgeTests.csproj, so no unit test can reach Backtest().
+      - name: Mutation - Backtest ran a strategy nobody asked for
+        run: python mutation/mutate_backtest_strategy_echo.py
 
       # ⚠️ 15/18 on its first run, and all three survivors were real. Two of them were
       # SOURCE gates that passed under the mutant because they asserted a value is

@@ -817,11 +817,15 @@ export const TOOLS = [
   },
   {
     name: 'nt_backtest',
-    description: 'Run a backtest of a compiled strategy via the NT8 Strategy Analyzer over a configurable symbol, UTC date range, timeframe, and parameters.',
+    description:
+      'Run a backtest of a compiled strategy via the NT8 Strategy Analyzer over a configurable ' +
+      'symbol, UTC date range, timeframe, and parameters. The response echoes effectiveStrategy ' +
+      'and effectiveGlobals: the Strategy Analyzer window is REUSED between calls, so a run is ' +
+      'only attributable if what came back is what you asked for.',
     inputSchema: {
       type: 'object',
       properties: {
-        strategy:    { type: 'string', description: 'Strategy class name (must be compiled first)' },
+        strategy:    { type: 'string', description: 'Strategy CLASS name, not the .cs file name, and it must be compiled. NT8 names its stock sample FILES with a leading "@" (@SampleMACrossOver.cs) while the class has none (SampleMACrossOver); passing the "@" form used to run whatever strategy the reused Strategy Analyzer window already had and report 0 trades. It is now refused with the resolvable alternative named.' },
         symbol:      { type: 'string', description: 'Instrument (e.g. GC 08-26, NQ, ES)' },
         from:        { type: 'string', description: 'UTC Start date YYYY-MM-DD' },
         to:          { type: 'string', description: 'UTC End date YYYY-MM-DD' },

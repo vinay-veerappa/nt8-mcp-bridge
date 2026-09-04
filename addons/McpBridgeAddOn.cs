@@ -1286,6 +1286,41 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (string.IsNullOrEmpty(strategy) || string.IsNullOrEmpty(symbol))
                 return new { error = "strategy and symbol are required" };
 
+            // RESOLVE THE NAME BEFORE TOUCHING THE WINDOW.
+            //
+            // The Strategy Analyzer window is REUSED across calls (_saWindow), and the
+            // strategy was applied with the lenient SetP. A name that does not resolve
+            // therefore failed silently and left the window on whatever it already had,
+            // and the run reported success for a DIFFERENT strategy.
+            //
+            // Measured 2026-09-04: a request for '@SampleMACrossOver' ran '_McpTestBot'
+            // and returned totalTrades: 0 -- indistinguishable from the requested
+            // strategy having simply not traded. The trigger is NT8's own convention:
+            // the file is '@SampleMACrossOver.cs' but the CLASS is 'SampleMACrossOver',
+            // so the leading '@' resolves to nothing. A second call in the same session
+            // naming 'BollingerCrossOver' was honoured, which is what makes this an
+            // unresolvable-name FALLBACK rather than the argument being ignored.
+            //
+            // This is the phase 0.1 config-inheritance defect one level up: not just the
+            // settings inherited from a reused window, but the strategy itself.
+            var stratTypeReq = FindStrategyType(strategy);
+            if (stratTypeReq == null)
+            {
+                var alt = strategy.StartsWith("@") ? strategy.Substring(1) : ("@" + strategy);
+                var altType = FindStrategyType(alt);
+                return new
+                {
+                    error = "strategy type not found (compiled?): " + strategy,
+                    hint = altType != null
+                        ? ("'" + alt + "' DOES resolve -- NT8 names its stock sample FILES "
+                           + "with a leading '@' while the class has none. Use '" + alt + "'.")
+                        : ("GET /api/strategies lists the compiled classes. Note this is the "
+                           + "CLASS name, not the .cs file name."),
+                    refusedBefore = "the Strategy Analyzer window was not touched, so no "
+                                  + "other strategy could be run in its place",
+                };
+            }
+
             var disp = System.Windows.Application.Current?.Dispatcher;
             if (disp == null) return new { error = "no WPF dispatcher (is NT8 UI up?)" };
 
@@ -1296,6 +1331,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             object baselineResults = null;  // SystemPerformance ref before run — detects SA reusing the entry object
             var paramErrors = new List<string>();                       // any param that did NOT take
             var appliedParams = new Dictionary<string, string>();       // param -> value READ BACK after the write
+            string effectiveStrategy = null;                            // what the window ACTUALLY selected
 
             // Profile provenance and GLOBAL preconditions.
             //
@@ -1337,6 +1373,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                     var props = GetP(tab, "TabStrategyProperties");
 
                     SetP(props, "Strategy", strategy);
+
+                    // ECHO, then REFUSE. Resolving the type above proves the name is a
+                    // real strategy; it does not prove the property TOOK. Read back what
+                    // the window is actually going to run and compare. Any reason the
+                    // write failed -- an SA-side validation, a property that silently
+                    // ignores an unknown value -- lands here rather than in a plausible
+                    // result attributed to the wrong strategy.
+                    effectiveStrategy = StrategyIdentity(GetP(props, "Strategy"));
+                    if (!string.Equals(effectiveStrategy, stratTypeReq.Name,
+                                       StringComparison.OrdinalIgnoreCase))
+                        paramErrors.Add(string.Format(
+                            "Strategy did not take: requested '{0}' (class '{1}'), window "
+                            + "is set to '{2}'. The Strategy Analyzer window is reused, so "
+                            + "the run would have executed the PREVIOUS strategy and "
+                            + "reported it as yours.",
+                            strategy, stratTypeReq.Name,
+                            string.IsNullOrEmpty(effectiveStrategy) ? "<null>" : effectiveStrategy));
+
                     SetP(props, "InstrumentOrInstrumentList", symbol);
                     var bp = GetP(props, "BarsPeriod");
                     var bpType = Type.GetType("NinjaTrader.Data.BarsPeriodType, NinjaTrader.Core");
@@ -1485,6 +1539,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     globalMismatches,
                     appliedParams,
                     effectiveGlobals,
+                    effectiveStrategy,
                     profileHash,
                     hint = "enums are set BY NAME (case-insensitive); POST /api/backtest/inspect lists "
                          + "every property with its legal enum members, and POST /api/settings/inspect "
@@ -2440,6 +2495,28 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         private static string SafeToString(object v) { try { return v.ToString(); } catch { return "<toString threw>"; } }
+
+        // Comparable identifier for whatever TabStrategyProperties.Strategy holds.
+        //
+        // It may be a string (display name), a Type, or a live StrategyBase depending on
+        // NT8 version and on whether the property has been written yet. Reduced to a bare
+        // class name so a read-back can be compared to a resolved Type.Name.
+        //
+        // The last dotted segment is taken rather than testing `Contains`, because a
+        // substring match is how a check ends up matching too much: 'MACrossOver' is a
+        // substring of 'SampleMACrossOver', and an identity test that accepts a substring
+        // would pass exactly the confusion it exists to detect.
+        private static string StrategyIdentity(object v)
+        {
+            if (v == null) return "";
+            var t = v as Type;
+            if (t != null) return t.Name;
+            if (v is NinjaTrader.NinjaScript.StrategyBase) return v.GetType().Name;
+            var s = SafeToString(v);
+            if (string.IsNullOrEmpty(s)) return "";
+            int dot = s.LastIndexOf('.');
+            return dot >= 0 && dot < s.Length - 1 ? s.Substring(dot + 1) : s;
+        }
 
         // -
         //  Phase 1 handlers (unchanged)
