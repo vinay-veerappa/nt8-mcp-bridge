@@ -35,6 +35,18 @@ import io
 import os
 import sys
 
+# A GATE THAT CANNOT REPORT ITS FINDING IS WORSE THAN NO GATE. Anchor labels are
+# copied out of the batteries, which quote source comments verbatim - and those
+# comments contain non-cp1252 characters (⚠️). On Windows, stdout defaults to
+# cp1252, so `print(p)` in main() raised UnicodeEncodeError *while listing the
+# broken anchors*: the run exited 1 having named only the anchors that happened to
+# precede the first emoji. CI was red for five consecutive pushes reporting 2 of 3
+# broken anchors, and anyone fixing the 2 it named would have believed they were
+# done. `errors="replace"` is the load-bearing half - it makes this unkillable for
+# ANY future label, rather than for the characters that happen to be there today.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 

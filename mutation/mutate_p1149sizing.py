@@ -146,8 +146,20 @@ MUTANTS = [
      "⚠️ THE PLAIN ORDER PATH stops consulting the gate, while the other two keep doing so.\n"
      "     This is the ticket's whole subject: the defect was measured on the ATM path and fixing\n"
      "     only that path leaves /api/order exactly as open as it was",
-     '            var sizing = BridgeSizingGate.Evaluate(',
-     '            var sizing = BridgeSizingGateDISABLED.Evaluate('),
+     # ANCHOR DISAMBIGUATED 2026-09-04. A FOURTH call site (the multi-account
+     # orchestrator, ~7462) reuses the variable name `sizing` at deeper indentation, so
+     # the single-line find-string matched BOTH as a substring -- 2 hits, battery
+     # vacuous, mutant scored killed without running. The second line pins the
+     # indentation exactly (a `\n` cannot slide), and `currentPos` vs the orchestrator's
+     # `orchPos` is the discriminator if the indentation ever converges.
+     # The fourth site is NOT a defect: it consults this gate and the lockout gate with
+     # the same arithmetic, and says so in its own comments. It is the ANCHOR that was
+     # stale, not the code -- but a fifth site would break this again, so read
+     # `grep -n "BridgeSizingGate.Evaluate(" addons/McpBridgeAddOn.cs` before editing.
+     '            var sizing = BridgeSizingGate.Evaluate(\n'
+     '                EffectiveMaxContracts(account, symbol),',
+     '            var sizing = BridgeSizingGateDISABLED.Evaluate(\n'
+     '                EffectiveMaxContracts(account, symbol),'),
 
     (BRIDGE,
      "the OCO path stops consulting the gate. An OCO's entry adds exposure just as a plain order\n"

@@ -86,10 +86,13 @@ MUTANTS = [
      "THE MEASURED SEAM DEFECT: the route drops `offset` on the floor, exactly as it did for\n"
      "     all three of /api/orders' parameters -- the wrapper sends it and the switch discards\n"
      "     it, and every component either side is individually correct (SOURCE gate)",
+     # ANCHOR REFRESHED 2026-09-04: the route gained a `query["format"]` argument, so the
+     # find-string stopped matching (0 hits) and this battery scored a SURVIVOR as killed.
+     # check_anchors.py caught it; CI could not PRINT it (cp1252 crash mid-report).
      '                    return GetBars(query["symbol"], query["period"], query["periodValue"],\n'
-     '                        query["count"], query["offset"]);',
+     '                        query["count"], query["offset"], query["format"]);',
      '                    return GetBars(query["symbol"], query["period"], query["periodValue"],\n'
-     '                        query["count"], null);'),
+     '                        query["count"], null, query["format"]);'),
 
     (BRIDGE,
      "the SECOND crash restored: period=Banana goes straight to Enum.Parse. Enum.Parse is\n"

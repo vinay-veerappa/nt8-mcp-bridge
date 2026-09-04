@@ -111,7 +111,15 @@ MUTANTS = [
     (BRIDGE,
      "the call site feeds the gate the RESOLVED OrderAction label instead of the request's\n"
      "     direction, so the gate reads a label the caller chose (P1-97, one statement above)",
+     # ANCHOR DISAMBIGUATED 2026-09-04, same cause as mutate_p1149sizing.py: the
+     # multi-account orchestrator (~7451) feeds the lockout gate the identical
+     # expression at deeper indentation, so this single-line find-string matched both
+     # as a substring (2 hits) and the battery went vacuous. Leading with
+     # `IsAccountLocked(...)` and a `\n` pins the indentation to the single-account
+     # site. The orchestrator site is correctly wired - it was the anchor that rotted.
+     '                IsAccountLocked(account.Name),\n'
      '                actionStr.Equals("buy", StringComparison.OrdinalIgnoreCase),',
+     '                IsAccountLocked(account.Name),\n'
      '                resolvedAction.Equals("Buy", StringComparison.OrdinalIgnoreCase),'),
 ]
 
