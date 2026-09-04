@@ -702,6 +702,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/compile":            return Post(method, () => Compile(body));
                 case "/api/compile/result":     return ReadCompileResult();
                 case "/api/backtest":           return Post(method, () => Backtest(body));
+                case "/api/backtest/inspect":   return Post(method, () => BacktestInspect());
+                case "/api/settings/inspect":   return Post(method, () => SettingsInspect(body));
                 case "/api/strategy/running":   return RunningStrategies();
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
@@ -1024,6 +1026,231 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // -
+        //  GLOBAL SETTINGS DISCOVERY (Settings -> Market data and friends). Reflection only.
+        //
+        //  WHY. `Global merge policy` (= "Merge back adjusted" on this box) and `Show Tick
+        //  Replay` live in NT8's global Settings dialog, NOT on the strategy. The Strategy
+        //  Analyzer takes no MergePolicy argument, so it INHERITS the global - which means
+        //  every SA backtest has been running on back-adjusted prices via a setting nothing
+        //  here can read. That is the price-scale divergence at its source.
+        //
+        //  The only correct MergePolicy use in this file is per-BarsRequest in ExportBars
+        //  (~3699, defaulting to DoNotMerge). Nothing touches the GLOBAL.
+        //
+        //  Two-stage on purpose. Without `type` it lists candidate option/settings types and
+        //  their static members - cheap, and it does not walk hundreds of property getters
+        //  whose side effects are unknown. With `type` it resolves that one type, finds the
+        //  statics holding an instance, and describes them. Discover the name; do not guess
+        //  it, and do not hard-code a type this box happens to have.
+        //
+        //  ⚠️ READ-ONLY BY DESIGN. A global is not a per-run parameter: writing one changes
+        //  every chart, strategy and export on the machine. When a profile needs a global,
+        //  it must ASSERT and REPORT it, and refuse the run on disagreement - not set it.
+        // -
+
+        private object SettingsInspect(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            string typeName = req.Str("type");
+            string filter = (req.Str("filter") ?? string.Empty).Trim();
+
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                var t = ResolveNtType(typeName);
+                if (t == null) return new { error = "type not found in any loaded NinjaTrader assembly: " + typeName };
+
+                var found = new List<object>();
+                foreach (var mi in t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                {
+                    object inst = null;
+                    var pi = mi as PropertyInfo;
+                    var fi = mi as FieldInfo;
+                    try
+                    {
+                        if (pi != null && pi.GetIndexParameters().Length == 0) inst = pi.GetValue(null);
+                        else if (fi != null) inst = fi.GetValue(null);
+                        else continue;
+                    }
+                    catch { continue; }
+                    if (inst == null) continue;
+
+                    var it = inst.GetType();
+                    if (it.IsPrimitive || inst is string || it.IsEnum)
+                        found.Add(new { member = mi.Name, kind = "scalar", type = it.FullName, value = SafeToString(inst) });
+                    else
+                        found.Add(DescribeObject(mi.Name, inst));
+                }
+                return new { type = t.FullName, assembly = t.Assembly.GetName().Name, count = found.Count, members = found };
+            }
+
+            var candidates = new List<object>();
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var an = asm.GetName().Name ?? string.Empty;
+                if (!an.StartsWith("NinjaTrader", StringComparison.OrdinalIgnoreCase)) continue;
+                Type[] types;
+                // A partially-loadable assembly throws here and takes the whole scan with it.
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException ex) { types = ex.Types; }
+                catch { continue; }
+
+                foreach (var t in types)
+                {
+                    if (t == null || !t.IsClass) continue;
+                    var n = t.Name;
+                    if (!(n.EndsWith("Options", StringComparison.Ordinal)
+                          || n.EndsWith("Settings", StringComparison.Ordinal)
+                          || n.EndsWith("Preferences", StringComparison.Ordinal))) continue;
+                    if (filter.Length > 0 && (t.FullName ?? n).IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    var statics = new List<string>();
+                    try
+                    {
+                        foreach (var mi in t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                            if (mi is PropertyInfo || mi is FieldInfo) statics.Add(mi.Name);
+                    }
+                    catch { }
+                    candidates.Add(new { type = t.FullName, assembly = an, staticMembers = statics });
+                }
+            }
+            return new
+            {
+                filter,
+                hint = "re-POST with {\"type\":\"<full type name>\"} to describe its static instances",
+                count = candidates.Count,
+                candidateTypes = candidates,
+            };
+        }
+
+        private static Type ResolveNtType(string name)
+        {
+            var t = Type.GetType(name);
+            if (t != null) return t;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { t = asm.GetType(name); } catch { t = null; }
+                if (t != null) return t;
+            }
+            return null;
+        }
+
+        // -
+        //  Backtest configuration DISCOVERY. Reflection only - sets nothing.
+        //
+        //  WHY THIS EXISTS. Backtest() configures five things (Strategy, instrument,
+        //  BarsPeriod, params, date range) and INHERITS everything else from whatever the
+        //  reused SA window was last configured with by hand - order fill resolution, tick
+        //  replay, slippage, commission, trading hours, break-at-EOD, merge policy,
+        //  limit-fill-on-touch. None of it is echoed back, so two identical calls on
+        //  different days can return materially different numbers and no result can name
+        //  the configuration that produced it.
+        //
+        //  Freezing that configuration requires knowing which knobs are REACHABLE, and
+        //  that cannot be assumed: the SA From/To dates have no config property at all and
+        //  SetSaDateRange has to drive the Infragistics editors directly. So this route
+        //  reports the property surface - name, type, writability, and for enums the legal
+        //  member names - and the profile is written against what it finds, not a wish list.
+        //
+        //  `enumNames` is the load-bearing field. Both setters in this file silently drop a
+        //  string enum name: SetP() converts enums via Enum.ToObject(t, Convert.ToInt64(v)),
+        //  which throws on "High" into a bare catch and then fails SetValue into a second
+        //  bare catch; the params loop in Backtest() uses Convert.ChangeType(string, enumType),
+        //  which throws into a bare catch of its own (this is why TradePolicy could not be
+        //  set remotely). Every knob above is an enum set BY NAME, so a profile written
+        //  before those are fixed would report success and change nothing.
+        // -
+
+        private object BacktestInspect()
+        {
+            lock (_saLock)
+            {
+                var disp = System.Windows.Application.Current?.Dispatcher;
+                if (disp == null) return new { error = "no WPF dispatcher (is NT8 UI up?)" };
+
+                Exception err = null;
+                var groups = new List<object>();
+
+                disp.Invoke((Action)(() =>
+                {
+                    try
+                    {
+                        // Adopt the existing window rather than creating a second one, for the
+                        // same reason Backtest() does: closing an NT8 window pops a blocking
+                        // confirmation dialog, so windows are never closed, only adopted.
+                        _saWindow = FindExistingSaWindow();
+                        bool created = _saWindow == null;
+                        if (created)
+                        {
+                            var saType = Type.GetType(SaNs + "StrategyAnalyzer, NinjaTrader.Gui");
+                            _saWindow = Activator.CreateInstance(saType);
+                            InvokeM(_saWindow, "Show");
+                        }
+                        try { SetP(_saWindow, "WindowState", System.Windows.WindowState.Minimized); } catch { }
+
+                        var vm = GetP(_saWindow, "ViewModel");
+                        var tab = GetP(vm, "SelectedTab");
+                        var props = GetP(tab, "TabStrategyProperties");
+
+                        groups.Add(new { adoptedExistingWindow = !created });
+                        groups.Add(DescribeObject("TabStrategyProperties", props));
+                        groups.Add(DescribeObject("BarsPeriod", GetP(props, "BarsPeriod")));
+                        groups.Add(DescribeObject("StrategyTemplate", GetP(props, "StrategyTemplate")));
+                        groups.Add(DescribeObject("SelectedTab", tab));
+                    }
+                    catch (Exception ex) { err = ex; }
+                }));
+
+                if (err != null)
+                    return new { error = "inspect failed: " + err.Message, stack = err.StackTrace };
+                return new { groups };
+            }
+        }
+
+        private static object DescribeObject(string label, object o)
+        {
+            if (o == null) return new { label, present = false, typeName = (string)null, count = 0, properties = new object[0] };
+
+            var list = new List<object>();
+            foreach (var pi in o.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (pi.GetIndexParameters().Length != 0) continue;
+
+                object val = null;
+                string readError = null;
+                try { val = pi.GetValue(o); }
+                catch (Exception ex) { readError = ex.GetType().Name; }
+
+                // Nullable<TEnum> does not report IsEnum, and an SA setting that is
+                // legitimately unset is exactly the shape that arrives as a nullable. Miss
+                // this and the knob reports as a plain struct with no legal values, which
+                // reads as "not an enum" rather than "enum, currently null".
+                var t = pi.PropertyType;
+                var under = Nullable.GetUnderlyingType(t) ?? t;
+                var isEnum = under.IsEnum;
+
+                list.Add(new
+                {
+                    name = pi.Name,
+                    type = t.FullName,
+                    canWrite = pi.CanWrite,
+                    isEnum,
+                    isNullable = !ReferenceEquals(under, t),
+                    enumNames = isEnum ? Enum.GetNames(under) : null,
+                    value = readError == null ? (val == null ? null : SafeToString(val)) : null,
+                    readError,
+                });
+            }
+            return new
+            {
+                label,
+                present = true,
+                typeName = o.GetType().FullName,
+                count = list.Count,
+                properties = list,
+            };
+        }
+
+        // -
         //  Backtest - driven via a bridge-managed Strategy Analyzer window.
         //  Sequence (all on the WPF dispatcher):
         //    create+show(minimized) SA window (cached/reused) - configure the
@@ -1067,6 +1294,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             object tabRef = null;
             object baseline = null;
             object baselineResults = null;  // SystemPerformance ref before run — detects SA reusing the entry object
+            var paramErrors = new List<string>();                       // any param that did NOT take
+            var appliedParams = new Dictionary<string, string>();       // param -> value READ BACK after the write
 
             disp.Invoke((Action)(() =>
             {
@@ -1098,12 +1327,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (prms != null)
                     {
                         var tmpl = GetP(props, "StrategyTemplate");
-                        if (tmpl != null)
+                        if (tmpl == null)
+                            paramErrors.Add("StrategyTemplate is null; no parameter can be applied");
+                        else
                             foreach (var p in prms.Properties())
                             {
-                                var pi = tmpl.GetType().GetProperty(p.Name, BindingFlags.Public | BindingFlags.Instance);
-                                if (pi != null && pi.CanWrite && p.Value is JValue jv && jv.Value != null)
-                                    try { pi.SetValue(tmpl, Convert.ChangeType(jv.Value, pi.PropertyType)); } catch { }
+                                // Was: Convert.ChangeType(jv.Value, pi.PropertyType) inside a bare
+                                // catch. A string enum name ("High", "OnEachTick") threw and was
+                                // swallowed, so the parameter silently kept its previous value and
+                                // the backtest ran anyway - reporting success for a configuration
+                                // the caller never asked for. TrySetP coerces enums by name and
+                                // says why when it cannot; the failure now BLOCKS the run below.
+                                var jv = p.Value as JValue;
+                                if (jv == null || jv.Value == null)
+                                {
+                                    paramErrors.Add(p.Name + ": expected a scalar value, got " + p.Value.Type);
+                                    continue;
+                                }
+                                string setErr;
+                                if (!TrySetP(tmpl, p.Name, jv.Value, out setErr))
+                                    paramErrors.Add(p.Name + ": " + setErr);
+                                else
+                                {
+                                    // Read back. StrategyTemplate is a PERSISTED live StrategyBase,
+                                    // so a write can land on a stale object, and a setter can clamp
+                                    // or ignore a value without throwing. What it REPORTS after the
+                                    // write is the only evidence the run used what was requested.
+                                    var after = GetP(tmpl, p.Name);
+                                    appliedParams[p.Name] = after == null ? null : SafeToString(after);
+                                }
                             }
                     }
 
@@ -1117,6 +1369,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                     // SelectedResult object across runs and just swap its Results (SystemPerformance).
                     // Detecting a new Results reference is more reliable than a new SelectedResult.
                     baselineResults = baseline != null ? GetP(baseline, "Results") : null;
+                    // FAIL CLOSED. A parameter that did not take means the run would execute
+                    // some OTHER configuration and report it as the one requested - the exact
+                    // silent substitution this whole path is being hardened against. Refusing
+                    // is louder and cheaper than a plausible number nobody can attribute.
+                    if (paramErrors.Count > 0) return;
                     valid = Convert.ToBoolean(InvokeM(vm, "CheckSettingsValid"));
                     if (valid) InvokeM(vm, "OnRun", null, null);
                 }
@@ -1124,6 +1381,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             }));
 
             if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
+            if (paramErrors.Count > 0)
+                return new
+                {
+                    error = "refused: " + paramErrors.Count + " parameter(s) could not be applied, so the "
+                          + "backtest would have run a configuration you did not ask for",
+                    paramErrors,
+                    appliedParams,
+                    hint = "enums are set BY NAME (case-insensitive); POST /api/backtest/inspect lists "
+                         + "every property with its legal enum members",
+                };
             if (!valid) return new { error = "settings invalid - check strategy name, instrument, or that data exists for the range" };
 
             // Poll for a new completed result. Two signals:
@@ -1556,25 +1823,116 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             return null;
         }
+        // Coerce a JSON-ish value to a target property type, REPORTING why it could not.
+        //
+        // ⚠️ THE DEFECT THIS FIXES. Enums were converted with
+        //     Enum.ToObject(t, Convert.ToInt64(val))
+        // which is numeric-only. An enum passed BY NAME - "High", "OnEachTick",
+        // "MergeBackAdjusted" - made Convert.ToInt64 throw into a bare catch, left `val` as
+        // the original string, and then SetValue threw into a SECOND bare catch. The result
+        // was a silent no-op: the caller asked for a setting, got no error, and nothing
+        // changed. That is why TradePolicy could not be set remotely.
+        //
+        // Names are the ONLY sensible wire form for an enum - a caller cannot know NT8's
+        // integer for `OrderFillResolution.High`, and the integer is not stable across
+        // versions - so name-first with a numeric fallback is the right order, not the
+        // reverse. Nullable<TEnum> is handled explicitly because an NT8 setting that is
+        // legitimately unset arrives as a nullable, and Nullable<T> does not report IsEnum.
+        private static bool CoerceTo(Type target, object val, out object result, out string error)
+        {
+            result = null;
+            error = null;
+            if (target == null) { error = "no target type"; return false; }
+
+            var under = Nullable.GetUnderlyingType(target) ?? target;
+
+            if (val == null)
+            {
+                if (!ReferenceEquals(under, target) || !target.IsValueType) { result = null; return true; }
+                error = "null is not assignable to non-nullable " + target.Name;
+                return false;
+            }
+            if (target.IsInstanceOfType(val)) { result = val; return true; }
+
+            var s = val as string;
+            try
+            {
+                if (under.IsEnum)
+                {
+                    if (s != null)
+                    {
+                        // Enum.Parse accepts an integer STRING too ("1"), which would silently
+                        // accept a value outside the enum. IsDefined closes that.
+                        var parsed = Enum.Parse(under, s, true);
+                        if (!Enum.IsDefined(under, parsed))
+                        {
+                            error = string.Format("'{0}' is not a member of {1}; legal: {2}",
+                                s, under.Name, string.Join(", ", Enum.GetNames(under)));
+                            return false;
+                        }
+                        result = parsed;
+                        return true;
+                    }
+                    result = Enum.ToObject(under, Convert.ToInt64(val));
+                    if (!Enum.IsDefined(under, result))
+                    {
+                        error = string.Format("{0} is not a member of {1}; legal: {2}",
+                            val, under.Name, string.Join(", ", Enum.GetNames(under)));
+                        result = null;
+                        return false;
+                    }
+                    return true;
+                }
+                result = Convert.ChangeType(val, under);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = string.Format("cannot convert {0} '{1}' to {2}: {3}",
+                    val.GetType().Name, val, target.Name, ex.Message);
+                return false;
+            }
+        }
+
+        // Lenient setter. Kept lenient ON PURPOSE: ~30 call sites rely on "set it if you
+        // can, carry on if you cannot" (window state, cosmetic properties). It now coerces
+        // enums by NAME via CoerceTo, so every one of those callers gains that for free.
+        // Anything that must KNOW whether the write landed uses TrySetP instead.
         private static void SetP(object o, string name, object val)
         {
+            string ignored;
+            TrySetP(o, name, val, out ignored);
+        }
+
+        // Strict setter: returns false and says why. Use this wherever a caller-supplied
+        // value is being applied, because a setting that silently does not take is
+        // indistinguishable from one that did.
+        private static bool TrySetP(object o, string name, object val, out string error)
+        {
+            error = null;
+            if (o == null) { error = "target object is null"; return false; }
+
             var pi = o.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (pi != null && pi.GetIndexParameters().Length == 0)
             {
-                try
-                {
-                    if (val != null && !pi.PropertyType.IsInstanceOfType(val))
-                        try { val = pi.PropertyType.IsEnum ? Enum.ToObject(pi.PropertyType, Convert.ToInt64(val)) : Convert.ChangeType(val, pi.PropertyType); } catch { }
-                    pi.SetValue(o, val);
-                    return;
-                }
-                catch { /* indexer or access threw */ }
+                if (!pi.CanWrite) { error = name + " is read-only"; return false; }
+                object coerced;
+                if (!CoerceTo(pi.PropertyType, val, out coerced, out error)) return false;
+                try { pi.SetValue(o, coerced); return true; }
+                catch (Exception ex) { error = "SetValue(" + name + ") threw: " + ex.Message; return false; }
             }
+
             var fi = o.GetType().GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (fi != null)
             {
-                try { fi.SetValue(o, val); } catch { }
+                object coerced;
+                if (!CoerceTo(fi.FieldType, val, out coerced, out error)) return false;
+                try { fi.SetValue(o, coerced); return true; }
+                catch (Exception ex) { error = "SetValue(field " + name + ") threw: " + ex.Message; return false; }
             }
+
+            error = "no property or field named " + name + " on " + o.GetType().Name;
+            return false;
         }
         private static object InvokeM(object o, string name, params object[] args)
         {
