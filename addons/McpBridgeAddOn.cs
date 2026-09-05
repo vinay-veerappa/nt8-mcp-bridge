@@ -801,6 +801,69 @@ namespace NinjaTrader.NinjaScript.AddOns
         //  Strategy authoring (safe - pure file I/O)
         // -
 
+        // -
+        //  NT8 COMPILES bin\Custom\Strategies AND bin\Custom\Indicators RECURSIVELY.
+        //  These handlers did not, and every one of them read only the top level.
+        //
+        //  Measured 2026-09-04: `nt_list_strategies` reported 27 files. There are 59.
+        //  The 32 it omitted live in six subfolders -- Vinay, PriceAction, RajAlgos,
+        //  bcomasStrategies, TradeSaberStrategies, TrendIsYourFriend -- and the Vinay
+        //  folder is where this user's own bots are. The listing was read as evidence
+        //  that those bots were NOT DEPLOYED, and a deploy was very nearly repeated on
+        //  a live box because of it. An empty answer and an unsearched folder look
+        //  identical.
+        //
+        //  The CREATE path is the dangerous one. It checked File.Exists at the TOP
+        //  LEVEL only, so creating `Strategies/Foo.cs` while `Strategies/Vinay/Foo.cs`
+        //  already exists writes a SECOND definition of the same class. NT8 then fails
+        //  to compile the whole Custom assembly, which stops EVERY addon loading -- the
+        //  risk guard included -- and the only symptom is a deploy that had no effect.
+        //  This is the identical trap the indicator sync hit in the consumer repo,
+        //  where a top-level-only check would have written 23 duplicate classes beside
+        //  copies already sitting in Indicators/Vinay and Indicators/RedTail.
+        // -
+
+        // Every .cs under `root`, at any depth, newest first.
+        private static List<object> ListScriptsRecursive(string root)
+        {
+            return Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories)
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(fi => fi.LastWriteTimeUtc)
+                .Select(fi => (object)new
+                {
+                    name = Path.GetFileNameWithoutExtension(fi.Name),
+                    file = fi.Name,
+                    // Relative folder, so a caller can see WHERE it lives. "" is the
+                    // top level. Two files with the same name in different folders is
+                    // a collision NT8 will refuse to compile, and this is what makes
+                    // that visible.
+                    folder = RelativeFolder(root, fi.DirectoryName),
+                    bytes = fi.Length,
+                    modified = fi.LastWriteTimeUtc,
+                })
+                .ToList();
+        }
+
+        private static string RelativeFolder(string root, string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return "";
+            var r = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar);
+            var d = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar);
+            if (string.Equals(r, d, StringComparison.OrdinalIgnoreCase)) return "";
+            return d.StartsWith(r, StringComparison.OrdinalIgnoreCase)
+                ? d.Substring(r.Length).TrimStart(Path.DirectorySeparatorChar)
+                : d;
+        }
+
+        // Every path under `root` holding `name`.cs, at any depth. Returns ALL of them:
+        // more than one IS the collision, and a caller that silently took the first
+        // would hide it.
+        private static List<string> FindScriptFiles(string root, string name)
+        {
+            if (!Directory.Exists(root)) return new List<string>();
+            return Directory.GetFiles(root, name + ".cs", SearchOption.AllDirectories).ToList();
+        }
+
         private static string StrategiesDir =>
             Path.Combine(Globals.UserDataDir, "bin", "Custom", "Strategies");
 
@@ -819,19 +882,26 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var dir = StrategiesDir;
             if (!Directory.Exists(dir)) return new { dir, strategies = new List<object>() };
-            var list = Directory.GetFiles(dir, "*.cs")
-                .Select(f => new FileInfo(f))
-                .OrderByDescending(fi => fi.LastWriteTimeUtc)
-                .Select(fi => new { name = Path.GetFileNameWithoutExtension(fi.Name), file = fi.Name, bytes = fi.Length, modified = fi.LastWriteTimeUtc })
-                .ToList();
-            return new { dir, count = list.Count, strategies = list };
+            var list = ListScriptsRecursive(dir);
+            return new { dir, count = list.Count, recursive = true, strategies = list };
         }
 
         private object GetStrategySource(string name)
         {
-            var path = SafeStrategyPath(name);
-            if (!File.Exists(path)) return new { error = $"strategy not found: {name}" };
-            return new { name = Path.GetFileNameWithoutExtension(path), file = Path.GetFileName(path), source = File.ReadAllText(path) };
+            var path = SafeStrategyPath(name);   // name gate first: traversal is closed here
+            if (!File.Exists(path))
+            {
+                var hits = FindScriptFiles(StrategiesDir, Path.GetFileNameWithoutExtension(path));
+                if (hits.Count == 0) return new { error = $"strategy not found: {name}" };
+                if (hits.Count > 1)
+                    return new { error = $"AMBIGUOUS: {hits.Count} files named {name}.cs exist under Strategies",
+                                 paths = hits,
+                                 note = "NT8 compiles this tree recursively, so duplicate class names in different folders fail the WHOLE Custom assembly and stop every addon loading." };
+                path = hits[0];
+            }
+            return new { name = Path.GetFileNameWithoutExtension(path), file = Path.GetFileName(path),
+                         folder = RelativeFolder(StrategiesDir, Path.GetDirectoryName(path)),
+                         source = File.ReadAllText(path) };
         }
 
         private object CreateStrategy(string body)
@@ -845,6 +915,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             var path = SafeStrategyPath(name);
             var existed = File.Exists(path);
             if (existed && !overwrite) return new { error = $"strategy exists (pass overwrite=true): {name}" };
+
+            // A same-named file in a SUBFOLDER is not a duplicate to overwrite, it is a
+            // duplicate to refuse: writing here would define the class twice and fail
+            // the whole Custom assembly, which stops every addon loading. `overwrite`
+            // cannot authorise this -- it means "replace the file I named", and this is
+            // a different file.
+            var elsewhere = FindScriptFiles(StrategiesDir, Path.GetFileNameWithoutExtension(path))
+                .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (elsewhere.Count > 0)
+                return new { error = $"refused: {name}.cs already exists elsewhere under Strategies",
+                             paths = elsewhere,
+                             note = "NT8 compiles this tree RECURSIVELY. Writing a second copy would define the class twice, fail the whole Custom assembly, and stop every addon loading -- the risk guard included. Edit the existing file, or pick another class name." };
 
             Directory.CreateDirectory(StrategiesDir);
             File.WriteAllText(path, source, new UTF8Encoding(false));
@@ -876,19 +959,26 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var dir = IndicatorsDir;
             if (!Directory.Exists(dir)) return new { dir, indicators = new List<object>() };
-            var list = Directory.GetFiles(dir, "*.cs")
-                .Select(f => new FileInfo(f))
-                .OrderByDescending(fi => fi.LastWriteTimeUtc)
-                .Select(fi => new { name = Path.GetFileNameWithoutExtension(fi.Name), file = fi.Name, bytes = fi.Length, modified = fi.LastWriteTimeUtc })
-                .ToList();
-            return new { dir, count = list.Count, indicators = list };
+            var list = ListScriptsRecursive(dir);
+            return new { dir, count = list.Count, recursive = true, indicators = list };
         }
 
         private object GetIndicatorSource(string name)
         {
-            var path = SafeIndicatorPath(name);
-            if (!File.Exists(path)) return new { error = $"indicator not found: {name}" };
-            return new { name = Path.GetFileNameWithoutExtension(path), file = Path.GetFileName(path), source = File.ReadAllText(path) };
+            var path = SafeIndicatorPath(name);   // name gate first: traversal is closed here
+            if (!File.Exists(path))
+            {
+                var hits = FindScriptFiles(IndicatorsDir, Path.GetFileNameWithoutExtension(path));
+                if (hits.Count == 0) return new { error = $"indicator not found: {name}" };
+                if (hits.Count > 1)
+                    return new { error = $"AMBIGUOUS: {hits.Count} files named {name}.cs exist under Indicators",
+                                 paths = hits,
+                                 note = "NT8 compiles this tree recursively, so duplicate class names in different folders fail the WHOLE Custom assembly and stop every addon loading." };
+                path = hits[0];
+            }
+            return new { name = Path.GetFileNameWithoutExtension(path), file = Path.GetFileName(path),
+                         folder = RelativeFolder(IndicatorsDir, Path.GetDirectoryName(path)),
+                         source = File.ReadAllText(path) };
         }
 
         private object CreateIndicator(string body)
@@ -902,6 +992,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             var path = SafeIndicatorPath(name);
             var existed = File.Exists(path);
             if (existed && !overwrite) return new { error = $"indicator exists (pass overwrite=true): {name}" };
+
+            // Eleven vendor subfolders live under Indicators, which makes this the
+            // likelier half of the collision. See CreateStrategy for why `overwrite`
+            // cannot authorise writing over a file it did not name.
+            var elsewhere = FindScriptFiles(IndicatorsDir, Path.GetFileNameWithoutExtension(path))
+                .Where(f => !string.Equals(Path.GetFullPath(f), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (elsewhere.Count > 0)
+                return new { error = $"refused: {name}.cs already exists elsewhere under Indicators",
+                             paths = elsewhere,
+                             note = "NT8 compiles this tree RECURSIVELY. Writing a second copy would define the class twice, fail the whole Custom assembly, and stop every addon loading -- the risk guard included. Edit the existing file, or pick another class name." };
 
             Directory.CreateDirectory(IndicatorsDir);
             File.WriteAllText(path, source, new UTF8Encoding(false));

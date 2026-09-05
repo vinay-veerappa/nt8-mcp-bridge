@@ -104,6 +104,16 @@ jobs:
       - name: Backtest runs the strategy it was asked for
         run: python tools/check_backtest_strategy_echo.py
 
+      # NT8 compiles Strategies/ and Indicators/ RECURSIVELY; six handlers used
+      # Directory.GetFiles(dir, "*.cs"), which is TopDirectoryOnly.
+      # nt_list_strategies reported 27 files against 59 on disk, and that listing was
+      # read as evidence a deployed bot was missing. The severe half is creation:
+      # File.Exists at the top level only means writing Strategies/Foo.cs beside an
+      # existing Strategies/Vinay/Foo.cs defines the class TWICE, fails the whole
+      # Custom assembly, and stops every addon loading -- the risk guard included.
+      - name: Script-tree handlers see the whole tree
+        run: python tools/check_script_tree_recursion.py
+
       # ⚠️ Ported from nt8-riskguard in session 42, AFTER it was needed here. A battery whose
       # find-string stops matching prints [SKIP] and scores that mutant a SURVIVOR -- but only
       # when the battery is RUN, which is minutes of `dotnet build`. P3-111 moved the parse
@@ -174,6 +184,14 @@ jobs:
       # tests/BridgeTests.csproj, so no unit test can reach Backtest().
       - name: Mutation - Backtest ran a strategy nobody asked for
         run: python mutation/mutate_backtest_strategy_echo.py
+
+      # 6/8 on its first run, and BOTH survivors were the two most severe mutants --
+      # the create paths accepting a cross-folder collision. The gate asserted that
+      # FindScriptFiles was CALLED near the word "refused"; neutering the guard to
+      # `if (false)` leaves both present. Same shape that beat the P1-105 and P2-109
+      # gates. Fixed by asserting the collision list is TESTED, not merely computed.
+      - name: Mutation - script-tree handlers saw only the top level
+        run: python mutation/mutate_script_tree_recursion.py
 
       # ⚠️ 15/18 on its first run, and all three survivors were real. Two of them were
       # SOURCE gates that passed under the mutant because they asserted a value is
