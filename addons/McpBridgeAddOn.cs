@@ -1995,6 +1995,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                         exitReasons[xname] = (exitReasons.TryGetValue(xname, out xc) ? xc : 0) + 1;
                     }
                     if (trades.Count >= maxTrades) continue;   // still count the rest
+                    // The entry-level key this method ALREADY groups by above. It was
+                    // computed, reported as an aggregate, and never emitted -- so a
+                    // consumer could read "entry win rate 41%" and had no way to
+                    // reproduce it, or to tell which rows are legs of one bracket.
+                    // Scale-out exits share an entry; the leg convention is one row
+                    // per leg, and this is what joins them.
+                    var entryGroup = GetP(entryExec, "Time") is DateTime egt
+                        ? egt.Ticks + "|" + SafeToString(GetP(entryExec, "MarketPosition"))
+                        : null;
+                    // The entry order's signal name. This is the JOIN KEY to the
+                    // strategy's own decision log (which records WHY the trade was
+                    // taken -- something no bridge field can supply, because the
+                    // criteria never reach the platform).
+                    var entryName = SafeToString(GetP(entryExec, "Name"));
+                    if (string.IsNullOrWhiteSpace(entryName) || entryName == "<toString threw>")
+                        entryName = SafeToString(GetP(GetP(entryExec, "Order"), "Name"));
                     trades.Add(new
                     {
                         instrument = SafeToString(GetP(entryExec, "Instrument") is object inst ? GetP(inst, "FullName") : null),
@@ -2007,6 +2023,27 @@ namespace NinjaTrader.NinjaScript.AddOns
                         profitCurrency = pc,
                         profitPoints = GetP(tr, "ProfitPoints"),
                         exitName = GetP(exitExec, "Name"),
+                        // --- added: what win/loss attribution needs -----------------
+                        entryName,
+                        entryGroup,
+                        tradeNumber = GetP(tr, "TradeNumber"),
+                        // PER-LEG quantities. Trade.Quantity is the trade's, and on a
+                        // scale-out the two executions differ from it and from each
+                        // other -- which is exactly what makes a queen/runner bracket
+                        // two rows rather than one.
+                        entryQuantity = GetP(entryExec, "Quantity"),
+                        exitQuantity  = GetP(exitExec, "Quantity"),
+                        // MAE/MFE. These live on Trade and are available ONLY from a
+                        // backtest SystemPerformance -- this method's own account-level
+                        // sibling carries a note saying so -- and were not projected.
+                        // They are what separates a bad ENTRY (the loser never went
+                        // your way) from a bad EXIT (it did, and was given back);
+                        // nothing in a P&L column can tell those apart.
+                        maeCurrency = GetP(tr, "MaeCurrency"),
+                        maePoints   = GetP(tr, "MaePoints"),
+                        mfeCurrency = GetP(tr, "MfeCurrency"),
+                        mfePoints   = GetP(tr, "MfePoints"),
+                        commission  = GetP(tr, "Commission"),
                     });
                 }
 

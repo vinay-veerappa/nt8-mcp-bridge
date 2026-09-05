@@ -1440,6 +1440,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             TestP1149_ThePositionQuantityIsReadAsAMagnitude();
             TestP1149_EveryOrderPathConsultsTheGate();
             TestP1149_TheBridgeDoesNotCarryItsOwnCopyOfTheCap();
+            TestBacktestTradesCarryExcursionsAndPerLegFields();
             TestP2138_TheLivePayloadMapsOntoTheTreesInput();
             TestP2138_AFollowerWithTwoRelationshipsShowsTheRefusal();
             TestP2138_TheRouteServesTheTreeItBuilds();
@@ -1453,7 +1454,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 123;
+            const int declared = 124;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -5508,6 +5509,88 @@ namespace NinjaTrader.NinjaScript.AddOns
                 "P1-149: and the decision class assigns no default of its own -- it takes the cap as "
                 + "a parameter. A fallback constant in here is the same second-reader defect wearing "
                 + "a different hat.");
+        }
+
+        /// <summary>
+        /// A backtest trade row must carry what win/loss attribution needs: the excursions,
+        /// the per-leg quantities, the entry signal name, and the entry group key.
+        ///
+        /// WHY THESE AND NOT OTHERS. `Trade.MaeCurrency` / `MfeCurrency` are available ONLY
+        /// from a backtest SystemPerformance -- this file's account-level sibling carries a
+        /// note in the source saying exactly that -- and they were the fields that separate a
+        /// bad ENTRY (the loser never went your way) from a bad EXIT (it did, and was given
+        /// back). No P&L column distinguishes those, so the analysis was impossible rather
+        /// than merely inconvenient.
+        ///
+        /// `entryGroup` is the sharper omission: ExtractBacktest ALREADY groups by an
+        /// entry key to compute `entries`, `winEntries`, `avgWinEntry` and `maxLossEntry`,
+        /// and never emitted the key. A consumer could read "entry win rate 41%" with no way
+        /// to reproduce it, and no way to tell which rows are legs of one bracket -- which is
+        /// the whole content of the leg convention.
+        ///
+        /// A SOURCE GATE, because the method reflects over a StrategyAnalyzerGridEntry and
+        /// cannot be constructed off-platform. So it gets negative controls: a field name
+        /// present in an anonymous object proves nothing if nothing reads the Trade for it.
+        /// </summary>
+        private static void TestBacktestTradesCarryExcursionsAndPerLegFields()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] backtest trade rows carry MAE/MFE, per-leg quantities and the entry key (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // Positive: the field is emitted AND its value is read off the Trade. Asserting
+            // only the field name would pass for `maeCurrency = 0`, which is the shape that
+            // makes an absent measurement look like a measured zero.
+            foreach (var pair in new[] {
+                new[] { "maeCurrency", "MaeCurrency" },
+                new[] { "maePoints",   "MaePoints"   },
+                new[] { "mfeCurrency", "MfeCurrency" },
+                new[] { "mfePoints",   "MfePoints"   },
+                new[] { "tradeNumber", "TradeNumber" },
+                new[] { "commission",  "Commission"  } })
+            {
+                Assert(Regex.IsMatch(code, pair[0] + @"\s*=\s*GetP\(\s*tr\s*,\s*""" + pair[1] + @"""\s*\)"),
+                    "the row emits `" + pair[0] + "` read from Trade." + pair[1]
+                    + " -- not a literal, which would read as a measured value");
+            }
+
+            // PER-LEG quantities come off the EXECUTIONS, not off Trade.Quantity. On a
+            // scale-out the two executions differ from the trade's quantity and from each
+            // other, and that difference is why a queen/runner bracket is two rows.
+            Assert(Regex.IsMatch(code, @"entryQuantity\s*=\s*GetP\(\s*entryExec\s*,\s*""Quantity""\s*\)"),
+                "`entryQuantity` comes from the ENTRY execution, not from Trade.Quantity");
+            Assert(Regex.IsMatch(code, @"exitQuantity\s*=\s*GetP\(\s*exitExec\s*,\s*""Quantity""\s*\)"),
+                "and `exitQuantity` from the EXIT execution");
+
+            // The entry group key: emitted, and built from the SAME two components the
+            // aggregation above already groups by. A key computed differently from the
+            // aggregate it is supposed to explain would be worse than none.
+            Assert(code.Contains("entryGroup"),
+                "the row emits `entryGroup`, the key that joins the legs of one bracket");
+            Assert(Regex.IsMatch(code, @"entryGroup\s*=\s*GetP\(\s*entryExec\s*,\s*""Time""\s*\)\s*is\s+DateTime"),
+                "and it is derived from the entry execution's Time, matching the `ekey` the "
+                + "aggregation groups by -- a key built differently from the aggregate it "
+                + "explains would be worse than no key");
+
+            // The entry signal name is the JOIN KEY to the strategy's own decision log, which
+            // is the only possible source of WHY a trade was taken: the criteria live in the
+            // strategy and never reach the platform, so no bridge field can ever supply them.
+            Assert(code.Contains("entryName"),
+                "the row emits `entryName` -- the join key to the strategy's decision log");
+            Assert(Regex.IsMatch(code, @"entryName\s*=\s*SafeToString\(\s*GetP\(\s*GetP\(\s*entryExec\s*,\s*""Order""\s*\)\s*,\s*""Name""\s*\)\s*\)"),
+                "and it falls back to the entry ORDER's Name when Execution.Name is empty -- "
+                + "the same two-step the exit-reason tally already needed, because "
+                + "Execution.Name is empty on some fills");
+
+            // NEGATIVE CONTROL. The pre-existing fields must survive: a projection rewritten
+            // to add columns is exactly where a column silently disappears, and every
+            // downstream consumer reads these by name.
+            foreach (var kept in new[] { "instrument", "marketPosition", "quantity",
+                                         "entryPrice", "exitPrice", "entryTime", "exitTime",
+                                         "profitCurrency", "profitPoints", "exitName" })
+                Assert(Regex.IsMatch(code, @"\b" + kept + @"\s*="),
+                    "and the pre-existing field `" + kept + "` is still emitted");
         }
 
         public static int Main(string[] args)
