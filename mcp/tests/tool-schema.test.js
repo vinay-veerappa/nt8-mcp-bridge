@@ -238,8 +238,8 @@ test('the schemas are still structurally sound after any edit', () => {
   // and nt_events_since (the honest successor to the retired nt_subscribe stub: a stateless
   // audit-tail poll, not a fabricated subscription). Six added, none removed.
   //
-  // nt_bars gained a `format` enum field (rows|columnar), not a new tool.
-  assert.equal(TOOLS.length, 59, 'tool count unchanged');   // 56 -> 53 -> 53 -> 59
+  // 59 -> 60: nt_optimize_strategy added for NT8 Strategy Analyzer optimization
+  assert.equal(TOOLS.length, 60, 'tool count unchanged');
   for (const t of TOOLS) {
     assert.equal(typeof t.name, 'string', 'every tool has a name');
     assert.ok(t.name.startsWith('nt_'), `${t.name} keeps the nt_ prefix`);
@@ -577,4 +577,16 @@ test('F-21: nt_bars format is opt-in and rows stays the default', () => {
     'format is a closed enum — an unexpected value would be a silent shape change');
   assert.equal(p.format.default, 'rows',
     'rows is the default: the response shape a caller gets without asking must not have changed');
+});
+
+test('nt_optimize_strategy declares required fields and enum choices', () => {
+  const t = byName.get('nt_optimize_strategy');
+  assert.ok(t, 'nt_optimize_strategy is declared');
+  assert.deepEqual(required('nt_optimize_strategy'), ['strategy', 'symbol', 'paramRanges']);
+  const p = props('nt_optimize_strategy');
+  assert.ok(p.strategy && p.symbol && p.paramRanges, 'declares core optimization properties');
+  assert.ok(p.optimizer.enum.includes('DefaultOptimizer'), 'includes DefaultOptimizer');
+  assert.ok(p.optimizer.enum.includes('GeneticOptimizer'), 'includes GeneticOptimizer');
+  assert.ok(p.fitness.enum.includes('MaxProfitFactor'), 'includes MaxProfitFactor');
+  assert.ok(p.generations && p.generationSize, 'declares genetic parameters');
 });

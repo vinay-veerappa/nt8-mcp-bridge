@@ -839,6 +839,35 @@ export const TOOLS = [
     },
   },
   {
+    name: 'nt_optimize_strategy',
+    description:
+      'Run an optimization (Grid Search or Genetic Algorithm) of a compiled strategy via the NT8 Strategy Analyzer. ' +
+      'Evaluates parameter ranges, ranks iterations by optimization fitness (e.g. MaxProfitFactor, MaxNetProfit, MaxSharpeRatio), ' +
+      'and returns top ranked iteration results along with parameter values and performance metrics.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy:        { type: 'string', description: 'Strategy CLASS name, not the .cs file name, and it must be compiled.' },
+        symbol:          { type: 'string', description: 'Instrument (e.g. GC 08-26, NQ, ES)' },
+        paramRanges:     { type: 'object', description: 'Parameter ranges to optimize: { "ParamName": { "min": 5, "max": 20, "step": 5 } } or { "ParamName": [5, 20, 5] }' },
+        from:            { type: 'string', description: 'UTC Start date YYYY-MM-DD' },
+        to:              { type: 'string', description: 'UTC End date YYYY-MM-DD' },
+        period:          { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Second', 'Range', 'Volume'], description: 'Bars period type', default: 'Minute' },
+        periodValue:     { type: 'number', description: 'Bars period value (e.g. 5 for 5m)', default: 5 },
+        optimizer:       { type: 'string', enum: ['DefaultOptimizer', 'GeneticOptimizer'], description: 'Optimizer type (DefaultOptimizer for grid search, GeneticOptimizer for genetic)', default: 'DefaultOptimizer' },
+        fitness:         { type: 'string', enum: ['MaxProfitFactor', 'MaxNetProfit', 'MaxSharpeRatio', 'MinDrawDown', 'MaxSortinoRatio', 'MaxAvgProfit'], description: 'Optimization fitness metric (e.g. MaxProfitFactor, MaxNetProfit, MaxSharpeRatio, MinDrawDown)', default: 'MaxProfitFactor' },
+        generations:     { type: 'number', description: 'Number of generations for GeneticOptimizer', default: 5 },
+        generationSize:  { type: 'number', description: 'Generation size for GeneticOptimizer', default: 25 },
+        keepBest:        { type: 'number', description: 'Number of top iteration results to keep in Strategy Analyzer', default: 10 },
+        params:          { type: 'object', description: 'Fixed strategy parameter values { paramName: value }' },
+        optimizerParams: { type: 'object', description: 'Optional parameters for the optimizer (e.g. { generations: 5, generationSize: 25 } for GeneticOptimizer)' },
+        maxResults:      { type: 'number', description: 'Max iterations to return in the JSON response', default: 50 },
+        timeoutSec:      { type: 'number', description: 'Server-side timeout in seconds for the optimization run to finish', default: 300 },
+      },
+      required: ['strategy', 'symbol', 'paramRanges'],
+    },
+  },
+  {
     name: 'nt_strategy_status',
     description: 'List strategies NT8 is currently running (enabled on an account): type, state (Realtime/Historical/etc.), account, instrument, timeframe, market position and quantity. Read-only.',
     inputSchema: { type: 'object', properties: {} },

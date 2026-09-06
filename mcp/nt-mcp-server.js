@@ -666,6 +666,12 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
+    case 'nt_optimize_strategy': {
+      const timeoutMs = ((args.timeoutSec || 300) + 30) * 1000;
+      const res = await ntFetch('/api/optimize', 'POST', args, timeoutMs);
+      return res.data;
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

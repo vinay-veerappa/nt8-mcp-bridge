@@ -703,6 +703,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/compile/result":     return ReadCompileResult();
                 case "/api/backtest":           return Post(method, () => Backtest(body));
                 case "/api/backtest/inspect":   return Post(method, () => BacktestInspect());
+                case "/api/optimize":           return Post(method, () => Optimize(body));
+                case "/api/optimize/inspect":   return Post(method, () => OptimizeInspect(body));
+                case "/api/backtest/optimize":  return Post(method, () => Optimize(body));
                 case "/api/settings/inspect":   return Post(method, () => SettingsInspect(body));
                 case "/api/strategy/running":   return RunningStrategies();
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
@@ -1473,6 +1476,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                     tabRef = tab;
                     var props = GetP(tab, "TabStrategyProperties");
 
+                    // Explicitly set BacktestType to Backtest so a reused window is never left in Optimize mode
+                    var btType = Type.GetType(SaNs + "StrategyAnalyzerGuiBacktestType, NinjaTrader.Gui");
+                    if (btType != null) SetP(props, "BacktestType", Enum.Parse(btType, "Backtest"));
+
                     SetP(props, "Strategy", strategy);
 
                     // ECHO, then REFUSE. Resolving the type above proves the name is a
@@ -1681,6 +1688,669 @@ namespace NinjaTrader.NinjaScript.AddOns
             return report;
             } // end lock(_saLock)
         }
+
+        private object Optimize(string body)
+        {
+            JObject q;
+            try { q = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body); }
+            catch (Exception ex) { return new { error = "invalid JSON body: " + ex.Message }; }
+
+            string strategy = q.Str("strategy");
+            if (string.IsNullOrWhiteSpace(strategy))
+                return new { error = "missing 'strategy' in request body" };
+
+            var stratTypeReq = FindStrategyType(strategy);
+            if (stratTypeReq == null)
+            {
+                var alt = strategy.StartsWith("@") ? strategy.Substring(1) : ("@" + strategy);
+                var altType = FindStrategyType(alt);
+                return new
+                {
+                    error = "strategy type not found (compiled?): " + strategy,
+                    hint = altType != null
+                        ? ("'" + alt + "' DOES resolve -- NT8 names its stock sample FILES with a leading '@' while the class has none. Use '" + alt + "'.")
+                        : "POST /api/strategy/inspect lists compiled strategies",
+                    refusedBefore = "the Strategy Analyzer window was not touched, so no other strategy could be run in its place",
+                };
+            }
+
+            string symbol = q.Str("symbol") ?? "NQ 09-26";
+            string period = q.Str("period") ?? "Minute";
+            int periodValue = q["periodValue"] != null ? (int)q["periodValue"] : 5;
+            string optName = q.Str("optimizer") ?? "DefaultOptimizer";
+            string fitName = q.Str("fitness") ?? "MaxProfitFactor";
+            int keepBest = Math.Max(1, Math.Min(500, q["keepBest"] != null ? (int)q["keepBest"] : 10));
+            int maxResults = Math.Max(1, Math.Min(500, q["maxResults"] != null ? (int)q["maxResults"] : 50));
+            int timeoutSec = Math.Max(10, Math.Min(3600, q["timeoutSec"] != null ? (int)q["timeoutSec"] : 300));
+
+            DateTime fromDt = DateTime.MinValue, toDt = DateTime.MinValue;
+            if (!string.IsNullOrEmpty(q.Str("from"))) DateTime.TryParse(q.Str("from"), out fromDt);
+            if (!string.IsNullOrEmpty(q.Str("to"))) DateTime.TryParse(q.Str("to"), out toDt);
+
+            var optType = FindOptimizerType(optName);
+            if (optType == null)
+                return new { error = "unknown optimizer '" + optName + "'" };
+
+            var fitType = FindFitnessType(fitName);
+            if (fitType == null)
+                return new { error = "unknown optimization fitness '" + fitName + "'" };
+
+            var paramRanges = q["paramRanges"] as JObject;
+            if (paramRanges == null || !paramRanges.HasValues)
+                return new { error = "missing 'paramRanges' in request body - at least one parameter range must be specified to optimize" };
+
+            var prms = q["params"] as JObject;
+            var optPrms = q["optimizerParams"] as JObject;
+
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { error = "no WPF dispatcher (is NT8 UI up?)" };
+
+            lock (_saLock)
+            {
+                Exception cfgErr = null;
+                var paramErrors = new List<string>();
+                var appliedRanges = new Dictionary<string, object>();
+                var appliedFixed = new Dictionary<string, object>();
+                string effectiveStrategy = null;
+                bool valid = false;
+                object tabRef = null;
+                object baselineResults = null;
+                int baselineCount = 0;
+                object baselineFirst = null;
+                string baselineGuid = null;
+
+                disp.Invoke((Action)(() =>
+                {
+                    try
+                    {
+                        _saWindow = FindExistingSaWindow();
+                        if (_saWindow == null)
+                        {
+                            var saType = Type.GetType(SaNs + "StrategyAnalyzer, NinjaTrader.Gui");
+                            _saWindow = Activator.CreateInstance(saType);
+                            InvokeM(_saWindow, "Show");
+                        }
+                        try { SetP(_saWindow, "WindowState", System.Windows.WindowState.Minimized); } catch { }
+
+                        var vm = GetP(_saWindow, "ViewModel");
+                        var tab = GetP(vm, "SelectedTab");
+                        tabRef = tab;
+                        var props = GetP(tab, "TabStrategyProperties");
+
+                        // Explicitly set BacktestType to Optimize
+                        var btType = Type.GetType(SaNs + "StrategyAnalyzerGuiBacktestType, NinjaTrader.Gui");
+                        if (btType != null) SetP(props, "BacktestType", Enum.Parse(btType, "Optimize"));
+
+                        SetP(props, "Strategy", strategy);
+
+                        effectiveStrategy = StrategyIdentity(GetP(props, "Strategy"));
+                        if (!string.Equals(effectiveStrategy, stratTypeReq.Name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            paramErrors.Add(string.Format(
+                                "Strategy did not take: requested '{0}' (class '{1}'), window is set to '{2}'.",
+                                strategy, stratTypeReq.Name,
+                                string.IsNullOrEmpty(effectiveStrategy) ? "<null>" : effectiveStrategy));
+                        }
+
+                        SetP(props, "InstrumentOrInstrumentList", symbol);
+                        var bp = GetP(props, "BarsPeriod");
+                        var bpType = Type.GetType("NinjaTrader.Data.BarsPeriodType, NinjaTrader.Core");
+                        SetP(bp, "BarsPeriodType", Enum.Parse(bpType, period, true));
+                        SetP(bp, "Value", periodValue);
+
+                        if (fromDt != DateTime.MinValue || toDt != DateTime.MinValue)
+                            SetSaDateRange(_saWindow, fromDt, toDt);
+
+                        var tmpl = GetP(props, "StrategyTemplate");
+                        if (tmpl == null)
+                        {
+                            paramErrors.Add("StrategyTemplate is null; cannot configure optimizer parameters");
+                            return;
+                        }
+
+                        // Configure Optimizer
+                        var optInst = Activator.CreateInstance(optType);
+                        SetP(optInst, "KeepBestResults", keepBest);
+                        if (optPrms != null)
+                        {
+                            foreach (var op in optPrms.Properties())
+                            {
+                                var jv = op.Value as JValue;
+                                if (jv == null || jv.Value == null) continue;
+                                string targetProp = op.Name;
+                                if (string.Equals(targetProp, "crossoverRatePercent", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (optInst.GetType().GetProperty("CrossoverRatePecent") != null)
+                                        targetProp = "CrossoverRatePecent";
+                                }
+                                string setErr;
+                                TrySetP(optInst, targetProp, jv.Value, out setErr);
+                            }
+                        }
+                        SetP(tmpl, "Optimizer", optInst);
+
+                        // Configure Fitness
+                        var fitInst = Activator.CreateInstance(fitType);
+                        SetP(tmpl, "OptimizationFitness", fitInst);
+
+                        // Apply fixed parameters on tmpl
+                        if (prms != null)
+                        {
+                            foreach (var p in prms.Properties())
+                            {
+                                var jv = p.Value as JValue;
+                                if (jv == null || jv.Value == null)
+                                {
+                                    paramErrors.Add(p.Name + ": expected a scalar value, got " + p.Value.Type);
+                                    continue;
+                                }
+                                string setErr;
+                                if (!TrySetP(tmpl, p.Name, jv.Value, out setErr))
+                                    paramErrors.Add(p.Name + ": " + setErr);
+                                else
+                                    appliedFixed[p.Name] = SafeToString(GetP(tmpl, p.Name));
+                            }
+                        }
+
+                        // Configure OptimizationParameters
+                        var optParams = GetP(tmpl, "OptimizationParameters") as IEnumerable;
+                        if (optParams == null)
+                        {
+                            paramErrors.Add("OptimizationParameters collection is null on StrategyTemplate");
+                            return;
+                        }
+
+                        var availableParams = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in optParams)
+                        {
+                            var name = SafeToString(GetP(p, "Name"));
+                            if (!string.IsNullOrEmpty(name))
+                                availableParams[name] = p;
+                        }
+
+                        // Verify that all paramRanges keys exist in strategy parameters
+                        foreach (var rangeProp in paramRanges.Properties())
+                        {
+                            if (!availableParams.ContainsKey(rangeProp.Name))
+                            {
+                                paramErrors.Add(string.Format("unknown optimization parameter '{0}' for strategy '{1}'. Available parameters: {2}",
+                                    rangeProp.Name, strategy, string.Join(", ", availableParams.Keys)));
+                            }
+                        }
+
+                        if (paramErrors.Count > 0) return;
+
+                        foreach (var kvp in availableParams)
+                        {
+                            var p = kvp.Value;
+                            var pName = kvp.Key;
+                            var pType = GetP(p, "ParameterType") as Type ?? typeof(double);
+
+                            JToken rangeToken = null;
+                            foreach (var prop in paramRanges.Properties())
+                            {
+                                if (string.Equals(prop.Name, pName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    rangeToken = prop.Value;
+                                    break;
+                                }
+                            }
+
+                            if (rangeToken != null)
+                            {
+                                object minVal = null, maxVal = null, stepVal = null;
+                                if (rangeToken is JObject ro)
+                                {
+                                    minVal = ro["min"] ?? ro["Min"] ?? ro["start"] ?? ro["Start"];
+                                    maxVal = ro["max"] ?? ro["Max"] ?? ro["stop"] ?? ro["Stop"];
+                                    stepVal = ro["step"] ?? ro["Step"] ?? ro["increment"] ?? ro["Increment"] ?? 1.0;
+                                }
+                                else if (rangeToken is JArray ra && ra.Count >= 2)
+                                {
+                                    minVal = ra[0];
+                                    maxVal = ra[1];
+                                    stepVal = ra.Count >= 3 ? ra[2] : 1.0;
+                                }
+                                else
+                                {
+                                    paramErrors.Add($"parameter range for '{pName}' must be an object {{min, max, step}} or array [min, max, step]");
+                                    continue;
+                                }
+
+                                if (minVal == null || maxVal == null)
+                                {
+                                    paramErrors.Add($"parameter range for '{pName}' missing min or max");
+                                    continue;
+                                }
+
+                                object minCoerced, maxCoerced;
+                                string coerceErr;
+                                if (!CoerceTo(pType, (minVal as JValue)?.Value ?? minVal, out minCoerced, out coerceErr))
+                                {
+                                    paramErrors.Add($"parameter range '{pName}' min conversion error: {coerceErr}");
+                                    continue;
+                                }
+                                if (!CoerceTo(pType, (maxVal as JValue)?.Value ?? maxVal, out maxCoerced, out coerceErr))
+                                {
+                                    paramErrors.Add($"parameter range '{pName}' max conversion error: {coerceErr}");
+                                    continue;
+                                }
+
+                                double stepDbl = 1.0;
+                                try { stepDbl = Convert.ToDouble((stepVal as JValue)?.Value ?? stepVal); }
+                                catch { stepDbl = 1.0; }
+                                if (stepDbl <= 0) stepDbl = 1.0;
+
+                                SetP(p, "Min", minCoerced);
+                                SetP(p, "Max", maxCoerced);
+                                SetP(p, "Increment", stepDbl);
+                                SetP(p, "Value", minCoerced);
+
+                                appliedRanges[pName] = new { min = minCoerced, max = maxCoerced, step = stepDbl };
+                            }
+                            else
+                            {
+                                // Pin to current value
+                                object curVal = GetP(tmpl, pName) ?? GetP(p, "Value");
+                                if (curVal != null)
+                                {
+                                    SetP(p, "Value", curVal);
+                                    SetP(p, "Min", curVal);
+                                    SetP(p, "Max", curVal);
+                                    SetP(p, "Increment", 1.0);
+                                }
+                            }
+                        }
+
+                        if (paramErrors.Count > 0) return;
+
+                        valid = Convert.ToBoolean(InvokeM(vm, "CheckSettingsValid"));
+                        if (valid)
+                        {
+                            baselineResults = GetP(tab, "Results");
+                            baselineCount = (baselineResults as ICollection)?.Count ?? 0;
+                            baselineFirst = (baselineResults as IList)?.Count > 0 ? (baselineResults as IList)[0] : null;
+                            baselineGuid = SafeToString(GetP(props, "SelectedRunGuid"));
+                            InvokeM(vm, "OnRun", null, null);
+                        }
+                    }
+                    catch (Exception ex) { cfgErr = ex; }
+                }));
+
+                if (cfgErr != null) return new { error = "configure/fire failed: " + cfgErr.Message, stack = cfgErr.StackTrace };
+                if (paramErrors.Count > 0)
+                    return new { error = "refused: " + paramErrors.Count + " parameter error(s)", paramErrors };
+                if (!valid)
+                    return new { error = "settings invalid - check strategy name, parameter ranges, instrument, or data range" };
+
+                var deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
+                var startTime = DateTime.UtcNow;
+                bool started = false;
+                bool done = false;
+                IList finalResults = null;
+                string finalSelectedGuid = null;
+
+                while (DateTime.UtcNow < deadline)
+                {
+                    Thread.Sleep(500);
+                    disp.Invoke((Action)(() =>
+                    {
+                        bool isProgress = Convert.ToBoolean(GetP(tabRef, "IsProgressVisible"));
+                        bool isRun = Convert.ToBoolean(GetP(tabRef, "IsRunVisible"));
+                        var tabProps = GetP(tabRef, "TabStrategyProperties");
+                        string curGuid = SafeToString(GetP(tabProps, "SelectedRunGuid"));
+                        var curResults = GetP(tabRef, "Results") as IList;
+                        int curCount = curResults?.Count ?? 0;
+
+                        if (isProgress) started = true;
+
+                        bool guidChanged = !string.IsNullOrEmpty(curGuid) && curGuid != baselineGuid;
+                        bool guidConditionMet = string.IsNullOrEmpty(baselineGuid) || guidChanged;
+
+                        if ((started || guidChanged) && !isProgress && isRun && curResults != null && curCount > 0 && guidConditionMet)
+                        {
+                            done = true;
+                            finalResults = curResults;
+                            finalSelectedGuid = curGuid;
+                        }
+                    }));
+                    if (done) break;
+                }
+
+                if (!done || finalResults == null)
+                    return new { status = "timeout", message = $"no result within {timeoutSec}s (optimization may still be running)" };
+
+                var iterations = new List<object>();
+                int totalIterationsCount = 0;
+
+                disp.Invoke((Action)(() =>
+                {
+                    object targetRun = null;
+                    if (!string.IsNullOrEmpty(finalSelectedGuid))
+                    {
+                        foreach (var item in finalResults)
+                        {
+                            if (SafeToString(GetP(item, "Guid")) == finalSelectedGuid)
+                            {
+                                targetRun = item;
+                                break;
+                            }
+                        }
+                    }
+                    if (targetRun == null && finalResults.Count > 0)
+                    {
+                        targetRun = finalResults[finalResults.Count - 1];
+                    }
+
+                    var rawEntries = new List<object>();
+                    if (targetRun != null)
+                    {
+                        if (!Convert.ToBoolean(GetP(targetRun, "IsTotalRow")))
+                            rawEntries.Add(targetRun);
+
+                        var children = GetP(targetRun, "Children") as IList;
+                        if (children != null)
+                        {
+                            foreach (var ch in children)
+                            {
+                                if (!Convert.ToBoolean(GetP(ch, "IsTotalRow")))
+                                    rawEntries.Add(ch);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (var item in finalResults)
+                        {
+                            if (!Convert.ToBoolean(GetP(item, "IsTotalRow")))
+                                rawEntries.Add(item);
+                        }
+                    }
+
+                    totalIterationsCount = rawEntries.Count;
+                    int limit = Math.Min(rawEntries.Count, maxResults);
+                    for (int i = 0; i < limit; i++)
+                    {
+                        iterations.Add(ExtractOptimizeEntry(rawEntries[i], i + 1));
+                    }
+                }));
+
+                return new
+                {
+                    status = "ok",
+                    strategy,
+                    symbol,
+                    optimizer = optType.Name,
+                    fitness = fitType.Name,
+                    appliedRanges,
+                    appliedFixed,
+                    totalIterations = totalIterationsCount,
+                    returnedIterations = iterations.Count,
+                    best = iterations.Count > 0 ? iterations[0] : null,
+                    iterations,
+                };
+            } // end lock(_saLock)
+        }
+
+        private object OptimizeInspect(string body)
+        {
+            JObject q;
+            try { q = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body); }
+            catch { q = new JObject(); }
+            string stratName = q.Str("strategy");
+
+            var optimizers = new[] { "DefaultOptimizer", "GeneticOptimizer" };
+            var fitnessTypes = new[]
+            {
+                "MaxProfitFactor", "MaxNetProfit", "MaxSharpeRatio", "MinDrawDown",
+                "MaxSortinoRatio", "MaxAvgProfit", "MaxPercentProfitable",
+                "MaxWinLossRatio", "MaxUlcerRatio", "MaxR2", "MinAvgMae", "MaxAvgMfe"
+            };
+
+            object strategyDetails = null;
+            if (!string.IsNullOrWhiteSpace(stratName))
+            {
+                var stratType = FindStrategyType(stratName);
+                if (stratType == null)
+                    return new { error = "unknown strategy '" + stratName + "'" };
+
+                var disp = System.Windows.Application.Current?.Dispatcher;
+                if (disp == null) return new { error = "no WPF dispatcher" };
+
+                lock (_saLock)
+                {
+                    disp.Invoke((Action)(() =>
+                    {
+                        _saWindow = FindExistingSaWindow();
+                        if (_saWindow == null)
+                        {
+                            var saType = Type.GetType(SaNs + "StrategyAnalyzer, NinjaTrader.Gui");
+                            _saWindow = Activator.CreateInstance(saType);
+                            InvokeM(_saWindow, "Show");
+                        }
+                        try { SetP(_saWindow, "WindowState", System.Windows.WindowState.Minimized); } catch { }
+
+                        var vm = GetP(_saWindow, "ViewModel");
+                        var tab = GetP(vm, "SelectedTab");
+                        var props = GetP(tab, "TabStrategyProperties");
+
+                        var btType = Type.GetType(SaNs + "StrategyAnalyzerGuiBacktestType, NinjaTrader.Gui");
+                        if (btType != null) SetP(props, "BacktestType", Enum.Parse(btType, "Optimize"));
+                        SetP(props, "Strategy", stratName);
+
+                        var tmpl = GetP(props, "StrategyTemplate");
+                        var optParams = GetP(tmpl, "OptimizationParameters") as IEnumerable;
+                        var paramList = new List<object>();
+                        if (optParams != null)
+                        {
+                            foreach (var p in optParams)
+                            {
+                                var pType = GetP(p, "ParameterType") as Type;
+                                paramList.Add(new
+                                {
+                                    name = SafeToString(GetP(p, "Name")),
+                                    type = pType?.FullName,
+                                    min = GetP(p, "Min"),
+                                    max = GetP(p, "Max"),
+                                    step = GetP(p, "Increment"),
+                                    value = GetP(p, "Value"),
+                                    enumValues = GetP(p, "EnumValues")
+                                });
+                            }
+                        }
+                        strategyDetails = new
+                        {
+                            strategy = stratName,
+                            typeName = stratType.FullName,
+                            parameters = paramList
+                        };
+                    }));
+                }
+            }
+
+            return new
+            {
+                optimizers,
+                fitnessTypes,
+                geneticDefaults = new
+                {
+                    generations = 5,
+                    generationSize = 25,
+                    mutationRatePercent = 5.0,
+                    crossoverRatePercent = 80.0
+                },
+                strategy = strategyDetails
+            };
+        }
+
+        private static Dictionary<string, object> ParseParametersString(string ps)
+        {
+            var dict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(ps)) return dict;
+
+            int openP = ps.LastIndexOf('(');
+            int closeP = ps.LastIndexOf(')');
+            if (openP > 0 && closeP > openP)
+            {
+                string valPart = ps.Substring(0, openP).Trim();
+                string namePart = ps.Substring(openP + 1, closeP - openP - 1).Trim();
+                string[] vals = valPart.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                string[] names = namePart.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                if (vals.Length == names.Length)
+                {
+                    for (int k = 0; k < names.Length; k++)
+                    {
+                        string n = names[k].Trim();
+                        string vStr = vals[k].Trim();
+                        if (!string.IsNullOrEmpty(n))
+                        {
+                            if (long.TryParse(vStr, out long lVal)) dict[n] = lVal;
+                            else if (double.TryParse(vStr, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double dVal)) dict[n] = dVal;
+                            else dict[n] = vStr;
+                        }
+                    }
+                }
+            }
+            return dict;
+        }
+
+        private object ExtractOptimizeEntry(object entry, int rank)
+        {
+            if (entry == null) return null;
+            var perf = GetP(entry, "Results");
+            var all = GetP(perf, "AllTrades");
+            var tp = GetP(all, "TradesPerformance");
+            var cur = tp != null ? GetP(tp, "Currency") : null;
+
+            int totalTrades = Convert.ToInt32(D(tp, "TradesCount") ?? 0);
+            int winners = Convert.ToInt32(D(GetP(all, "WinningTrades"), "Count") ?? 0);
+            int losers = Convert.ToInt32(D(GetP(all, "LosingTrades"), "Count") ?? 0);
+            double winRatePct = totalTrades > 0 ? Math.Round(100.0 * winners / totalTrades, 1) : 0;
+
+            double gp = D(tp, "GrossProfit") is double g1 ? g1 : 0;
+            double gl = D(tp, "GrossLoss") is double g2 ? g2 : 0;
+            double? profitFactor = gl != 0 ? Math.Round(gp / Math.Abs(gl), 3) : (double?)null;
+
+            string ps = SafeToString(GetP(entry, "ParametersString"));
+            var optParams = ParseParametersString(ps);
+
+            // Fallback 1: ParameterWrapper[] on Parameters property
+            if (optParams.Count == 0)
+            {
+                var pwColl = GetP(entry, "Parameters") as IEnumerable;
+                if (pwColl != null)
+                {
+                    foreach (var p in pwColl)
+                    {
+                        var pName = SafeToString(GetP(p, "Name"));
+                        var pVal = GetP(p, "Value");
+                        if (!string.IsNullOrEmpty(pName))
+                            optParams[pName] = pVal;
+                    }
+                }
+            }
+
+            // Fallback 2: OptimizationParameters property
+            if (optParams.Count == 0)
+            {
+                var pColl = GetP(entry, "OptimizationParameters") as IEnumerable;
+                if (pColl != null)
+                {
+                    foreach (var p in pColl)
+                    {
+                        var pName = SafeToString(GetP(p, "Name"));
+                        var pVal = GetP(p, "Value");
+                        if (!string.IsNullOrEmpty(pName))
+                            optParams[pName] = pVal;
+                    }
+                }
+            }
+
+            return new
+            {
+                rank,
+                parameters = optParams,
+                parametersString = ps,
+                metrics = new
+                {
+                    totalTrades,
+                    winners,
+                    losers,
+                    winRatePct,
+                    profitFactor,
+                    netProfit = D(cur, "CumProfit"),
+                    grossProfit = gp,
+                    grossLoss = gl,
+                    maxDrawdown = D(cur, "Drawdown"),
+                    avgProfit = D(cur, "AverageProfit"),
+                    sharpeRatio = D(tp, "SharpeRatio"),
+                    sortinoRatio = D(tp, "SortinoRatio"),
+                    tradesPerDay = D(tp, "TradesPerDay"),
+                    maxConsecWinners = D(tp, "MaxConsecutiveWinner"),
+                    maxConsecLosers = D(tp, "MaxConsecutiveLoser"),
+                    totalCommission = D(tp, "TotalCommission"),
+                }
+            };
+        }
+
+        private static Type FindOptimizerType(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) name = "DefaultOptimizer";
+            name = name.Trim();
+            if (string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase)) name = "DefaultOptimizer";
+            if (string.Equals(name, "Genetic", StringComparison.OrdinalIgnoreCase)) name = "GeneticOptimizer";
+
+            var t = ResolveNtType("NinjaTrader.NinjaScript.Optimizers." + name) ?? ResolveNtType(name);
+            if (t != null) return t;
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); } catch { continue; }
+                foreach (var ty in types)
+                {
+                    if (ty.FullName != null && ty.FullName.StartsWith("NinjaTrader.NinjaScript.Optimizers.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (string.Equals(ty.Name, name, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(ty.FullName, name, StringComparison.OrdinalIgnoreCase))
+                            return ty;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private static Type FindFitnessType(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) name = "MaxProfitFactor";
+            name = name.Trim();
+            if (!name.StartsWith("Max", StringComparison.OrdinalIgnoreCase) && !name.StartsWith("Min", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.Equals(name, "DrawDown", StringComparison.OrdinalIgnoreCase)) name = "MinDrawDown";
+                else if (string.Equals(name, "AvgMae", StringComparison.OrdinalIgnoreCase)) name = "MinAvgMae";
+                else name = "Max" + name;
+            }
+
+            var t = ResolveNtType("NinjaTrader.NinjaScript.OptimizationFitnesses." + name) ?? ResolveNtType(name);
+            if (t != null) return t;
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); } catch { continue; }
+                foreach (var ty in types)
+                {
+                    if (ty.FullName != null && ty.FullName.StartsWith("NinjaTrader.NinjaScript.OptimizationFitnesses.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (string.Equals(ty.Name, name, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(ty.FullName, name, StringComparison.OrdinalIgnoreCase))
+                            return ty;
+                    }
+                }
+            }
+            return null;
+        }
+
 
         // DEV: walk the SA window's logical tree and report every DateTime-valued property,
         // to locate the toolbar From/To date controls. Also reports control types seen.

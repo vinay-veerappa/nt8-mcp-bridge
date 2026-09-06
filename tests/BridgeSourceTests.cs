@@ -1450,11 +1450,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             // P2-127 follow-up. The dormant-account filter.
             TestP2127_DormantAccountsAreFlaggedNotHidden();
             TestP2127_ThePageRendersTheDormantFilter();
+            TestOptimizeStrategyEndpointAndBacktestIsolation();
 
             // Harness self-check, mirroring the core suite's. A runner that silently skips
             // tests is worse than no runner, so the count is asserted rather than assumed.
             Console.WriteLine("\n[TEST] HARNESS: every declared test ran");
-            const int declared = 124;
+            const int declared = 125;
             Assert(_testsRun == declared,
                 string.Format("all {0} declared tests were invoked (ran {1})", declared, _testsRun));
 
@@ -5591,6 +5592,38 @@ namespace NinjaTrader.NinjaScript.AddOns
                                          "profitCurrency", "profitPoints", "exitName" })
                 Assert(Regex.IsMatch(code, @"\b" + kept + @"\s*="),
                     "and the pre-existing field `" + kept + "` is still emitted");
+        }
+
+        private static void TestOptimizeStrategyEndpointAndBacktestIsolation()
+        {
+            _testsRun++;
+            Console.WriteLine("\n[TEST] Optimize strategy endpoint and BacktestType window isolation (SOURCE gate)");
+
+            string code = StripComments(File.ReadAllText(BridgeSourcePath()));
+
+            // Route checks
+            Assert(Regex.IsMatch(code, @"case\s+""/api/optimize"":\s+return\s+Post\(\s*method,\s*\(\)\s*=>\s*Optimize\(\s*body\s*\)\s*\);"),
+                "/api/optimize routes to Optimize(body)");
+            Assert(Regex.IsMatch(code, @"case\s+""/api/optimize/inspect"":\s+return\s+Post\(\s*method,\s*\(\)\s*=>\s*OptimizeInspect\(\s*body\s*\)\s*\);"),
+                "/api/optimize/inspect routes to OptimizeInspect(body)");
+            Assert(Regex.IsMatch(code, @"case\s+""/api/backtest/optimize"":\s+return\s+Post\(\s*method,\s*\(\)\s*=>\s*Optimize\(\s*body\s*\)\s*\);"),
+                "/api/backtest/optimize routes to Optimize(body)");
+
+            // Window isolation checks: Backtest explicitly sets BacktestType to Backtest
+            Assert(Regex.IsMatch(code, @"SetP\(\s*props,\s*""BacktestType"",\s*Enum\.Parse\(\s*btType,\s*""Backtest""\s*\)\s*\);"),
+                "Backtest() explicitly sets BacktestType to Backtest before running");
+
+            // Window isolation checks: Optimize explicitly sets BacktestType to Optimize
+            Assert(Regex.IsMatch(code, @"SetP\(\s*props,\s*""BacktestType"",\s*Enum\.Parse\(\s*btType,\s*""Optimize""\s*\)\s*\);"),
+                "Optimize() explicitly sets BacktestType to Optimize before running");
+
+            // Strategy resolution checks: Optimize resolves strategy type before touching SA window
+            Assert(Regex.IsMatch(code, @"var\s+stratTypeReq\s*=\s*FindStrategyType\(\s*strategy\s*\);"),
+                "Optimize() resolves requested strategy type before touching window");
+
+            // Fail-closed checks on unknown parameter ranges
+            Assert(Regex.IsMatch(code, @"unknown optimization parameter"),
+                "Optimize() fails closed when requested range is not a valid strategy parameter");
         }
 
         public static int Main(string[] args)
